@@ -210,8 +210,12 @@ async fn a_deliver_only_run_ends_completed_with_a_real_receipt() {
 
     let receipts = of_kind(&events, EventKind::ChannelDelivered);
     assert_eq!(receipts.len(), 1, "one receipt: {events:#?}");
+    assert_eq!(receipts[0].bytes["call_id"], "job:deliver:notify:1");
+    assert_eq!(receipts[0].bytes["attempt"], 1);
     assert_eq!(receipts[0].bytes["channel"], "mock-im");
     assert_eq!(receipts[0].bytes["target"]["handle"], "owner");
+    assert_eq!(receipts[0].bytes["parts_sent"], 1);
+    assert_eq!(receipts[0].bytes["parts_total"], 1);
     assert!(
         receipts[0].bytes["detail"]["message_id"].is_string(),
         "the receipt names the adapter message: {:#?}",
@@ -257,4 +261,97 @@ async fn a_deliver_only_run_ends_completed_with_a_real_receipt() {
         },
     );
     assert_eq!(ended.len(), 1, "one end, completed: {events:#?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancel_before_dispatch_ends_cancelled_with_one_verdict() {
+    force_no_proxy();
+    let dir = temp_dir("job-cancel-e2e");
+    let (router_base, _router_mock) = spawn_scripted_provider(
+        vec![ScriptedResponse::Text("bootstrap acknowledged".into()); 4],
+        0,
+    )
+    .await;
+    let (worker_base, _worker_mock) =
+        spawn_scripted_provider(vec![ScriptedResponse::Text("unused".into()); 4], 0).await;
+    let config = write_config(&dir, &router_base, &worker_base);
+    let run = format!("{JOB}@{SLOT}");
+
+    kian_cli::job_cli::execute(&JobCommand::Run {
+        job: JOB.to_string(),
+        slot: Some(SLOT.to_string()),
+        pack: None,
+        base: None,
+        force: false,
+        config: config.clone(),
+        json: true,
+    })
+    .await
+    .expect("admit the run");
+    kian_cli::job_cli::execute(&JobCommand::Cancel {
+        run: run.clone(),
+        config: config.clone(),
+        json: true,
+    })
+    .await
+    .expect("cancel the admitted run before it is drained");
+
+    let _server = Server::from_config_file(&config)
+        .await
+        .expect("assemble the serve")
+        .0;
+    let store = EventStore::open_read_only(dir.join("kian.sqlite"))
+        .await
+        .expect("open the committed stream");
+    let session = plan::run_session(JOB, SLOT);
+    let events = wait_for_run(&store, session, "the cancelled end", |events| {
+        events.iter().any(|event| {
+            matches!(
+                event.kind,
+                EventKind::SessionEnded {
+                    reason: EndReason::Cancelled
+                }
+            )
+        })
+    })
+    .await;
+
+    let run_verdicts: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event.kind == EventKind::EvidenceVerdict
+                && event.bytes.get("gate").and_then(Value::as_str) == Some("run")
+        })
+        .collect();
+    assert_eq!(run_verdicts.len(), 1, "{events:#?}");
+    assert_eq!(run_verdicts[0].bytes["job"]["outcome"], "cancelled");
+    assert_eq!(run_verdicts[0].bytes["job"]["reason"], "cancelled");
+    assert_eq!(
+        run_verdicts[0].bytes["job"]["steps"],
+        serde_json::json!([{"step": "notify", "outcome": "skipped"}])
+    );
+    assert!(
+        events.iter().all(|event| event.kind != EventKind::ToolCall),
+        "cancel before dispatch writes no delivery intent: {events:#?}"
+    );
+
+    let duplicate = kian_cli::job_cli::execute(&JobCommand::Cancel {
+        run,
+        config,
+        json: true,
+    })
+    .await
+    .expect("a duplicate cancel of a terminal run is a no-op");
+    assert!(duplicate.contains("already_terminal"), "{duplicate}");
+    let after = store.rebuild(session).await.expect("reread the run");
+    assert_eq!(
+        after
+            .iter()
+            .filter(|event| {
+                event.kind == EventKind::EvidenceVerdict
+                    && event.bytes.get("gate").and_then(Value::as_str) == Some("run")
+            })
+            .count(),
+        1
+    );
 }

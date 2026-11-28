@@ -188,8 +188,12 @@ const PRODUCER_FILES: &[ProducerFile] = &[
         admits: 3,
     },
     ProducerFile {
+        // The engine inbox writer plus the job-run inbox writer: a job run
+        // is an internal producer (JOB-MODEL §5.2, listed in PLUGIN-SPEC
+        // §3.4.3), so its conductor's control rows are admitted through the
+        // same internal path, not the channel admission port.
         file: "kian-cli/src/superagent.rs",
-        admits: 2,
+        admits: 3,
     },
     ProducerFile {
         // `kian job run` / `kian job cancel` admit the operator's control rows
@@ -424,7 +428,7 @@ fn assembly_mounts_the_bus_on_every_worker_side() {
     };
     // Site 1 — the worker template's inner loop: the exact site B2
     // reported. The bus-present arm must mount `with_hooks`.
-    let template = region("let worker_loop = match &hook_bus", "let worker_inner");
+    let template = region("let worker_react = match &hook_bus", "let worker_inner");
     assert_eq!(
         template.matches("ReActLoop::with_hooks").count(),
         1,

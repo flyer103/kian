@@ -226,17 +226,17 @@ async fn qa_workers_per_id_bounds_and_form_agreement() {
         "text board carries capabilities: {plain_text}"
     );
 
-    // Sorted by id ascending, and the per-id derivation: aa-dyn fresh ⇒
-    // online; zz-dyn 60 s stale vs a 5 s dynamic bound ⇒ offline;
-    // slow-pin 60 s stale vs its 600 s pin bound ⇒ online.
+    // Sorted by id ascending. The board is a registry projection, so a
+    // cached heartbeat can never make a worker online (WORKER-MODEL W1):
+    // every row is offline whatever the per-id liveness bound records.
     assert_eq!(
         json_facts,
         vec![
-            ("aa-dyn".into(), "online".into()),
-            ("slow-pin".into(), "online".into()),
+            ("aa-dyn".into(), "offline".into()),
+            ("slow-pin".into(), "offline".into()),
             ("zz-dyn".into(), "offline".into()),
         ],
-        "per-id bounds from the config drive the state"
+        "a registry row is offline until the live directory says otherwise"
     );
     for row in rows {
         assert!(row.get("description").is_none(), "D-L2: absent");

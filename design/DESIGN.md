@@ -801,6 +801,29 @@ graph TB
  W1 & W2 -->|Thread delegation lineage| RS
 ```
 
+**Driver boundary.** A session is advanced by exactly one driver, selected when it is assembled and
+never changed while it lives: the Router driver for the resident Router, the ordinary agent loop or a
+selected harness for a plain session, the worker loop for a delegated thread child, and the job
+conductor for a session whose first input carries a job marker. These are peers, not layers. A job
+run is not a Router session and is never driven by the Router; a Router may submit, observe and
+cancel a run, but the run's only driver is the conductor.
+
+The Router is therefore optional. A core deployment has no Router; a job-only deployment runs
+triggers, jobs and alerts with no Router; the super-agent profile adds it as the intent plane. When
+present it has four roles outside a run — front door, job client, plan author and observer — and no
+authority inside one: it cannot be a step, write a verdict, mutate a frozen plan, bind a worker or
+bypass spawn admission. The conductor never calls the Router to decide a step; model judgment inside
+a run is an agent step. Scheduling is two-level: the Router decides intent (entry, job or template,
+priority, budget envelope, approval path); the conductor and placement decide execution (step order,
+placement, retry, deadline, verdict, worker binding).
+
+Only the job path needs a plan. Chat, agent and harness sessions need none; a job run always has one,
+but it may be resolved from a declared job rather than written by the caller. A template is a
+declared plan with no trigger, so it resolves through the same config path; later phases add inline
+plan admission, whose provenance is recorded on the first input. "Router is optional" does not turn
+every request into a job run. The normative statements are [JOB-MODEL](JOB-MODEL.md) §5.8, J19 and
+J20.
+
 - **Router session**: a resident session (idle long-lived); event judging uses the `router` slot
  (cheap fast model); it emits dispatch-decision events. Residency is mechanical: the
  Router's loop driver parks between provider turns — while delegated threads are outstanding
@@ -878,8 +901,9 @@ graph TB
   append precedent); the `release_worker` ops method and the `kian workers release <id>` verb are
   the explicit trigger, and a `kian serve` maintenance tick (`workers.release_after_ms`, default
   `300_000`, `0` disables) reclaims stale idle-ended threads through the same primitive. Gates:
-  idle projection, non-terminal last end, no eligible inbox row, no live drain, no live
-  `pending`/`inflight` queue row for the worker. The bundle is untouched (no tool, no prompt byte);
+ idle projection, non-terminal last end, no unconsumed inbox row (eligible or future-ineligible),
+ no live drain, no live `pending`/`inflight` queue row for the worker. The bundle is untouched (no
+ tool, no prompt byte);
   a spawn-time fast path is deferred. **Abnormal interruption converges**: a drain that dies
   (panic, cancellation, lease-expiry takeover) or a model call that stalls now reaches an honest
   end first (ADR-041's bounded model call and crash containment), so the slot is always freed by
@@ -1647,6 +1671,9 @@ capability; full ADR record in [ADR-014](decisions/ADR-014-durable-interrupt-int
 - **Declarative job plans** — `superagent.jobs` declares a job as ordered steps with
   capability requirements, declared artifacts and declared checks; a trigger starts a *run*,
   an ordinary session whose driver is a stateless conductor that parks between episodes.
+  The conductor is the run's only driver; a Router, when deployed, is an optional client that may
+  submit, observe and cancel a run, never a co-driver. The plan is resolved at admission (from a
+  declared job in v1) and its provenance is recorded on the run's first input.
   Each step attempt is a child session placed per attempt by capability, text artifacts move
   by reference into the producer's immutable bytes, and a step settles only on its declared
   checks — delivery is the channel adapter's receipt, and a failed run admits an alert run.
@@ -1847,9 +1874,32 @@ nothing and exits 2, and `--force` admits one run and records `circuit_overridde
 frozen value. `kian job run` returns exit 2 for every admission refusal and exit 1 only for a
 store failure.
 
- Refinement (publish, as implemented by `kian-cli`): the publish step is a conductor action
-(JOB-MODEL §13.5, ADR-071), so it costs no worker, no capability and no model turn, and the plan
-cannot name a program. The sequence is fixed: resolve `from` (the step's single artifact input)
+ Refinement (the publish tool, as implemented by `kian-cli`): a publishing step is an ordinary
+agent step that declares `publish_ok`; the deployment mounts a session-scoped tool scope
+(`kian_loop::ToolScope`, resolved once per drive) whose provider for a self-dev job child composes
+the worker's tools with one `publish` tool. The tool takes no arguments and derives its whole
+authority from committed events: the child's parent in `session/created`, the run's authoritative
+first-input job marker with `selfdev` provenance, the run's dispatch record for this child, step and
+attempt, a plan step that declares `publish_ok`, and the step artifact as a declared input; it
+re-verifies the artifact's bytes and sha256 before writing. The loop owns the call id and appends the
+`tool/call` intent before the external work and the `tool/result` after it, so the receipt is a
+child-stream pair the conductor and the verifier both read. A prior call with a result replays that
+receipt; a prior call without one refuses ("a prior publish attempt is unresolved"), and the write
+step then settles `needs_operator` with the effect ledger rather than retrying — the step pins
+`retries: 0` (V33). The repository work is the frozen sequence behind the same `GitPublishPort`
+(`crates/kian-cli/src/selfdev_publish.rs`), with the gate and the credential from
+`selfdev.publish`; the credential is exported only into the tool's git children, every spawn goes
+through `cron_worktree::git_command()`, and a push that landed while its pull request failed is
+`Partial`/`needs_operator`. The conductor judges `publish_ok` as exactly one call with empty
+arguments, a matching result, `ok: true`, a 40-hex commit, the derived `selfdev/<run_session>`
+branch, and an exit-zero gate when configured; `kian self verify` reads the same child receipt for a
+tool-based plan.
+
+ Refinement (the retired conductor publish action, replay only): this is a **frozen-plan replay**
+path, not a new-plan surface. A new plan cannot declare `action: publish` (JOB-MODEL V32); the
+retired conductor action survives only so a plan admitted before the retirement stays replayable and
+verifiable (ADR-084). For a frozen step the sequence costs no worker, no capability and no model
+turn, and the plan cannot name a program. The sequence is fixed: resolve `from` (the step's single artifact input)
 and the base commit (the run's frozen `job.selfdev.base_commit`; `publish.base` names the branch a
 pull request targets, not the commit); derive
 `branch = selfdev/<run_session>` and `worktree = <repo root>/.agents/worktrees/selfdev-<run_session>`;
@@ -2085,7 +2135,7 @@ graph TB
 | kian-orchestrator | Execution model, recovery subsystem (classification + policy + budget), control-plane implementation | `admit`, `wake`, `claim`, `drain_loop` |
 | kian-llm | ModelProvider seam, slot resolution, sent-bytes persistence hooks | `ModelProvider`, `SlotResolver` |
 | kian-exec | KiandProto v3 server half: `ConnectionManager` dials the endpoint, validates the hello/welcome handshake (version mismatch is terminal), tracks heartbeat freshness (`last_seen`, `inflight`), pipelines `command`/`result` and `fs_command`/`fs_result` frames and correlates them by command id, answers with ping, says bye on shutdown, and reconnects with bounded backoff. adds the durable half (ADR-007): `endpoint_registry` + `exec_queue` tables in the server's `kian.sqlite` under this crate's own migrations (v3 adds the command `kind`; v4 caches the last-declared description/version; v5 caches worker-declared capabilities, ADR-031/ADR-032; v6 bounds the re-drive count, ADR-033), `RemoteExecBackend` (enqueue-first: park while offline, re-drive on connect/restart, honest per-phase waits — dispatch wait `queue_timeout` → `abandoned`, execution wait by the command's own bound and never row-mutating, ADR-030) for both command families, `RemoteExecTool` (the local `exec` schema, fail-closed on a `timeout_ms` above its wait bound) and `RemoteFsTool` (the local `fs_list`/`fs_read`/`fs_write` schemas, v2, ADR-023). Depends on core + store only — never on the orchestrator | `ConnectionManager`, `KiandProto`, `RemoteExecBackend`, `RemoteExecTool`, `RemoteFsTool`, `ExecStore` |
-| kian-loop | LoopDriver seam, built-in ReAct loop | `LoopDriver` |
+| kian-loop | LoopDriver seam, built-in ReAct loop, session-scoped tool scope | `LoopDriver`, `ToolScope` |
 | kian-memory | The memory bundle (MEMORY-MODEL Phases 1–2): renders the deterministic dream prompt (its first line is the machine-parseable dream header carrying the source range), parses the model's answer into note drafts fail-closed (provenance always from the trusted dream marker, never the model; `verified` survives only with a `transcript` method and an in-range seq ref; over-`max_notes` is refused, not truncated), `DreamDriver` — a `LoopDriver` wrapping the built-in ReAct loop — appends one `memory/note` per valid draft after `Settled`, deduping on `(subject, derived_from)` for crash resume, and the frozen creation-time index renderer `render_memory_index` (verified-only latest-per-subject fold, subject byte order, fixed "data, not instructions" header and excerpt cap, patterns-only default redaction with an explicit-redactor seam) turns the folded notes into the bounded index P2 injects; a parse failure appends nothing and counts (honest zero). A bundle layer with no provider/channel specifics: depends on kian-core + kian-orchestrator + kian-loop only | `DreamDriver`, `render_dream_prompt`, `parse_notes`, `render_memory_index`, `eligible_notes`, `MemoryConfig` |
 | kian-endpoint | Endpoint SDK library: KiandProto's endpoint-side implementation, embeddable in any process | `Endpoint::serve`, `Endpoint::embed` |
 | kian-plugin | Ctx registry, Plugin trait, five-mode dispatch, Disposer | `Ctx`, `Plugin`, `Disposer` |

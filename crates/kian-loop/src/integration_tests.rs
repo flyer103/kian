@@ -18,13 +18,15 @@ use uuid::Uuid;
 use kian_core::context::derive_model_context;
 use kian_core::events::{EndReason, Event, EventKind};
 use kian_core::model::{AgentDef, Budgets, Permission, SessionId, SlotName};
-use kian_core::seams::{PolicyRule, RecoveryAction, ToolCall, ToolResult};
+use kian_core::seams::{
+    PolicyRule, RecoveryAction, ToolCall, ToolError, ToolProvider, ToolResult, ToolSchema,
+};
 use kian_core::state::{SessionState, project};
 use kian_llm::ProviderRegistry;
 use kian_orchestrator::{ArtifactRuntime, BudgetOutcome, Engine, EngineConfig, ReadModelConfig};
 use kian_store::EventStore;
 
-use crate::react::{CLASS_EMPTY_RESPONSE, ReActConfig, ReActLoop};
+use crate::react::{CLASS_EMPTY_RESPONSE, ReActConfig, ReActLoop, ToolScope};
 use crate::test_support::{
     HookTools, NoopPolicy, NoopTools, RecordingPolicy, ScriptedProvider, agent_def, text_chunk,
     tool_call_chunk,
@@ -3060,4 +3062,101 @@ async fn an_over_bound_request_without_a_foldable_range_is_sent_anyway() {
 
     cleanup_db(&h.db_path);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// -- session-scoped tools ---------------------------------------------------
+
+struct ProbeTools {
+    seen: Arc<Mutex<Vec<String>>>,
+}
+
+impl ToolProvider for ProbeTools {
+    fn schemas(&self) -> Vec<ToolSchema> {
+        vec![ToolSchema {
+            name: "scoped_probe".into(),
+            description: "returns the scope the drive resolved".into(),
+            parameters: json!({"type": "object", "properties": {}}),
+        }]
+    }
+
+    fn invoke(
+        &self,
+        call: ToolCall,
+    ) -> futures::future::BoxFuture<'static, Result<ToolResult, ToolError>> {
+        self.seen.lock().unwrap().push(call.name.clone());
+        Box::pin(async move {
+            Ok(ToolResult {
+                call_id: call.id,
+                output: json!({"scoped": true}),
+                is_error: false,
+                redactions: Vec::new(),
+            })
+        })
+    }
+}
+
+struct OneScope {
+    tools: Arc<ProbeTools>,
+    sessions: Arc<Mutex<Vec<SessionId>>>,
+}
+
+impl ToolScope for OneScope {
+    fn tools_for(&self, session: SessionId) -> Arc<dyn ToolProvider> {
+        self.sessions.lock().unwrap().push(session);
+        self.tools.clone()
+    }
+}
+
+/// A mounted scope resolves the drive's own session once and dispatches the
+/// call through the provider it returned: the provider seam carries no caller,
+/// so the scope is the only place a tool can learn whose authority it holds.
+#[tokio::test]
+async fn a_mounted_tool_scope_resolves_the_drives_session() {
+    let sessions = Arc::new(Mutex::new(Vec::new()));
+    let probe = Arc::new(ProbeTools {
+        seen: Arc::new(Mutex::new(Vec::new())),
+    });
+    let turns: Vec<Vec<Result<kian_core::seams::ModelChunk, kian_core::seams::ProviderError>>> = vec![
+        vec![tool_call_chunk("call-1", "scoped_probe", json!({}))],
+        vec![text_chunk("done")],
+    ];
+    let db_path = temp_db_path();
+    let store = EventStore::open(&db_path).await.expect("open store");
+    let provider = Arc::new(ScriptedProvider::new(turns));
+    let mut registry = ProviderRegistry::new();
+    registry.register("mock", provider.clone());
+    let react = ReActLoop::with_config(
+        agent_def(),
+        Arc::new(registry),
+        Arc::new(NoopTools),
+        Arc::new(NoopPolicy),
+        ReActConfig::default(),
+    )
+    .with_tool_scope(Arc::new(OneScope {
+        tools: probe.clone(),
+        sessions: sessions.clone(),
+    }));
+    let engine = Engine::new(store.clone(), Arc::new(react), EngineConfig::default());
+    let h = Harness {
+        engine,
+        store,
+        db_path,
+    };
+    let sid = h.engine.create_session().await.expect("create");
+    assert_eq!(
+        submit_and_wait(&h, sid, json!("probe")).await,
+        EndReason::Completed
+    );
+    assert_eq!(sessions.lock().unwrap().as_slice(), &[sid]);
+    assert_eq!(probe.seen.lock().unwrap().as_slice(), &["scoped_probe"]);
+    let events = events_of(&h.store, sid).await;
+    assert!(
+        events.iter().any(|e| {
+            e.kind == EventKind::ToolResult
+                && e.bytes.get("content").and_then(|c| c.get("output"))
+                    == Some(&json!({"scoped": true}))
+        }),
+        "the scoped provider's result never landed"
+    );
+    cleanup_db(&h.db_path);
 }

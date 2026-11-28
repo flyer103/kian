@@ -1196,7 +1196,23 @@ mod tests {
     async fn commit_materializes_consumed_channel_receipts_into_the_ledger() {
         let (store, path) = test_store().await;
         let sid = SessionId::new();
-        seed_terminal(&store, sid).await;
+        let epoch = Epoch(1);
+        store
+            .append(
+                sid,
+                ev(sid, 1, epoch, EventKind::SessionCreated),
+                guard(epoch, 1),
+            )
+            .await
+            .unwrap();
+        store
+            .append(
+                sid,
+                ev(sid, 2, epoch, EventKind::TurnStart),
+                guard(epoch, 2),
+            )
+            .await
+            .unwrap();
 
         let consumed = InputRow {
             id: Uuid::new_v4(),
@@ -1223,6 +1239,21 @@ mod tests {
         }
         store.mark_consumed(sid, consumed.id, 2).await.unwrap();
         store.mark_consumed(sid, not_a_channel.id, 2).await.unwrap();
+        store
+            .append_end(
+                sid,
+                ev(
+                    sid,
+                    3,
+                    epoch,
+                    EventKind::SessionEnded {
+                        reason: EndReason::Completed,
+                    },
+                ),
+                guard(epoch, 3),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(
             store.archive_commit(&marker(sid, "aa"), 3).await.unwrap(),

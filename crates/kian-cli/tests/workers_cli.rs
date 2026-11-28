@@ -6,7 +6,17 @@
 
 use std::path::PathBuf;
 
+use futures::StreamExt;
+use futures::stream::BoxStream;
+use kian_core::events::{Event, EventKind, SCHEMA_VERSION};
+use kian_core::model::{Epoch, SessionId};
+use kian_core::seams::{LoopDriver, LoopOutcome};
+use kian_orchestrator::{DrainCtx, Engine, EngineConfig, ManualClock};
+use kian_store::{AppendGuard, EventStore};
+use serde_json::json;
 use uuid::Uuid;
+
+use kian_cli::ops::OpsError;
 
 fn temp_db() -> PathBuf {
     std::env::temp_dir().join(format!("kian-workers-cli-{}.sqlite", Uuid::new_v4()))
@@ -62,7 +72,8 @@ fn text_facts(text: &str) -> Vec<(String, String)> {
 }
 
 /// Text and `--json` carry the same rows (same ids, same states, same
-/// order); `online` requires the row's freshness conjunction (D-L2).
+/// order). This read-only process has no live connection, so registry rows
+/// are offline even when their cached heartbeat is fresh.
 #[tokio::test]
 async fn workers_text_and_json_agree() {
     let db = seeded_registry().await;
@@ -92,12 +103,12 @@ async fn workers_text_and_json_agree() {
     sorted.sort();
     assert_eq!(json_facts, sorted, "id-ascending order");
 
-    // The D-L2 derivation: fresh+online → online; stale+online →
-    // offline; offline → offline. Default bound 30s (no config).
+    // A cached registry state and heartbeat cannot establish membership
+    // in this process.
     assert_eq!(
         json_facts,
         vec![
-            ("builder-1".into(), "online".into()),
+            ("builder-1".into(), "offline".into()),
             ("mac-mini".into(), "offline".into()),
             ("zbox".into(), "offline".into()),
         ]
@@ -172,4 +183,102 @@ async fn workers_verb_writes_nothing() {
         rows
     };
     assert_eq!(before, after, "the verb writes nothing");
+}
+
+struct NoopReleaseDriver;
+
+impl LoopDriver for NoopReleaseDriver {
+    type Ctx = DrainCtx;
+
+    fn drive(&self, _ctx: DrainCtx) -> BoxStream<'static, LoopOutcome> {
+        futures::stream::once(async { LoopOutcome::Settled }).boxed()
+    }
+}
+
+async fn append(
+    store: &EventStore,
+    session: SessionId,
+    seq: u64,
+    kind: EventKind,
+    bytes: serde_json::Value,
+) {
+    store
+        .append(
+            session,
+            Event {
+                seq,
+                session,
+                epoch: Epoch(0),
+                ts: 1,
+                kind,
+                bytes,
+                version: SCHEMA_VERSION,
+            },
+            AppendGuard {
+                epoch: Epoch(0),
+                expected_seq: seq,
+            },
+        )
+        .await
+        .unwrap();
+}
+
+/// An eager-created child with no accepted input is a never-started
+/// reservation. Release reports `worker_not_bound`, even after its lease,
+/// rather than treating the reservation as a busy session.
+#[tokio::test]
+async fn release_reports_worker_not_bound_for_an_expired_reservation() {
+    let events_db = temp_db();
+    let exec_db = temp_db();
+    let store = EventStore::open(&events_db).await.unwrap();
+    let exec = kian_exec::ExecStore::open(&exec_db).await.unwrap();
+    let engine = Engine::with_clock(
+        store.clone(),
+        std::sync::Arc::new(NoopReleaseDriver),
+        EngineConfig {
+            holder: "test-holder".into(),
+            lease_ttl_ms: 30_000,
+            heartbeat_interval_ms: 10_000,
+        },
+        std::sync::Arc::new(ManualClock::new(1)),
+    );
+    let parent = SessionId::new();
+    let child = SessionId::new();
+    let thread = Uuid::new_v4();
+    append(&store, parent, 1, EventKind::SessionCreated, json!({})).await;
+    append(
+        &store,
+        parent,
+        2,
+        EventKind::ThreadStarted,
+        json!({
+            "thread_id": thread.to_string(),
+            "parent": parent.0.to_string(),
+            "worker": child.0.to_string(),
+            "pinned_version": 1,
+            "task": {"role": "user", "content": "delegate"},
+            "exec_worker": "builder-1",
+        }),
+    )
+    .await;
+    append(&store, child, 1, EventKind::SessionCreated, json!({})).await;
+    let before = store.head(child).await.unwrap().next_seq;
+
+    let error =
+        kian_cli::worker_release::release_worker(&*engine, &store, &exec, "builder-1", None)
+            .await
+            .expect_err("never-started reservation is not releasable");
+    assert!(
+        matches!(
+            error,
+            OpsError::WorkerNotBound { ref worker, .. } if worker == "builder-1"
+        ),
+        "{error:?}"
+    );
+    assert_eq!(store.head(child).await.unwrap().next_seq, before);
+
+    exec.close().await;
+    store.close().await;
+    let _ = std::fs::remove_file(events_db);
+    let _ = std::fs::remove_file(exec_db);
 }

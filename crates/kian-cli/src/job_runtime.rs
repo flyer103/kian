@@ -155,6 +155,35 @@ impl AlertPort for JobAlertPort {
     ) -> BoxFuture<'static, Result<(), String>> {
         let inbox = Arc::clone(&self.inbox);
         Box::pin(async move {
+            let marker = payload
+                .get(kian_superagent::job::status::JOB_KEY)
+                .ok_or_else(|| "alert input carries no job marker".to_string())?;
+            let marker = kian_superagent::job::status::parse_marker(marker)
+                .map_err(|error| format!("invalid alert marker: {error}"))?;
+            let failed_run = marker
+                .slot
+                .strip_prefix("alert:")
+                .filter(|suffix| !suffix.is_empty())
+                .ok_or_else(|| "alert slot does not name a failed run".to_string())?;
+            if marker.trigger != kian_superagent::job::alert::TRIGGER_ALERT
+                || !(marker.job_id.starts_with("alert:") || marker.job_id.starts_with("alert."))
+                || marker.run_id
+                    != kian_superagent::job::plan::alert_run_id(&marker.job_id, failed_run)
+                || key != format!("kian:alert:{failed_run}")
+            {
+                return Err("alert run identity does not match its failed run".to_string());
+            }
+            let violations = kian_superagent::job::plan::validate_plan(&marker.plan);
+            if !violations.is_empty() {
+                return Err(format!(
+                    "invalid alert plan: {}",
+                    violations
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ));
+            }
             inbox
                 .admit(session, payload, Some(key))
                 .await
@@ -199,11 +228,12 @@ pub fn unmounted_run(
 ) -> BoxStream<'static, LoopOutcome> {
     futures::stream::once(async move {
         let payload = kian_superagent::job::status::run_verdict_payload(
+            None,
             kian_superagent::job::outcome::RunOutcome::Failed,
             plan_digest.as_deref().unwrap_or(""),
             &[],
             None,
-            Some("job runs are not mounted in this process"),
+            Some("effect_unknown"),
         );
         if let Err(error) = ctx.append(EventKind::EvidenceVerdict, payload).await {
             tracing::warn!(

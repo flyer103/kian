@@ -101,6 +101,7 @@ superagent:
             action: deliver
             depends_on: [patch]
             optional: true
+            on_failure: continue
             channel: mock-im
             target: {{handle: owner}}
             content: {{text: "a proposal is ready - NOT MERGED"}}

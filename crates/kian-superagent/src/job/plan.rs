@@ -61,6 +61,15 @@ pub const DEFAULT_INLINE_MAX_BYTES: u64 = 65_536;
 /// The largest artifact this contract accepts (§12.1): 256 KiB.
 pub const MAX_ARTIFACT_BYTES: u64 = 262_144;
 
+/// A frozen plan's default canonical-size ceiling (§7.4 V24).
+pub const DEFAULT_MAX_PLAN_BYTES: u64 = 1_048_576;
+
+/// One agent prompt's default byte ceiling (§7.4 V25).
+pub const DEFAULT_MAX_PROMPT_BYTES: u64 = 65_536;
+
+/// One derived child task message's byte ceiling (§8.5, V26).
+pub const MAX_CHILD_TASK_BYTES: usize = 1_048_576;
+
 /// Extra attempts beyond the first (§7.2).
 pub const MAX_RETRIES: u8 = 5;
 
@@ -130,6 +139,24 @@ pub struct JobLimits {
     /// (§12.2).
     #[serde(default = "default_inline_max_bytes")]
     pub inline_max_bytes: u64,
+    /// The maximum canonical size of the resolved plan at load.
+    ///
+    /// Omitted from the frozen bytes at its default so plans stored before
+    /// this limit existed keep their digest.
+    #[serde(
+        default = "default_max_plan_bytes",
+        skip_serializing_if = "is_default_max_plan_bytes"
+    )]
+    pub max_plan_bytes: u64,
+    /// The maximum number of bytes in one agent prompt.
+    ///
+    /// Omitted from the frozen bytes at its default for the same
+    /// historical-digest compatibility reason.
+    #[serde(
+        default = "default_max_prompt_bytes",
+        skip_serializing_if = "is_default_max_prompt_bytes"
+    )]
+    pub max_prompt_bytes: u64,
     /// How many consecutive settled runs of this job may fail before a manual
     /// trigger is refused (SELF-EVOLUTION-MODEL §10.2). Zero disables the
     /// breaker; the value is part of the frozen plan, so a run cannot raise
@@ -155,6 +182,8 @@ impl Default for JobLimits {
             accept_unverified: Vec::new(),
             defer_budget_ms: DEFAULT_DEFER_BUDGET_MS,
             inline_max_bytes: DEFAULT_INLINE_MAX_BYTES,
+            max_plan_bytes: DEFAULT_MAX_PLAN_BYTES,
+            max_prompt_bytes: DEFAULT_MAX_PROMPT_BYTES,
             consecutive_failures: DEFAULT_CONSECUTIVE_FAILURES,
         }
     }
@@ -166,7 +195,7 @@ impl Default for JobLimits {
 /// digest's input, so its key set must not depend on the action. The
 /// deliver-only fields are meaningful only when
 /// `action == StepAction::Deliver`, and §7.4 V16 enforces exactly that.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StepPlan {
     /// Step id, unique in the plan (§7.4 V1/V3).
@@ -238,6 +267,118 @@ pub struct StepPlan {
     pub publish: Option<PublishSpec>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StepPlanWire {
+    id: String,
+    #[serde(default)]
+    action: StepAction,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    requires: Vec<String>,
+    #[serde(default)]
+    pin: Option<String>,
+    #[serde(default)]
+    allow_offline: bool,
+    #[serde(default)]
+    prefer: Vec<String>,
+    #[serde(default)]
+    depends_on: Vec<String>,
+    #[serde(default)]
+    inputs: Vec<ArtifactInput>,
+    #[serde(default)]
+    produces: Option<ArtifactSpec>,
+    #[serde(default)]
+    output_schema: Option<Value>,
+    #[serde(default = "default_step_timeout_ms")]
+    timeout_ms: u64,
+    #[serde(default)]
+    retries: u8,
+    #[serde(default)]
+    effect: Effect,
+    #[serde(default)]
+    idempotent: bool,
+    verify: Option<Vec<JobCheck>>,
+    #[serde(default)]
+    on_failure: OnFailure,
+    #[serde(default)]
+    optional: bool,
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    target: Option<Value>,
+    #[serde(default)]
+    content: Option<DeliverContent>,
+    #[serde(default)]
+    publish: Option<PublishSpec>,
+}
+
+impl<'de> Deserialize<'de> for StepPlan {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = StepPlanWire::deserialize(deserializer)?;
+        let verify = wire.verify.unwrap_or_else(|| {
+            default_checks(
+                wire.action,
+                wire.produces.as_ref(),
+                wire.channel.as_deref(),
+                wire.target.as_ref(),
+            )
+        });
+        Ok(Self {
+            id: wire.id,
+            action: wire.action,
+            prompt: wire.prompt,
+            requires: wire.requires,
+            pin: wire.pin,
+            allow_offline: wire.allow_offline,
+            prefer: wire.prefer,
+            depends_on: wire.depends_on,
+            inputs: wire.inputs,
+            produces: wire.produces,
+            output_schema: wire.output_schema,
+            timeout_ms: wire.timeout_ms,
+            retries: wire.retries,
+            effect: wire.effect,
+            idempotent: wire.idempotent,
+            verify,
+            on_failure: wire.on_failure,
+            optional: wire.optional,
+            channel: wire.channel,
+            target: wire.target,
+            content: wire.content,
+            publish: wire.publish,
+        })
+    }
+}
+
+fn default_checks(
+    action: StepAction,
+    produces: Option<&ArtifactSpec>,
+    channel: Option<&str>,
+    target: Option<&Value>,
+) -> Vec<JobCheck> {
+    match action {
+        StepAction::Agent => {
+            let mut checks = vec![JobCheck::FinalMessagePresent];
+            if let Some(produces) = produces {
+                checks.push(JobCheck::ArtifactWithinCap {
+                    name: produces.name.clone(),
+                });
+            }
+            checks
+        }
+        StepAction::Deliver => vec![JobCheck::DeliveryReceipt {
+            channel: channel.unwrap_or_default().to_string(),
+            target: target.cloned().unwrap_or(Value::Null),
+        }],
+        StepAction::Publish => Vec::new(),
+    }
+}
+
 impl StepPlan {
     /// Whether this step is executed by the conductor rather than placed
     /// on a worker (§13.1).
@@ -246,15 +387,15 @@ impl StepPlan {
         matches!(self.action, StepAction::Deliver)
     }
 
-    /// Whether this step publishes an artifact as a conductor action
-    /// (SELF-EVOLUTION-MODEL §9.4).
+    /// Whether this step carries the retired conductor publish action
+    /// (SELF-EVOLUTION-MODEL §9.4, ADR-084). Replay-only.
     #[must_use]
     pub fn is_publish(&self) -> bool {
         matches!(self.action, StepAction::Publish)
     }
 
     /// The publish facts, present exactly when the step is a well-formed
-    /// `publish` step (V27 validated them at load).
+    /// frozen `publish` step (V32 refuses the action for new plans).
     #[must_use]
     pub fn publish(&self) -> Option<&PublishSpec> {
         if !self.is_publish() {
@@ -349,8 +490,9 @@ pub enum StepAction {
     Agent,
     /// A conductor-executed send through the channel adapter (§13.1).
     Deliver,
-    /// A conductor-executed publish of one artifact (SELF-EVOLUTION-MODEL
-    /// §9.4): a derived worktree, a commit, a gate and a receipt.
+    /// A retired conductor action (ADR-084). Kept only so a plan frozen before
+    /// the retirement still deserializes and replays; a new plan is refused by
+    /// V32, and a publish is an agent step that calls the publish tool.
     Publish,
 }
 
@@ -463,7 +605,7 @@ const fn default_publish_gates() -> bool {
 /// verbatim ([`JobCheck::to_check_spec`]); the last two are job-owned
 /// because they are predicates over the *run's* facts, not the child's
 /// stream.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "check", rename_all = "snake_case")]
 pub enum JobCheck {
     /// The child ended with a final answer (§11.2).
@@ -509,6 +651,73 @@ pub enum JobCheck {
         #[serde(default)]
         deny: Vec<String>,
     },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "check", rename_all = "snake_case")]
+enum JobCheckWire {
+    FinalMessagePresent,
+    ToolResultSinceLastUserInput,
+    NoErrorToolResultTail {
+        k: u64,
+    },
+    MinToolResults {
+        n: u64,
+    },
+    ArtifactWithinCap {
+        name: String,
+    },
+    DeliveryReceipt {
+        channel: String,
+        #[serde(default)]
+        target: Value,
+    },
+    PublishOk,
+    PatchPathsAllowed {
+        artifact: String,
+        #[serde(default)]
+        allow: Vec<String>,
+        #[serde(default)]
+        deny: Vec<String>,
+    },
+    ReportMatchesSchema {
+        #[serde(default, rename = "schema")]
+        _schema: Value,
+    },
+}
+
+impl<'de> Deserialize<'de> for JobCheck {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = JobCheckWire::deserialize(deserializer).map_err(|error| {
+            serde::de::Error::custom(format!("invalid check in the closed V27 set: {error}"))
+        })?;
+        match wire {
+            JobCheckWire::FinalMessagePresent => Ok(Self::FinalMessagePresent),
+            JobCheckWire::ToolResultSinceLastUserInput => Ok(Self::ToolResultSinceLastUserInput),
+            JobCheckWire::NoErrorToolResultTail { k } => Ok(Self::NoErrorToolResultTail { k }),
+            JobCheckWire::MinToolResults { n } => Ok(Self::MinToolResults { n }),
+            JobCheckWire::ArtifactWithinCap { name } => Ok(Self::ArtifactWithinCap { name }),
+            JobCheckWire::DeliveryReceipt { channel, target } => {
+                Ok(Self::DeliveryReceipt { channel, target })
+            }
+            JobCheckWire::PublishOk => Ok(Self::PublishOk),
+            JobCheckWire::PatchPathsAllowed {
+                artifact,
+                allow,
+                deny,
+            } => Ok(Self::PatchPathsAllowed {
+                artifact,
+                allow,
+                deny,
+            }),
+            JobCheckWire::ReportMatchesSchema { .. } => Err(serde::de::Error::custom(
+                "phase_unavailable: report_matches_schema is not available in v1 (V30)",
+            )),
+        }
+    }
 }
 
 impl JobCheck {
@@ -782,34 +991,10 @@ pub fn validate_plan(plan: &JobPlan) -> Vec<PlanViolation> {
         validate_step(plan, index, step, &mut out);
     }
 
-    let publish_steps = plan.steps.iter().filter(|step| step.is_publish()).count();
-    if publish_steps > 1 {
-        out.push(violation(
-            "V28",
-            "steps",
-            "invalid publish step: a plan declares at most one publish step",
-        ));
-    }
-    if publish_steps > 0 && !plan.declares_surface() {
-        out.push(violation(
-            "V29",
-            "steps",
-            "publish requires a declared surface: no step declares patch_paths_allowed",
-        ));
-    }
-
     validate_limits(plan, &mut out);
     validate_graph(plan, &mut out);
-
-    let any_check = plan.steps.iter().any(|s| !s.verify.is_empty());
-    let any_deliver = plan.steps.iter().any(StepPlan::is_deliver);
-    if !any_check && !any_deliver {
-        out.push(violation(
-            "V21",
-            "steps",
-            "no step declares a verify check: a run that cannot be checked cannot succeed",
-        ));
-    }
+    validate_evidence(plan, &mut out);
+    validate_edges(plan, &mut out);
 
     if plan.limits.max_parallel != MAX_PARALLEL_V1 {
         out.push(violation(
@@ -818,6 +1003,23 @@ pub fn validate_plan(plan: &JobPlan) -> Vec<PlanViolation> {
             format!(
                 "v1 admits one step at a time; found {}",
                 plan.limits.max_parallel
+            ),
+        ));
+        out.push(violation(
+            "V30",
+            "limits.max_parallel",
+            "phase_unavailable: max_parallel > 1 is not available in v1",
+        ));
+    }
+
+    let plan_bytes = canonical_json(&plan.frozen_json()).len();
+    if plan_bytes > usize::try_from(plan.limits.max_plan_bytes).unwrap_or(usize::MAX) {
+        out.push(violation(
+            "V24",
+            "limits.max_plan_bytes",
+            format!(
+                "the resolved plan is {plan_bytes} bytes, above the {} byte cap",
+                plan.limits.max_plan_bytes
             ),
         ));
     }
@@ -836,6 +1038,16 @@ fn validate_limits(plan: &JobPlan, out: &mut Vec<PlanViolation>) {
     }
     for (index, worker) in limits.prefer.iter().enumerate() {
         validate_prefer_entry(&format!("limits.prefer[{index}]"), worker, out);
+    }
+    let mut seen = BTreeSet::new();
+    for (index, worker) in limits.prefer.iter().enumerate() {
+        if !seen.insert(worker.as_str()) {
+            out.push(violation(
+                "V22",
+                format!("limits.prefer[{index}]"),
+                format!("duplicate prefer entry {worker:?}"),
+            ));
+        }
     }
     if limits.max_parallel == 0 {
         out.push(violation(
@@ -883,14 +1095,32 @@ fn validate_step(plan: &JobPlan, index: usize, step: &StepPlan, out: &mut Vec<Pl
                     "an agent step declares a prompt",
                 ));
             }
+            if let Some(prompt) = &step.prompt
+                && prompt.len()
+                    > usize::try_from(plan.limits.max_prompt_bytes).unwrap_or(usize::MAX)
+            {
+                out.push(violation(
+                    "V25",
+                    format!("{path}.prompt"),
+                    format!(
+                        "prompt is {} bytes, above the {} byte cap",
+                        prompt.len(),
+                        plan.limits.max_prompt_bytes
+                    ),
+                ));
+            }
         }
         StepAction::Deliver => validate_deliver(&path, plan, step, out),
-        StepAction::Publish => validate_publish(&path, step, out),
+        StepAction::Publish => out.push(violation(
+            "V32",
+            format!("{path}.action"),
+            "invalid action: the normative plan action set is agent or deliver",
+        )),
     }
 
     if step.action != StepAction::Publish && step.publish.is_some() {
         out.push(violation(
-            "V27",
+            "V32",
             format!("{path}.publish"),
             "invalid publish step: the publish field belongs to a publish step",
         ));
@@ -971,6 +1201,11 @@ fn validate_step(plan: &JobPlan, index: usize, step: &StepPlan, out: &mut Vec<Pl
                 format!("{path}.produces.media"),
                 "binary artifacts are P3 (§21.2); v1 carries text only",
             ));
+            out.push(violation(
+                "V30",
+                format!("{path}.produces.media"),
+                "phase_unavailable: binary artifacts are not available in v1",
+            ));
         }
     }
 
@@ -997,11 +1232,29 @@ fn validate_step(plan: &JobPlan, index: usize, step: &StepPlan, out: &mut Vec<Pl
                         ),
                     ));
                 }
+                if matches!(step.action, StepAction::Agent)
+                    && let Some(produces) = producer.produces.as_ref()
+                    && produces.max_bytes > plan.limits.inline_max_bytes
+                {
+                    out.push(violation(
+                        "V23",
+                        &at_path,
+                        format!(
+                            "producer cap {} exceeds limits.inline_max_bytes {}",
+                            produces.max_bytes, plan.limits.inline_max_bytes
+                        ),
+                    ));
+                }
             }
         }
     }
 
     if let Some(schema) = &step.output_schema {
+        out.push(violation(
+            "V30",
+            format!("{path}.output_schema"),
+            "phase_unavailable: structured output is not available in v1",
+        ));
         if !schema.is_object() {
             out.push(violation(
                 "V17",
@@ -1022,17 +1275,43 @@ fn validate_step(plan: &JobPlan, index: usize, step: &StepPlan, out: &mut Vec<Pl
     for (at, check) in step.verify.iter().enumerate() {
         let at_path = format!("{path}.verify[{at}]");
         match check {
+            JobCheck::NoErrorToolResultTail { k } if !(1..=10).contains(k) => {
+                out.push(violation(
+                    "V27",
+                    &at_path,
+                    "no_error_tool_result_tail requires k in 1..=10",
+                ));
+            }
+            JobCheck::MinToolResults { n } if !(1..=100).contains(n) => {
+                out.push(violation(
+                    "V27",
+                    &at_path,
+                    "min_tool_results requires n in 1..=100",
+                ));
+            }
             JobCheck::ArtifactWithinCap { name } if name.trim().is_empty() => out.push(violation(
-                "V21",
+                "V27",
                 &at_path,
                 "artifact_within_cap names the artifact to check",
             )),
-            JobCheck::DeliveryReceipt { channel, .. } if channel.trim().is_empty() => {
+            JobCheck::ArtifactWithinCap { name } if !step_declares_artifact(step, name) => {
                 out.push(violation(
-                    "V21",
+                    "V27",
                     &at_path,
-                    "delivery_receipt names the channel that must have delivered",
+                    format!(
+                        "artifact_within_cap names {name:?}, which this step neither produces nor consumes"
+                    ),
                 ))
+            }
+            JobCheck::DeliveryReceipt { channel, target }
+                if step.channel.as_deref() != Some(channel.as_str())
+                    || step.target.as_ref() != Some(target) =>
+            {
+                out.push(violation(
+                    "V27",
+                    &at_path,
+                    "delivery_receipt must name this deliver step's channel and target",
+                ));
             }
             JobCheck::PatchPathsAllowed {
                 artifact,
@@ -1041,6 +1320,35 @@ fn validate_step(plan: &JobPlan, index: usize, step: &StepPlan, out: &mut Vec<Pl
             } => {
                 patch_checks += 1;
                 validate_surface(&at_path, artifact, allow, deny, step, out);
+            }
+            JobCheck::PublishOk => {
+                if !matches!(step.action, StepAction::Agent) {
+                    out.push(violation(
+                        "V33",
+                        &at_path,
+                        "publish_ok is allowed only on an agent step: the publish tool is called by the step's child, never by the conductor",
+                    ));
+                }
+                if step.inputs.is_empty() {
+                    out.push(violation(
+                        "V33",
+                        &at_path,
+                        "a publish step consumes the patch artifact it publishes: declare it as a step input",
+                    ));
+                } else if step.inputs.len() > 1 {
+                    out.push(violation(
+                        "V33",
+                        &at_path,
+                        "a publish step consumes exactly one input, the patch artifact it publishes",
+                    ));
+                }
+                if step.retries > 0 {
+                    out.push(violation(
+                        "V33",
+                        &at_path,
+                        "a publish is never retried: declare retries: 0",
+                    ));
+                }
             }
             _ => {}
         }
@@ -1057,6 +1365,193 @@ fn validate_step(plan: &JobPlan, index: usize, step: &StepPlan, out: &mut Vec<Pl
     for (at, worker) in step.prefer.iter().enumerate() {
         validate_prefer_entry(&format!("{path}.prefer[{at}]"), worker, out);
     }
+    let mut seen = BTreeSet::new();
+    for (at, worker) in step.prefer.iter().enumerate() {
+        if !seen.insert(worker.as_str()) {
+            out.push(violation(
+                "V22",
+                format!("{path}.prefer[{at}]"),
+                format!("duplicate prefer entry {worker:?}"),
+            ));
+        }
+    }
+
+    if step.optional && step.on_failure != OnFailure::Continue {
+        out.push(violation(
+            "V28",
+            format!("{path}.optional"),
+            "an optional step must declare on_failure: continue",
+        ));
+    }
+}
+
+fn step_declares_artifact(step: &StepPlan, name: &str) -> bool {
+    step.produces_name() == Some(name)
+        || step.inputs.iter().any(|input| input.name == name)
+        || step
+            .content
+            .as_ref()
+            .and_then(|content| content.from_artifact.as_ref())
+            .is_some_and(|input| input.name == name)
+}
+
+fn validate_evidence(plan: &JobPlan, out: &mut Vec<PlanViolation>) {
+    let accepted: BTreeSet<&str> = plan
+        .limits
+        .accept_unverified
+        .iter()
+        .map(String::as_str)
+        .collect();
+
+    for (index, step) in plan.steps.iter().enumerate() {
+        if !step.verify.is_empty() {
+            continue;
+        }
+        let path = format!("steps[{index}].verify");
+        if step.is_deliver() {
+            out.push(violation(
+                "V21",
+                path,
+                "a deliver step must declare a delivery_receipt check",
+            ));
+        } else if !matches!(step.action, StepAction::Agent) || !accepted.contains(step.id.as_str())
+        {
+            out.push(violation(
+                "V21",
+                path,
+                "an empty verify list is allowed only on an agent step listed in limits.accept_unverified",
+            ));
+        }
+    }
+
+    for (index, step) in plan
+        .steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| matches!(step.action, StepAction::Agent))
+    {
+        let bound = child_task_message_upper_bound(plan, step);
+        if bound > MAX_CHILD_TASK_BYTES {
+            out.push(violation(
+                "V26",
+                format!("steps[{index}]"),
+                format!(
+                    "the derived child task message can reach {bound} bytes, above the {MAX_CHILD_TASK_BYTES} byte cap"
+                ),
+            ));
+        }
+    }
+
+    let publish_steps: Vec<&str> = plan
+        .steps
+        .iter()
+        .filter(|step| {
+            step.verify
+                .iter()
+                .any(|check| matches!(check, JobCheck::PublishOk))
+        })
+        .map(|step| step.id.as_str())
+        .collect();
+    if publish_steps.len() > 1 {
+        out.push(violation(
+            "V33",
+            "steps",
+            format!("a plan declares at most one publish step, found {publish_steps:?}"),
+        ));
+    }
+
+    for (index, step_id) in plan.limits.accept_unverified.iter().enumerate() {
+        match plan.step(step_id) {
+            None => out.push(violation(
+                "V21",
+                format!("limits.accept_unverified[{index}]"),
+                format!("step {step_id:?} is not in this plan"),
+            )),
+            Some(step) if !matches!(step.action, StepAction::Agent) => out.push(violation(
+                "V21",
+                format!("limits.accept_unverified[{index}]"),
+                format!("step {step_id:?} is not an agent step"),
+            )),
+            Some(_) => {}
+        }
+    }
+}
+
+/// A conservative upper bound on the task text `child_task_text` can admit
+/// for one agent step, using the producer caps as the inlined byte counts.
+#[must_use]
+pub fn child_task_message_upper_bound(plan: &JobPlan, step: &StepPlan) -> usize {
+    const RUNTIME_ENVELOPE_BYTES: usize = 1_024;
+
+    let mut bytes = RUNTIME_ENVELOPE_BYTES
+        .saturating_add(plan.id.len())
+        .saturating_add(step.id.len())
+        .saturating_add(step.digest().len())
+        .saturating_add(step.prompt.as_ref().map_or(0, String::len));
+    for input in &step.inputs {
+        let cap = plan
+            .step(&input.step)
+            .and_then(|producer| producer.produces.as_ref())
+            .map_or(0, |produces| produces.max_bytes);
+        bytes = bytes
+            .saturating_add(usize::try_from(cap).unwrap_or(usize::MAX))
+            .saturating_add(input.step.len())
+            .saturating_add(input.name.len());
+    }
+    bytes
+}
+
+fn validate_edges(plan: &JobPlan, out: &mut Vec<PlanViolation>) {
+    for (index, step) in plan.steps.iter().enumerate() {
+        for (at, input) in step.inputs.iter().enumerate() {
+            if plan.step(&input.step).is_none() {
+                continue;
+            }
+            if !depends_transitively_on(plan, step, &input.step) {
+                out.push(violation(
+                    "V29",
+                    format!("steps[{index}].inputs[{at}].step"),
+                    format!(
+                        "producer {:?} is not a direct or transitive dependency of {:?}",
+                        input.step, step.id
+                    ),
+                ));
+            }
+        }
+        if let Some(input) = step
+            .content
+            .as_ref()
+            .and_then(|content| content.from_artifact.as_ref())
+            && plan.step(&input.step).is_some()
+            && !depends_transitively_on(plan, step, &input.step)
+        {
+            out.push(violation(
+                "V29",
+                format!("steps[{index}].content.from_artifact.step"),
+                format!(
+                    "producer {:?} is not a direct or transitive dependency of {:?}",
+                    input.step, step.id
+                ),
+            ));
+        }
+    }
+}
+
+fn depends_transitively_on(plan: &JobPlan, consumer: &StepPlan, producer: &str) -> bool {
+    let mut pending = consumer.depends_on.clone();
+    let mut seen = BTreeSet::new();
+    while let Some(current) = pending.pop() {
+        if current == producer {
+            return true;
+        }
+        if !seen.insert(current.clone()) {
+            continue;
+        }
+        if let Some(step) = plan.step(&current) {
+            pending.extend(step.depends_on.iter().cloned());
+        }
+    }
+    false
 }
 
 fn validate_surface(
@@ -1116,93 +1611,6 @@ fn valid_surface_glob(entry: &str) -> bool {
     entry
         .split('/')
         .all(|segment| !segment.is_empty() && segment != ".." && segment != ".")
-}
-
-fn validate_publish(path: &str, step: &StepPlan, out: &mut Vec<PlanViolation>) {
-    if step.publish.is_none() {
-        out.push(violation(
-            "V27",
-            format!("{path}.publish"),
-            "invalid publish step: a publish step declares its publish block",
-        ));
-    }
-    if step.inputs.len() != 1 {
-        out.push(violation(
-            "V27",
-            format!("{path}.inputs"),
-            "invalid publish step: exactly one input names the artifact to publish",
-        ));
-    }
-    if step.retries != 0 {
-        out.push(violation(
-            "V27",
-            format!("{path}.retries"),
-            "invalid publish step: a publish is never retried, so retries is 0",
-        ));
-    }
-    if !matches!(step.effect, Effect::Write) {
-        out.push(violation(
-            "V27",
-            format!("{path}.effect"),
-            "invalid publish step: a publish writes, so effect is write",
-        ));
-    }
-    if step.idempotent {
-        out.push(violation(
-            "V27",
-            format!("{path}.idempotent"),
-            "invalid publish step: a publish is not idempotent",
-        ));
-    }
-    let forbidden = |field: &str, present: bool, out: &mut Vec<PlanViolation>| {
-        if present {
-            out.push(violation(
-                "V27",
-                format!("{path}.{field}"),
-                format!("invalid publish step: a publish step declares no {field}"),
-            ));
-        }
-    };
-    forbidden("prompt", step.prompt.is_some(), out);
-    forbidden("requires", !step.requires.is_empty(), out);
-    forbidden("pin", step.pin.is_some(), out);
-    forbidden("prefer", !step.prefer.is_empty(), out);
-    forbidden("allow_offline", step.allow_offline, out);
-    forbidden("produces", step.produces.is_some(), out);
-    forbidden("channel", step.channel.is_some(), out);
-    forbidden("target", step.target.is_some(), out);
-    forbidden("content", step.content.is_some(), out);
-
-    if let Some(input) = step.inputs.first()
-        && !step.depends_on.iter().any(|dep| dep == &input.step)
-    {
-        out.push(violation(
-            "V27",
-            format!("{path}.depends_on"),
-            format!(
-                "invalid publish step: depends_on names the producer {:?}",
-                input.step
-            ),
-        ));
-    }
-
-    let Some(publish) = &step.publish else {
-        return;
-    };
-    if publish.pull_request && !publish.push {
-        out.push(violation(
-            "V31",
-            format!("{path}.publish.pull_request"),
-            "invalid publish target: pull_request needs push",
-        ));
-    }
-    if publish.base.trim().is_empty() || publish.base.chars().any(char::is_whitespace) {
-        out.push(violation(
-            "V31",
-            format!("{path}.publish.base"),
-            "invalid publish target: a branch name without whitespace",
-        ));
-    }
 }
 
 fn validate_deliver(path: &str, plan: &JobPlan, step: &StepPlan, out: &mut Vec<PlanViolation>) {
@@ -1451,6 +1859,22 @@ const fn is_default_consecutive_failures(value: &u32) -> bool {
 
 const fn default_inline_max_bytes() -> u64 {
     DEFAULT_INLINE_MAX_BYTES
+}
+
+const fn default_max_plan_bytes() -> u64 {
+    DEFAULT_MAX_PLAN_BYTES
+}
+
+const fn is_default_max_plan_bytes(value: &u64) -> bool {
+    *value == DEFAULT_MAX_PLAN_BYTES
+}
+
+const fn default_max_prompt_bytes() -> u64 {
+    DEFAULT_MAX_PROMPT_BYTES
+}
+
+const fn is_default_max_prompt_bytes(value: &u64) -> bool {
+    *value == DEFAULT_MAX_PROMPT_BYTES
 }
 
 const fn default_step_timeout_ms() -> u64 {
@@ -1771,6 +2195,7 @@ mod tests {
                  "produces": {"name": "news", "max_bytes": 65536},
                  "verify": [{"check": "final_message_present"}]},
                 {"id": "summarise", "action": "agent", "prompt": "a",
+                 "depends_on": ["fetch"],
                  "inputs": [{"step": "fetch", "name": "news"}],
                  "verify": [{"check": "artifact_within_cap", "name": "news"}]}
             ]
@@ -1878,9 +2303,83 @@ mod tests {
     fn v21_refuses_a_plan_with_no_evidence() {
         let unverifiable = plan(json!({
             "id": "digest",
-            "steps": [{"id": "fetch", "action": "agent", "prompt": "a"}]
+            "steps": [{"id": "fetch", "action": "agent", "prompt": "a", "verify": []}]
         }));
         assert!(rules(&unverifiable).contains(&"V21"));
+    }
+
+    #[test]
+    fn v21_resolves_defaults_and_scopes_empty_verify_to_named_agents() {
+        let defaulted = plan(json!({
+            "id": "digest",
+            "steps": [
+                {
+                    "id": "fetch",
+                    "prompt": "gather",
+                    "produces": {"name": "news"}
+                },
+                {
+                    "id": "send",
+                    "action": "deliver",
+                    "depends_on": ["fetch"],
+                    "channel": "imessage",
+                    "target": {"handle": "+1"},
+                    "content": {"text": "done"}
+                }
+            ]
+        }));
+        assert_eq!(
+            defaulted.steps[0].verify,
+            vec![
+                JobCheck::FinalMessagePresent,
+                JobCheck::ArtifactWithinCap {
+                    name: "news".to_string()
+                }
+            ]
+        );
+        assert!(matches!(
+            defaulted.steps[1].verify.as_slice(),
+            [JobCheck::DeliveryReceipt { channel, target }]
+                if channel == "imessage" && target == &json!({"handle": "+1"})
+        ));
+        assert!(validate_plan(&defaulted).is_empty());
+
+        let accepted_empty = plan(json!({
+            "id": "digest",
+            "limits": {"accept_unverified": ["fetch"]},
+            "steps": [{"id": "fetch", "prompt": "gather", "verify": []}]
+        }));
+        assert!(validate_plan(&accepted_empty).is_empty());
+
+        let deliver_empty = plan(json!({
+            "id": "digest",
+            "limits": {"accept_unverified": ["send"]},
+            "steps": [{
+                "id": "send",
+                "action": "deliver",
+                "channel": "imessage",
+                "target": {"handle": "+1"},
+                "content": {"text": "done"},
+                "verify": []
+            }]
+        }));
+        assert!(rules(&deliver_empty).contains(&"V21"));
+
+        let unknown = plan(json!({
+            "id": "digest",
+            "limits": {"accept_unverified": ["ghost"]},
+            "steps": [
+                {"id": "fetch", "prompt": "gather", "verify": []},
+                {
+                    "id": "send",
+                    "action": "deliver",
+                    "channel": "imessage",
+                    "target": {"handle": "+1"},
+                    "content": {"text": "done"}
+                }
+            ]
+        }));
+        assert!(rules(&unknown).contains(&"V21"));
     }
 
     #[test]
@@ -1893,6 +2392,364 @@ mod tests {
                        "verify": [{"check": "final_message_present"}]}]
         }));
         assert!(rules(&empty_entry).contains(&"V22"));
+    }
+
+    #[test]
+    fn v22_requires_unique_nonempty_prefer_entries_per_list() {
+        for worker in ["", &"x".repeat(129)] {
+            let invalid = plan(json!({
+                "id": "digest",
+                "limits": {"prefer": [worker]},
+                "steps": [{"id": "fetch", "prompt": "a", "prefer": [worker]}]
+            }));
+            assert!(rules(&invalid).contains(&"V22"));
+        }
+
+        let valid = plan(json!({
+            "id": "digest",
+            "limits": {"prefer": ["mac"]},
+            "steps": [{"id": "fetch", "prompt": "a", "prefer": ["vps"]}]
+        }));
+        assert!(validate_plan(&valid).is_empty());
+
+        let duplicate_job = plan(json!({
+            "id": "digest",
+            "limits": {"prefer": ["mac", "mac"]},
+            "steps": [{"id": "fetch", "prompt": "a"}]
+        }));
+        assert!(rules(&duplicate_job).contains(&"V22"));
+
+        let duplicate_step = plan(json!({
+            "id": "digest",
+            "steps": [{"id": "fetch", "prompt": "a", "prefer": ["mac", "mac"]}]
+        }));
+        assert!(rules(&duplicate_step).contains(&"V22"));
+    }
+
+    #[test]
+    fn v23_bounds_agent_inputs_but_not_deliver_references() {
+        let agent = |cap: u64| {
+            plan(json!({
+                "id": "digest",
+                "limits": {"inline_max_bytes": 100},
+                "steps": [
+                    {
+                        "id": "fetch",
+                        "prompt": "gather",
+                        "produces": {"name": "news", "max_bytes": cap}
+                    },
+                    {
+                        "id": "compose",
+                        "prompt": "compose",
+                        "depends_on": ["fetch"],
+                        "inputs": [{"step": "fetch", "name": "news"}]
+                    }
+                ]
+            }))
+        };
+        assert!(validate_plan(&agent(100)).is_empty());
+        assert!(rules(&agent(101)).contains(&"V23"));
+
+        let deliver = plan(json!({
+            "id": "digest",
+            "limits": {"inline_max_bytes": 1},
+            "steps": [
+                {
+                    "id": "fetch",
+                    "prompt": "gather",
+                    "produces": {"name": "news", "max_bytes": 262_144}
+                },
+                {
+                    "id": "send",
+                    "action": "deliver",
+                    "depends_on": ["fetch"],
+                    "channel": "imessage",
+                    "target": {"handle": "+1"},
+                    "content": {"from_artifact": {"step": "fetch", "name": "news"}}
+                }
+            ]
+        }));
+        assert!(
+            validate_plan(&deliver).is_empty(),
+            "{:?}",
+            validate_plan(&deliver)
+        );
+    }
+
+    fn plan_at_size_cap(cap: u64) -> JobPlan {
+        plan(json!({
+            "id": "digest",
+            "limits": {
+                "max_plan_bytes": cap,
+                "max_prompt_bytes": 32_768
+            },
+            "steps": [{
+                "id": "fetch",
+                "prompt": "x".repeat(16_000)
+            }]
+        }))
+    }
+
+    #[test]
+    fn v24_enforces_the_plan_size_cap_at_the_boundary() {
+        let mut cap = 20_000;
+        loop {
+            let measured = canonical_json(&plan_at_size_cap(cap).frozen_json()).len();
+            if measured == usize::try_from(cap).unwrap() {
+                break;
+            }
+            cap = u64::try_from(measured).unwrap();
+        }
+
+        assert!(validate_plan(&plan_at_size_cap(cap)).is_empty());
+        assert!(validate_plan(&plan_at_size_cap(cap + 1)).is_empty());
+        assert!(rules(&plan_at_size_cap(cap - 1)).contains(&"V24"));
+    }
+
+    #[test]
+    fn v25_enforces_the_prompt_cap_at_the_boundary() {
+        let prompt = |prompt_bytes: u64, cap: u64| {
+            plan(json!({
+                "id": "digest",
+                "limits": {
+                    "max_prompt_bytes": cap,
+                    "max_plan_bytes": 1_048_576
+                },
+                "steps": [{"id": "fetch", "prompt": "x".repeat(prompt_bytes as usize)}]
+            }))
+        };
+        let max = 4_096;
+        assert!(validate_plan(&prompt(max - 1, max)).is_empty());
+        assert!(validate_plan(&prompt(max, max)).is_empty());
+        assert!(rules(&prompt(max + 1, max)).contains(&"V25"));
+    }
+
+    #[test]
+    fn v26_enforces_the_child_task_cap_at_the_boundary() {
+        let plan_with_prompt = |prompt_bytes: usize| {
+            plan(json!({
+                "id": "digest",
+                "limits": {
+                    "max_plan_bytes": 2_097_152,
+                    "max_prompt_bytes": 2_097_152
+                },
+                "steps": [{"id": "fetch", "prompt": "x".repeat(prompt_bytes)}]
+            }))
+        };
+        let probe = plan_with_prompt(0);
+        let overhead = child_task_message_upper_bound(&probe, &probe.steps[0]);
+        let max_prompt = MAX_CHILD_TASK_BYTES - overhead;
+
+        assert!(validate_plan(&plan_with_prompt(max_prompt - 1)).is_empty());
+        assert!(validate_plan(&plan_with_prompt(max_prompt)).is_empty());
+        assert!(rules(&plan_with_prompt(max_prompt + 1)).contains(&"V26"));
+    }
+
+    #[test]
+    fn v27_validates_numeric_artifact_and_receipt_parameters() {
+        for k in [1, 10] {
+            let valid = plan(json!({
+                "id": "digest",
+                "steps": [{"id": "fetch", "prompt": "a",
+                           "verify": [{"check": "no_error_tool_result_tail", "k": k}]}]
+            }));
+            assert!(validate_plan(&valid).is_empty());
+        }
+        for k in [0, 11] {
+            let invalid = plan(json!({
+                "id": "digest",
+                "steps": [{"id": "fetch", "prompt": "a",
+                           "verify": [{"check": "no_error_tool_result_tail", "k": k}]}]
+            }));
+            assert!(rules(&invalid).contains(&"V27"));
+        }
+        for n in [1, 100] {
+            let valid = plan(json!({
+                "id": "digest",
+                "steps": [{"id": "fetch", "prompt": "a",
+                           "verify": [{"check": "min_tool_results", "n": n}]}]
+            }));
+            assert!(validate_plan(&valid).is_empty());
+        }
+        for n in [0, 101] {
+            let invalid = plan(json!({
+                "id": "digest",
+                "steps": [{"id": "fetch", "prompt": "a",
+                           "verify": [{"check": "min_tool_results", "n": n}]}]
+            }));
+            assert!(rules(&invalid).contains(&"V27"));
+        }
+
+        let produced = plan(json!({
+            "id": "digest",
+            "steps": [{
+                "id": "fetch",
+                "prompt": "a",
+                "produces": {"name": "news"},
+                "verify": [{"check": "artifact_within_cap", "name": "news"}]
+            }]
+        }));
+        assert!(validate_plan(&produced).is_empty());
+        let consumed = plan(json!({
+            "id": "digest",
+            "steps": [
+                {"id": "fetch", "prompt": "a", "produces": {"name": "news"}},
+                {
+                    "id": "compose",
+                    "prompt": "b",
+                    "depends_on": ["fetch"],
+                    "inputs": [{"step": "fetch", "name": "news"}],
+                    "verify": [{"check": "artifact_within_cap", "name": "news"}]
+                }
+            ]
+        }));
+        assert!(validate_plan(&consumed).is_empty());
+        let unknown = plan(json!({
+            "id": "digest",
+            "steps": [{
+                "id": "fetch",
+                "prompt": "a",
+                "verify": [{"check": "artifact_within_cap", "name": "ghost"}]
+            }]
+        }));
+        assert!(rules(&unknown).contains(&"V27"));
+
+        let receipt = plan(json!({
+            "id": "digest",
+            "steps": [{
+                "id": "send",
+                "action": "deliver",
+                "channel": "imessage",
+                "target": {"handle": "+1"},
+                "content": {"text": "done"},
+                "verify": [{
+                    "check": "delivery_receipt",
+                    "channel": "imessage",
+                    "target": {"handle": "+1"}
+                }]
+            }]
+        }));
+        assert!(validate_plan(&receipt).is_empty());
+        let wrong_target = plan(json!({
+            "id": "digest",
+            "steps": [{
+                "id": "send",
+                "action": "deliver",
+                "channel": "imessage",
+                "target": {"handle": "+1"},
+                "content": {"text": "done"},
+                "verify": [{
+                    "check": "delivery_receipt",
+                    "channel": "imessage",
+                    "target": {"handle": "+2"}
+                }]
+            }]
+        }));
+        assert!(rules(&wrong_target).contains(&"V27"));
+    }
+
+    #[test]
+    fn v27_refuses_unknown_and_conductor_added_checks() {
+        for check in [
+            "no_candidate",
+            "binding_conflict",
+            "artifact_unavailable",
+            "artifact_digest_mismatch",
+            "effect_gate",
+            "cancelled",
+            "invented",
+        ] {
+            let error = serde_json::from_value::<JobCheck>(json!({"check": check}))
+                .expect_err("the V27 check set is closed");
+            assert!(
+                error.to_string().contains("invalid check"),
+                "{check}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn v28_requires_optional_steps_to_continue() {
+        let invalid = plan(json!({
+            "id": "digest",
+            "steps": [{
+                "id": "fetch",
+                "prompt": "a",
+                "optional": true,
+                "on_failure": "halt"
+            }]
+        }));
+        assert!(rules(&invalid).contains(&"V28"));
+        let valid = plan(json!({
+            "id": "digest",
+            "steps": [{
+                "id": "fetch",
+                "prompt": "a",
+                "optional": true,
+                "on_failure": "continue"
+            }]
+        }));
+        assert!(validate_plan(&valid).is_empty());
+    }
+
+    #[test]
+    fn v29_requires_direct_or_transitive_artifact_dependencies() {
+        let transitive = plan(json!({
+            "id": "digest",
+            "steps": [
+                {"id": "fetch", "prompt": "a", "produces": {"name": "news"}},
+                {"id": "normalise", "prompt": "b", "depends_on": ["fetch"]},
+                {
+                    "id": "compose",
+                    "prompt": "c",
+                    "depends_on": ["normalise"],
+                    "inputs": [{"step": "fetch", "name": "news"}]
+                }
+            ]
+        }));
+        assert!(validate_plan(&transitive).is_empty());
+        let unrelated = plan(json!({
+            "id": "digest",
+            "steps": [
+                {"id": "fetch", "prompt": "a", "produces": {"name": "news"}},
+                {
+                    "id": "compose",
+                    "prompt": "c",
+                    "inputs": [{"step": "fetch", "name": "news"}]
+                }
+            ]
+        }));
+        assert!(rules(&unrelated).contains(&"V29"));
+    }
+
+    #[test]
+    fn v30_refuses_later_phase_policy_declarations() {
+        let output_schema = plan(json!({
+            "id": "digest",
+            "steps": [{"id": "fetch", "prompt": "a", "output_schema": {"type": "object"}}]
+        }));
+        assert!(rules(&output_schema).contains(&"V30"));
+        let binary = plan(json!({
+            "id": "digest",
+            "steps": [{
+                "id": "fetch",
+                "prompt": "a",
+                "produces": {"name": "blob", "media": "binary"}
+            }]
+        }));
+        assert!(rules(&binary).contains(&"V30"));
+        let parallel = plan(json!({
+            "id": "digest",
+            "limits": {"max_parallel": 2},
+            "steps": [{"id": "fetch", "prompt": "a"}]
+        }));
+        assert!(rules(&parallel).contains(&"V30"));
+
+        let error = serde_json::from_value::<JobCheck>(
+            json!({"check": "report_matches_schema", "schema": {"type": "object"}}),
+        )
+        .expect_err("P2 schema checks are unavailable in v1");
+        assert!(error.to_string().contains("phase_unavailable"), "{error}");
     }
 
     #[test]
@@ -2121,7 +2978,8 @@ mod tests {
         assert_eq!(canonical_json(&plan.frozen_json()), GOLDEN_CANONICAL);
     }
 
-    /// A well-formed self-dev plan: one patch producer, one publish step.
+    /// A pre-normative frozen self-dev plan. The action is retained only so
+    /// committed bytes remain deserializable and their digest remains stable.
     fn proposal() -> JobPlan {
         plan(json!({
             "id": "self-dev",
@@ -2148,19 +3006,17 @@ mod tests {
         }))
     }
 
-    fn rules_of(mutate: impl FnOnce(&mut serde_json::Value)) -> Vec<&'static str> {
-        let mut value = proposal().frozen_json();
-        mutate(&mut value);
-        rules(&plan(value))
-    }
-
-    fn publish_step(value: &mut serde_json::Value) -> &mut serde_json::Value {
-        &mut value["steps"][1]
-    }
-
     #[test]
-    fn a_well_formed_publish_plan_validates() {
-        assert_eq!(validate_plan(&proposal()), Vec::new());
+    fn v32_refuses_publish_for_new_plans_but_the_frozen_plan_replays() {
+        let frozen = proposal();
+        let bytes = canonical_json(&frozen.frozen_json());
+        let digest = frozen.digest();
+        assert!(rules(&frozen).contains(&"V32"));
+
+        let replay: JobPlan =
+            serde_json::from_str(&bytes).expect("the old frozen plan still loads");
+        assert_eq!(canonical_json(&replay.frozen_json()), bytes);
+        assert_eq!(replay.digest(), digest);
     }
 
     #[test]
@@ -2203,101 +3059,77 @@ mod tests {
     }
 
     #[test]
-    fn publish_ok_names_itself_and_is_owned_by_the_conductor() {
+    fn publish_ok_names_itself_and_is_owned_by_the_publish_step() {
         assert_eq!(JobCheck::PublishOk.name(), "publish_ok");
         assert!(JobCheck::PublishOk.to_check_spec().is_none());
     }
 
     #[test]
-    fn v27_rejects_a_publish_step_that_breaks_the_fixed_shape() {
+    fn v32_rejects_the_publish_field_on_another_action() {
+        let mut value = minimal().frozen_json();
+        value["steps"][0]["publish"] = json!({"gates": true});
+        let rules = rules(&plan(value));
+        assert!(rules.contains(&"V32"), "{rules:?}");
+    }
+
+    fn tool_publish_plan() -> serde_json::Value {
+        json!({
+            "id": "tool-publish",
+            "limits": {"deadline_ms": 1_800_000},
+            "steps": [{
+                "id": "patch",
+                "prompt": "propose a patch",
+                "produces": {"name": "patch", "max_bytes": 65536},
+                "verify": [{"check": "artifact_within_cap", "name": "patch"}]
+            }, {
+                "id": "publish",
+                "prompt": "call the publish tool once; it takes no arguments",
+                "depends_on": ["patch"],
+                "inputs": [{"step": "patch", "name": "patch"}],
+                "effect": "write",
+                "retries": 0,
+                "verify": [{"check": "publish_ok"}]
+            }]
+        })
+    }
+
+    #[test]
+    fn v33_accepts_publish_ok_on_an_agent_step_that_consumes_an_artifact() {
+        let held = plan(tool_publish_plan());
+        assert!(rules(&held).is_empty(), "{:?}", rules(&held));
+        let step = held.step("publish").expect("declared");
+        assert!(matches!(step.action, StepAction::Agent));
+        assert!(!step.is_publish());
         assert!(
-            rules_of(|value| {
-                publish_step(value)
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("publish");
-            })
-            .contains(&"V27")
-        );
-        assert!(
-            rules_of(|value| {
-                publish_step(value)["inputs"]
-                    .as_array_mut()
-                    .unwrap()
-                    .push(json!({"step": "patch", "name": "patch"}));
-            })
-            .contains(&"V27")
-        );
-        assert!(rules_of(|value| publish_step(value)["retries"] = json!(1)).contains(&"V27"));
-        assert!(rules_of(|value| publish_step(value)["effect"] = json!("read")).contains(&"V27"));
-        assert!(rules_of(|value| publish_step(value)["idempotent"] = json!(true)).contains(&"V27"));
-        assert!(rules_of(|value| publish_step(value)["prompt"] = json!("do it")).contains(&"V27"));
-        assert!(
-            rules_of(|value| publish_step(value)["produces"] = json!({"name": "again"}))
-                .contains(&"V27")
-        );
-        assert!(rules_of(|value| publish_step(value)["depends_on"] = json!([])).contains(&"V27"));
-        assert!(
-            rules_of(|value| publish_step(value)["channel"] = json!("mock-im")).contains(&"V27")
-        );
-        assert!(
-            rules_of(|value| publish_step(value)["requires"] = json!(["repo"])).contains(&"V27")
+            step.verify
+                .iter()
+                .any(|check| matches!(check, JobCheck::PublishOk))
         );
     }
 
     #[test]
-    fn v27_rejects_the_publish_field_on_another_action() {
-        let rules = rules_of(|value| value["steps"][0]["publish"] = json!({"gates": true}));
-        assert!(rules.contains(&"V27"), "{rules:?}");
+    fn v33_refuses_a_publish_step_without_its_artifact_or_with_retries() {
+        let mut no_input = tool_publish_plan();
+        no_input["steps"][1]["inputs"] = json!([]);
+        assert!(rules(&plan(no_input)).contains(&"V33"));
+
+        let mut two_inputs = tool_publish_plan();
+        let input = two_inputs["steps"][1]["inputs"][0].clone();
+        two_inputs["steps"][1]["inputs"] = json!([input, input]);
+        assert!(rules(&plan(two_inputs)).contains(&"V33"));
+
+        let mut retried = tool_publish_plan();
+        retried["steps"][1]["retries"] = json!(1);
+        assert!(rules(&plan(retried)).contains(&"V33"));
     }
 
     #[test]
-    fn v28_allows_at_most_one_publish_step() {
-        let rules = rules_of(|value| {
-            let copy = value["steps"][1].clone();
-            value["steps"].as_array_mut().unwrap()[1]["id"] = json!("publish-again");
-            value["steps"].as_array_mut().unwrap().push(copy);
-        });
-        assert!(rules.contains(&"V28"), "{rules:?}");
-    }
-
-    #[test]
-    fn v29_requires_a_declared_surface() {
-        let rules = rules_of(|value| {
-            value["steps"][0]["verify"] =
-                json!([{"check": "artifact_within_cap", "name": "patch"}]);
-        });
-        assert!(rules.contains(&"V29"), "{rules:?}");
-    }
-
-    #[test]
-    fn v31_rejects_a_pull_request_without_a_push_and_a_blank_base() {
-        let rules = rules_of(|value| {
-            publish_step(value)["publish"]["pull_request"] = json!(true);
-        });
-        assert!(rules.contains(&"V31"), "{rules:?}");
-        let rules = rules_of(|value| {
-            publish_step(value)["publish"]["base"] = json!("release 1");
-        });
-        assert!(rules.contains(&"V31"), "{rules:?}");
-        let rules = rules_of(|value| {
-            publish_step(value)["publish"]["base"] = json!("");
-        });
-        assert!(rules.contains(&"V31"), "{rules:?}");
-        assert!(
-            !rules_of(|value| {
-                publish_step(value)["publish"]["push"] = json!(true);
-                publish_step(value)["publish"]["pull_request"] = json!(true);
-            })
-            .contains(&"V31")
-        );
-    }
-
-    #[test]
-    fn a_publish_step_freezes_into_the_plan_digest() {
-        let without = proposal();
-        let mut value = without.frozen_json();
-        publish_step(&mut value)["publish"]["gates"] = json!(false);
-        assert_ne!(plan(value).digest(), without.digest());
+    fn v33_refuses_a_second_publish_step() {
+        let mut value = tool_publish_plan();
+        let mut second = value["steps"][1].clone();
+        second["id"] = json!("publish-again");
+        value["steps"].as_array_mut().expect("array").push(second);
+        let rules = rules(&plan(value));
+        assert!(rules.contains(&"V33"), "{rules:?}");
     }
 }

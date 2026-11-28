@@ -294,6 +294,59 @@ async fn queue_timeout_is_honest_and_marks_abandoned() {
     let _ = std::fs::remove_file(&db);
 }
 
+/// Without a live caller, the startup/sweep pass converges aged `pending`
+/// rows and returns one structured audit fact per row. `inflight` work is
+/// never swept.
+#[tokio::test]
+async fn orphan_pending_sweep_abandons_only_aged_pending_rows() {
+    let db = temp_db();
+    let store = ExecStore::open(&db).await.unwrap();
+    let pending = Uuid::new_v4();
+    let inflight = Uuid::new_v4();
+    store
+        .enqueue(
+            pending,
+            "box",
+            &cmd(&["echo", "orphan"]),
+            Some("call-orphan"),
+        )
+        .await
+        .unwrap();
+    store
+        .enqueue(
+            inflight,
+            "box",
+            &cmd(&["echo", "running"]),
+            Some("call-running"),
+        )
+        .await
+        .unwrap();
+    store.mark_inflight(inflight).await.unwrap();
+    sqlx::query("UPDATE exec_queue SET created_at = 0, updated_at = 0")
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let audit = store.abandon_aged_pending(10, 20).await.unwrap();
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].command_id, pending);
+    assert_eq!(audit[0].endpoint_id, "box");
+    assert_eq!(audit[0].tool_call_ref.as_deref(), Some("call-orphan"));
+    assert_eq!(audit[0].dispatch_attempts, 0);
+    assert_eq!(
+        store.get(pending).await.unwrap().unwrap().status,
+        QueueStatus::Abandoned
+    );
+    assert_eq!(
+        store.get(inflight).await.unwrap().unwrap().status,
+        QueueStatus::Inflight,
+        "the sweep is pending-only"
+    );
+
+    store.close().await;
+    let _ = std::fs::remove_file(&db);
+}
+
 /// Simulated server restart — connection manager dropped, pool reopened —
 /// re-drives the parked `pending` rows once the endpoint (re)connects:
 /// the row settles `done` with the real result even though the original
@@ -1035,10 +1088,10 @@ async fn foreign_row_lease_blocks_dispatch_until_expiry() {
 
 // -- bounded re-drive (ADR-033) -----------------------------------------
 
-/// Store-level bound: every claim counts a dispatch attempt; an `inflight`
-/// row is re-drivable only while `dispatch_attempts < max_dispatches`; the
-/// convergence transition refuses to race a live lease and is terminal once
-/// taken.
+/// Store-level bound: an attempt commits only after a written frame; an
+/// `inflight` row is re-drivable only while `dispatch_attempts <
+/// max_dispatches`; the convergence transition refuses to race a live lease
+/// and is terminal once taken.
 #[tokio::test]
 async fn dispatch_attempts_count_and_the_redrive_bound_converges() {
     no_proxy();
@@ -1051,8 +1104,8 @@ async fn dispatch_attempts_count_and_the_redrive_bound_converges() {
         .unwrap();
 
     assert_eq!(store.get(id).await.unwrap().unwrap().dispatch_attempts, 0);
-    // First dispatch: a `pending` row is always admitted (the guard is for
-    // re-drives), and the attempt is counted.
+    // First dispatch: a `pending` row is always claimed (the guard is for
+    // re-drives); the claim itself does not spend an attempt.
     assert!(
         store
             .claim_queue_row(id, "replica-a", 1_000, 0, 2)
@@ -1060,12 +1113,25 @@ async fn dispatch_attempts_count_and_the_redrive_bound_converges() {
             .unwrap()
     );
     store.mark_inflight(id).await.unwrap();
+    assert_eq!(store.get(id).await.unwrap().unwrap().dispatch_attempts, 0);
+    assert!(
+        store
+            .commit_dispatch_attempt(id, "replica-a")
+            .await
+            .unwrap()
+    );
     assert_eq!(store.get(id).await.unwrap().unwrap().dispatch_attempts, 1);
 
     // The result was lost: one re-drive is still within `1 + max_redrives`.
     assert!(
         store
             .claim_queue_row(id, "replica-a", 1_000, 10, 2)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .commit_dispatch_attempt(id, "replica-a")
             .await
             .unwrap()
     );
@@ -1093,6 +1159,66 @@ async fn dispatch_attempts_count_and_the_redrive_bound_converges() {
     );
     assert!(store.drivable("box").await.unwrap().is_empty());
 
+    store.close().await;
+    let _ = std::fs::remove_file(&db);
+}
+
+/// A crash between claim and send leaves the attempt unspent. The legacy
+/// refund primitive remains safe for a charged attempt and is idempotent at
+/// zero.
+#[tokio::test]
+async fn claim_without_a_written_frame_does_not_spend_an_attempt() {
+    let db = temp_db();
+    let store = ExecStore::open(&db).await.unwrap();
+    let id: CommandId = Uuid::new_v4();
+    store
+        .enqueue(id, "box", &cmd(&["echo", "crash"]), Some("call-crash"))
+        .await
+        .unwrap();
+
+    assert!(
+        store
+            .claim_queue_row(id, "replica-a", 1_000, 0, 2)
+            .await
+            .unwrap()
+    );
+    assert_eq!(store.get(id).await.unwrap().unwrap().dispatch_attempts, 0);
+    store.close().await;
+
+    let store = ExecStore::open(&db).await.unwrap();
+    assert_eq!(
+        store.get(id).await.unwrap().unwrap().dispatch_attempts,
+        0,
+        "a claim that never reached the wire must not survive reopen as spent"
+    );
+    assert!(
+        !store
+            .refund_dispatch_attempt(id, "replica-a")
+            .await
+            .unwrap(),
+        "refunding a never-charged attempt is a no-op"
+    );
+    assert!(
+        store
+            .claim_queue_row(id, "replica-b", 1_000, 2_000, 2)
+            .await
+            .unwrap()
+    );
+    store.mark_inflight(id).await.unwrap();
+    assert!(
+        store
+            .commit_dispatch_attempt(id, "replica-b")
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .refund_dispatch_attempt(id, "replica-b")
+            .await
+            .unwrap(),
+        "a charged attempt is still refundable"
+    );
+    assert_eq!(store.get(id).await.unwrap().unwrap().dispatch_attempts, 0);
     store.close().await;
     let _ = std::fs::remove_file(&db);
 }

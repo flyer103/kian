@@ -919,12 +919,10 @@ async fn qa_busy_refusal_names_the_owner_then_releases() {
     let spawned_sid = SessionId(Uuid::parse_str(&lineage_session).expect("uuid"));
     streams.set(
         spawned_sid,
-        Ok(vec![ev(
-            spawned_sid,
-            0,
-            EventKind::SessionCreated,
-            Value::Null,
-        )]),
+        Ok(vec![
+            ev(spawned_sid, 0, EventKind::SessionCreated, Value::Null),
+            ev(spawned_sid, 1, EventKind::InputAdmitted, Value::Null),
+        ]),
     );
 
     let before_admits = inbox.admits.lock().unwrap().len();
@@ -973,9 +971,10 @@ async fn qa_busy_refusal_names_the_owner_then_releases() {
         spawned_sid,
         Ok(vec![
             ev(spawned_sid, 0, EventKind::SessionCreated, Value::Null),
+            ev(spawned_sid, 1, EventKind::InputAdmitted, Value::Null),
             ev(
                 spawned_sid,
-                1,
+                2,
                 EventKind::ThreadCompleted,
                 json!({"thread_id": owner_thread, "status": "completed", "summary": {}}),
             ),
@@ -1039,6 +1038,7 @@ async fn qa_busy_check_read_error_fails_closed() {
 fn qa_liveness_release_table() {
     let worker = sid(6);
     let created = || ev(worker, 0, EventKind::SessionCreated, Value::Null);
+    let admitted = |seq| ev(worker, seq, EventKind::InputAdmitted, Value::Null);
 
     // Never started: no session/created and no input.
     assert_eq!(
@@ -1046,9 +1046,16 @@ fn qa_liveness_release_table() {
         kian_superagent::ThreadLiveness::NeverStarted
     );
 
-    // Started, no terminal: live.
+    // Created alone is a leased reservation, not a live binding: the
+    // task row is the fact that makes a thread started.
     assert_eq!(
         thread_liveness(&[created()]),
+        kian_superagent::ThreadLiveness::NeverStarted
+    );
+
+    // Started (created + admitted), no terminal: live.
+    assert_eq!(
+        thread_liveness(&[created(), admitted(1)]),
         kian_superagent::ThreadLiveness::Live
     );
 
@@ -1072,39 +1079,49 @@ fn qa_liveness_release_table() {
 
     // completed releases (both vocabularies); cancelled releases.
     assert_eq!(
-        thread_liveness(&[created(), completed(1)]),
+        thread_liveness(&[created(), admitted(1), completed(2)]),
         kian_superagent::ThreadLiveness::Released
     );
     assert_eq!(
-        thread_liveness(&[created(), ended(1, EndReason::Completed)]),
+        thread_liveness(&[created(), admitted(1), ended(2, EndReason::Completed)]),
         kian_superagent::ThreadLiveness::Released
     );
     assert_eq!(
-        thread_liveness(&[created(), ended(1, EndReason::Cancelled)]),
+        thread_liveness(&[created(), admitted(1), ended(2, EndReason::Cancelled)]),
         kian_superagent::ThreadLiveness::Released
     );
 
     // failed / interrupted are resumable: the worker stays held.
     assert_eq!(
-        thread_liveness(&[created(), failed(1)]),
+        thread_liveness(&[created(), admitted(1), failed(2)]),
         kian_superagent::ThreadLiveness::Live
     );
     assert_eq!(
-        thread_liveness(&[created(), ended(1, EndReason::Failed)]),
+        thread_liveness(&[created(), admitted(1), ended(2, EndReason::Failed)]),
         kian_superagent::ThreadLiveness::Live
     );
     assert_eq!(
-        thread_liveness(&[created(), ended(1, EndReason::Interrupted)]),
+        thread_liveness(&[created(), admitted(1), ended(2, EndReason::Interrupted)]),
         kian_superagent::ThreadLiveness::Live
     );
 
     // Last terminal wins in both orders.
     assert_eq!(
-        thread_liveness(&[created(), failed(1), ended(2, EndReason::Completed)]),
+        thread_liveness(&[
+            created(),
+            admitted(1),
+            failed(2),
+            ended(3, EndReason::Completed)
+        ]),
         kian_superagent::ThreadLiveness::Released
     );
     assert_eq!(
-        thread_liveness(&[created(), completed(1), ended(2, EndReason::Interrupted)]),
+        thread_liveness(&[
+            created(),
+            admitted(1),
+            completed(2),
+            ended(3, EndReason::Interrupted)
+        ]),
         kian_superagent::ThreadLiveness::Live
     );
 }
@@ -1150,7 +1167,10 @@ async fn qa_never_started_reservation_releases_only_after_ttl() {
     let started = QaStreams::shared();
     started.set(
         worker,
-        Ok(vec![ev(worker, 0, EventKind::SessionCreated, Value::Null)]),
+        Ok(vec![
+            ev(worker, 0, EventKind::SessionCreated, Value::Null),
+            ev(worker, 1, EventKind::InputAdmitted, Value::Null),
+        ]),
     );
     let held = busy_owner(
         &router_events,

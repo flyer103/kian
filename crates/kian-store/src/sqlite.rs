@@ -16,13 +16,14 @@ use std::ops::Range;
 use kian_core::events::{Event, EventKind};
 use kian_core::model::{Epoch, InputRow, LeaseRecord, SessionId};
 use kian_core::state::{SessionState, project};
+use sqlx::Sqlite;
+use sqlx::Transaction;
 use sqlx::sqlite::SqlitePool;
 use uuid::Uuid;
 
 use crate::event_store::{AppendGuard, Head, StoreError, classify_cas_rejection, to_i64 as se_i64};
 use crate::inbox::{
-    AdmitOutcome, ExpiredLeases, InboxError, SessionInbox, UnreadableLease, decode_input,
-    to_i64 as ie_i64,
+    ExpiredLeases, InboxError, SessionInbox, UnreadableLease, decode_input, to_i64 as ie_i64,
 };
 
 // -- events -----------------------------------------------------------------
@@ -42,6 +43,9 @@ const BATCH_TAIL_SQL: &str = "INSERT INTO events (session, seq, epoch, ts, kind,
 const HEAD_SQL: &str =
     "SELECT COALESCE(MAX(epoch), 0), COALESCE(MAX(seq), 0) FROM events WHERE session = ?";
 
+const LAST_EVENT_SQL: &str =
+    "SELECT version, envelope FROM events WHERE session = ? ORDER BY seq DESC LIMIT 1";
+
 /// The seq axis only (the unchanged-read fast path — see `version`).
 const VERSION_SQL: &str = "SELECT COALESCE(MAX(seq), 0) FROM events WHERE session = ?";
 
@@ -53,6 +57,9 @@ const SCAN_SQL: &str = "SELECT version, envelope FROM events WHERE session = ? A
 /// already satisfies the `ORDER BY seq`).
 const SCAN_KIND_SQL: &str =
     "SELECT version, envelope FROM events WHERE session = ?1 AND kind = ?2 ORDER BY seq ASC";
+
+const SCAN_KIND_ACROSS_SESSIONS_SQL: &str =
+    "SELECT version, envelope FROM events WHERE kind = ?1 ORDER BY session ASC, seq ASC LIMIT ?2";
 
 /// The CAS refused the write: re-read the head and classify which fence
 /// tripped — the same classification both backends share (§3: pg's
@@ -107,9 +114,21 @@ pub(crate) async fn append_batch(
     envelopes: &[String],
     guard: AppendGuard,
 ) -> Result<(), StoreError> {
+    let mut tx = pool.begin().await?;
+    append_batch_tx(&mut tx, session, events, envelopes, guard).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub(crate) async fn append_batch_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    session: SessionId,
+    events: &[Event],
+    envelopes: &[String],
+    guard: AppendGuard,
+) -> Result<(), StoreError> {
     let first = &events[0];
     let session_key = session.0.to_string();
-    let mut tx = pool.begin().await?;
     // The first row is the same single-statement CAS as `append`: either
     // both fences hold and the batch proceeds (holding the writer lock
     // until commit), or zero rows land and the typed error classifies
@@ -126,12 +145,12 @@ pub(crate) async fn append_batch(
         .bind(se_i64(first.epoch.0, "epoch")?)
         .bind(&session_key)
         .bind(se_i64(first.seq, "seq")?)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     if result.rows_affected() != 1 {
         let (epoch_floor, max_seq): (i64, i64) = sqlx::query_as(HEAD_SQL)
             .bind(&session_key)
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **tx)
             .await?;
         return Err(classify_cas_rejection(session, guard, epoch_floor, max_seq));
     }
@@ -144,10 +163,9 @@ pub(crate) async fn append_batch(
             .bind(event.kind.as_str())
             .bind(i64::from(event.version))
             .bind(envelope.as_str())
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
     }
-    tx.commit().await?;
     Ok(())
 }
 
@@ -177,6 +195,52 @@ pub(crate) async fn scan(
         events.push(event);
     }
     Ok(events)
+}
+
+pub(crate) async fn scan_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    session: SessionId,
+    range: Range<u64>,
+) -> Result<Vec<Event>, StoreError> {
+    let end = range.end.min(i64::MAX as u64);
+    let rows: Vec<(i64, String)> = sqlx::query_as(SCAN_SQL)
+        .bind(session.0.to_string())
+        .bind(se_i64(range.start, "seq")?)
+        .bind(se_i64(end, "seq")?)
+        .fetch_all(&mut **tx)
+        .await?;
+    decode_scan_rows(session, rows)
+}
+
+fn decode_scan_rows(
+    session: SessionId,
+    rows: Vec<(i64, String)>,
+) -> Result<Vec<Event>, StoreError> {
+    let mut events = Vec::with_capacity(rows.len());
+    for (version_col, envelope) in rows {
+        let event: Event = serde_json::from_str(&envelope)?;
+        if i64::from(event.version) != version_col || event.session != session {
+            return Err(StoreError::CorruptRow {
+                session,
+                seq: event.seq,
+            });
+        }
+        events.push(event);
+    }
+    Ok(events)
+}
+
+pub(crate) async fn last_event_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    session: SessionId,
+) -> Result<Option<Event>, StoreError> {
+    let row: Option<(i64, String)> = sqlx::query_as(LAST_EVENT_SQL)
+        .bind(session.0.to_string())
+        .fetch_optional(&mut **tx)
+        .await?;
+    row.map(|(_, envelope)| serde_json::from_str(&envelope))
+        .transpose()
+        .map_err(StoreError::from)
 }
 
 /// The kind-filtered session read (`WHERE session = ? AND kind = ?`,
@@ -212,6 +276,35 @@ pub(crate) async fn scan_kind(
         // the exact value: a row whose full kind differs is not the
         // requested kind (it is not corruption — same kind string) and is
         // skipped, so the result is exactly `scan`-then-`e.kind == kind`.
+        if event.kind != kind {
+            continue;
+        }
+        events.push(event);
+    }
+    Ok(events)
+}
+
+pub(crate) async fn scan_kind_across_sessions(
+    pool: &SqlitePool,
+    kind: EventKind,
+    limit: u64,
+) -> Result<Vec<Event>, StoreError> {
+    let kind_key = kind.as_str();
+    let limit = se_i64(limit, "limit")?;
+    let rows: Vec<(i64, String)> = sqlx::query_as(SCAN_KIND_ACROSS_SESSIONS_SQL)
+        .bind(kind_key)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    let mut events = Vec::with_capacity(rows.len());
+    for (version_col, envelope) in rows {
+        let event: Event = serde_json::from_str(&envelope)?;
+        if i64::from(event.version) != version_col || event.kind.as_str() != kind_key {
+            return Err(StoreError::CorruptRow {
+                session: event.session,
+                seq: event.seq,
+            });
+        }
         if event.kind != kind {
             continue;
         }
@@ -278,6 +371,20 @@ pub(crate) async fn head(pool: &SqlitePool, session: SessionId) -> Result<Head, 
     })
 }
 
+pub(crate) async fn head_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    session: SessionId,
+) -> Result<Head, StoreError> {
+    let (epoch, max_seq): (i64, i64) = sqlx::query_as(HEAD_SQL)
+        .bind(session.0.to_string())
+        .fetch_one(&mut **tx)
+        .await?;
+    Ok(Head {
+        next_seq: max_seq as u64 + 1,
+        epoch: Epoch(epoch as u64),
+    })
+}
+
 /// READ-MODEL §3 (P0): the session's version (`head.next_seq - 1`)
 /// alone. Unlike [`head`] this touches only the seq axis — the PK
 /// index's min/max lookup, no per-row epoch read — so the
@@ -331,6 +438,9 @@ const RECEIPT_BY_KEY_SQL: &str = "SELECT input_id, session, payload, admitted_at
 
 const ELIGIBLE_SQL: &str = "SELECT id, session, payload, admitted_at, eligible_at, idempotency_key FROM inputs WHERE session = ?1 AND consumed_by_seq IS NULL AND eligible_at <= ?2 ORDER BY eligible_at ASC, admitted_seq ASC";
 
+const HAS_UNCONSUMED_SQL: &str =
+    "SELECT EXISTS(SELECT 1 FROM inputs WHERE session = ?1 AND consumed_by_seq IS NULL)";
+
 /// (R17 C4, pin P3-5) the read-only per-session inbox read behind the
 /// task board's `input_required` arm: EVERY row of the session,
 /// consumed rows included — the row is durable and audit-visible after
@@ -338,6 +448,8 @@ const ELIGIBLE_SQL: &str = "SELECT id, session, payload, admitted_at, eligible_a
 /// parent's drain still carries its `state:"waiting"` fact. No
 /// eligibility filter, no clock: the caller reads facts, not work.
 const INPUT_ROWS_SQL: &str = "SELECT id, session, payload, admitted_at, eligible_at, idempotency_key FROM inputs WHERE session = ?1 ORDER BY eligible_at ASC, admitted_seq ASC";
+
+const INPUT_ROWS_ACROSS_SESSIONS_SQL: &str = "SELECT id, session, payload, admitted_at, eligible_at, idempotency_key FROM inputs ORDER BY admitted_at DESC, admitted_seq DESC LIMIT ?1";
 
 const STARTUP_SQL: &str = "SELECT id, session, payload, admitted_at, eligible_at, idempotency_key FROM inputs WHERE consumed_by_seq IS NULL AND eligible_at <= ?1 ORDER BY eligible_at ASC, admitted_seq ASC";
 
@@ -378,125 +490,95 @@ const ALL_LEASES_SQL: &str =
 
 type InputCols = (String, String, String, i64, i64, Option<String>);
 
-pub(crate) async fn admit(pool: &SqlitePool, input: InputRow) -> Result<AdmitOutcome, InboxError> {
-    let payload = serde_json::to_string(&input.payload)?;
-    let session_key = input.session.0.to_string();
-    let result = sqlx::query(ADMIT_SQL)
-        .bind(input.id.to_string())
-        .bind(&session_key)
-        .bind(&payload)
-        .bind(ie_i64(input.admitted_at, "admitted_at")?)
-        .bind(ie_i64(input.eligible_at, "eligible_at")?)
-        .bind(input.idempotency_key.as_deref())
-        .execute(pool)
+pub(crate) async fn input_by_key_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    session: SessionId,
+    key: &str,
+) -> Result<Option<InputRow>, InboxError> {
+    let row: Option<InputCols> = sqlx::query_as(INPUT_BY_KEY_SQL)
+        .bind(session.0.to_string())
+        .bind(key)
+        .fetch_optional(&mut **tx)
         .await?;
-    if result.rows_affected() == 1 {
-        return Ok(AdmitOutcome {
-            input,
-            deduplicated: false,
-        });
-    }
-    // Zero rows: the (session, idempotency_key) index already held a row.
-    // Read it back — first write wins.
-    let Some(key) = input.idempotency_key.clone() else {
-        return Err(InboxError::CorruptRow {
-            session: input.session,
-            input_id: input.id,
-            reason: "insert skipped without an idempotency key".into(),
-        });
-    };
-    let existing: Option<InputCols> = sqlx::query_as(INPUT_BY_KEY_SQL)
-        .bind(&session_key)
-        .bind(&key)
-        .fetch_optional(pool)
-        .await?;
-    existing
-        .map(decode_input)
-        .transpose()?
-        .map(|input| AdmitOutcome {
-            input,
-            deduplicated: true,
-        })
-        .ok_or(InboxError::CorruptRow {
-            session: SessionId(Uuid::parse_str(&session_key).unwrap_or_else(|_| Uuid::nil())),
-            input_id: Uuid::nil(),
-            reason: "unique index reported a collision but no row was found".into(),
-        })
+    row.map(decode_input).transpose()
 }
 
-/// The cross-incarnation channel admission (ADR-081). Identical to
-/// [`admit`] except the insert additionally refuses a key that is already
-/// consumed in any session, or that the receipts ledger already holds
-/// (ADR-082); `deduplicated: true` then names the consumed row (this
-/// session's row is read back first, the suppressing row second, the
-/// archived receipt last).
-pub(crate) async fn admit_channel(
-    pool: &SqlitePool,
-    input: InputRow,
-) -> Result<AdmitOutcome, InboxError> {
-    let payload = serde_json::to_string(&input.payload)?;
-    let session_key = input.session.0.to_string();
-    let result = sqlx::query(ADMIT_CHANNEL_SQL)
+pub(crate) async fn consumed_input_by_key_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    key: &str,
+) -> Result<Option<InputRow>, InboxError> {
+    let row: Option<InputCols> = sqlx::query_as(CONSUMED_BY_KEY_SQL)
+        .bind(key)
+        .fetch_optional(&mut **tx)
+        .await?;
+    row.map(decode_input).transpose()
+}
+
+pub(crate) async fn receipt_by_key_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    key: &str,
+) -> Result<Option<InputRow>, InboxError> {
+    let row: Option<InputCols> = sqlx::query_as(RECEIPT_BY_KEY_SQL)
+        .bind(key)
+        .fetch_optional(&mut **tx)
+        .await?;
+    row.map(decode_input).transpose()
+}
+
+pub(crate) async fn insert_input_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    input: &InputRow,
+    payload: &str,
+) -> Result<bool, InboxError> {
+    let result = sqlx::query(ADMIT_SQL)
         .bind(input.id.to_string())
-        .bind(&session_key)
-        .bind(&payload)
+        .bind(input.session.0.to_string())
+        .bind(payload)
         .bind(ie_i64(input.admitted_at, "admitted_at")?)
         .bind(ie_i64(input.eligible_at, "eligible_at")?)
         .bind(input.idempotency_key.as_deref())
-        .execute(pool)
+        .execute(&mut **tx)
         .await?;
-    if result.rows_affected() == 1 {
-        return Ok(AdmitOutcome {
-            input,
-            deduplicated: false,
-        });
-    }
-    let Some(key) = input.idempotency_key.clone() else {
-        return Err(InboxError::CorruptRow {
-            session: input.session,
-            input_id: input.id,
-            reason: "channel insert skipped without an idempotency key".into(),
-        });
-    };
-    // Zero rows: this session already holds the key (first write wins), or
-    // the cross-incarnation guard refused a key consumed elsewhere.
-    let existing: Option<InputCols> = sqlx::query_as(INPUT_BY_KEY_SQL)
-        .bind(&session_key)
-        .bind(&key)
-        .fetch_optional(pool)
+    Ok(result.rows_affected() == 1)
+}
+
+pub(crate) async fn insert_channel_input_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    input: &InputRow,
+    payload: &str,
+) -> Result<bool, InboxError> {
+    let result = sqlx::query(ADMIT_CHANNEL_SQL)
+        .bind(input.id.to_string())
+        .bind(input.session.0.to_string())
+        .bind(payload)
+        .bind(ie_i64(input.admitted_at, "admitted_at")?)
+        .bind(ie_i64(input.eligible_at, "eligible_at")?)
+        .bind(input.idempotency_key.as_deref())
+        .execute(&mut **tx)
         .await?;
-    if let Some(existing) = existing {
-        return decode_input(existing).map(|input| AdmitOutcome {
-            input,
-            deduplicated: true,
-        });
-    }
-    let suppressed: Option<InputCols> = sqlx::query_as(CONSUMED_BY_KEY_SQL)
-        .bind(&key)
-        .fetch_optional(pool)
-        .await?;
-    if let Some(suppressed) = suppressed {
-        return decode_input(suppressed).map(|input| AdmitOutcome {
-            input,
-            deduplicated: true,
-        });
-    }
-    let receipt: Option<InputCols> = sqlx::query_as(RECEIPT_BY_KEY_SQL)
-        .bind(&key)
-        .fetch_optional(pool)
-        .await?;
-    receipt
-        .map(decode_input)
-        .transpose()?
-        .map(|input| AdmitOutcome {
-            input,
-            deduplicated: true,
-        })
-        .ok_or(InboxError::CorruptRow {
-            session: SessionId(Uuid::parse_str(&session_key).unwrap_or_else(|_| Uuid::nil())),
-            input_id: Uuid::nil(),
-            reason: "channel admit was refused but neither this session's row, a consumed row nor an archived receipt was found".into(),
-        })
+    Ok(result.rows_affected() == 1)
+}
+
+pub(crate) async fn has_unconsumed_inputs_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    session: SessionId,
+) -> Result<bool, InboxError> {
+    sqlx::query_scalar(HAS_UNCONSUMED_SQL)
+        .bind(session.0.to_string())
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(InboxError::from)
+}
+
+pub(crate) async fn has_unconsumed_inputs(
+    pool: &SqlitePool,
+    session: SessionId,
+) -> Result<bool, InboxError> {
+    sqlx::query_scalar(HAS_UNCONSUMED_SQL)
+        .bind(session.0.to_string())
+        .fetch_one(pool)
+        .await
+        .map_err(InboxError::from)
 }
 
 pub(crate) async fn eligible_inputs(
@@ -520,6 +602,17 @@ pub(crate) async fn input_rows(
 ) -> Result<Vec<InputRow>, InboxError> {
     let rows: Vec<InputCols> = sqlx::query_as(INPUT_ROWS_SQL)
         .bind(session.0.to_string())
+        .fetch_all(pool)
+        .await?;
+    rows.into_iter().map(decode_input).collect()
+}
+
+pub(crate) async fn input_rows_across_sessions(
+    pool: &SqlitePool,
+    limit: u64,
+) -> Result<Vec<InputRow>, InboxError> {
+    let rows: Vec<InputCols> = sqlx::query_as(INPUT_ROWS_ACROSS_SESSIONS_SQL)
+        .bind(ie_i64(limit, "limit")?)
         .fetch_all(pool)
         .await?;
     rows.into_iter().map(decode_input).collect()
@@ -602,6 +695,62 @@ pub(crate) async fn claim(
         let live: Option<(i64, String, i64, i64)> = sqlx::query_as(CLAIM_ROW_SQL)
             .bind(&session_key)
             .fetch_optional(pool)
+            .await?;
+        let Some((epoch, live_holder, live_ttl, last_heartbeat)) = live else {
+            return Err(InboxError::CorruptRow {
+                session,
+                input_id: Uuid::nil(),
+                reason: "conditional claim refused but no claims row exists".into(),
+            });
+        };
+        return Err(InboxError::ClaimRejected {
+            session,
+            holder: live_holder,
+            epoch: Epoch(u64::try_from(epoch).map_err(|_| InboxError::CorruptRow {
+                session,
+                input_id: Uuid::nil(),
+                reason: format!("claims table returned a negative epoch ({epoch})"),
+            })?),
+            expires_at_ms: u64::try_from(last_heartbeat)
+                .unwrap_or(u64::MAX)
+                .saturating_add(u64::try_from(live_ttl).unwrap_or(u64::MAX)),
+        });
+    };
+    Ok(LeaseRecord {
+        session,
+        epoch: Epoch(u64::try_from(epoch).map_err(|_| InboxError::CorruptRow {
+            session,
+            input_id: Uuid::nil(),
+            reason: format!("claims table returned a negative epoch ({epoch})"),
+        })?),
+        holder: holder.to_string(),
+        ttl_ms,
+        last_heartbeat: now_ms,
+    })
+}
+
+pub(crate) async fn claim_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    session: SessionId,
+    holder: &str,
+    ttl_ms: u64,
+    now_ms: u64,
+) -> Result<LeaseRecord, InboxError> {
+    let session_key = session.0.to_string();
+    let issued: Option<i64> = sqlx::query_scalar(CLAIM_SQL)
+        .bind(&session_key)
+        .bind(&session_key)
+        .bind(&session_key)
+        .bind(holder)
+        .bind(ie_i64(ttl_ms, "ttl_ms")?)
+        .bind(ie_i64(now_ms, "now_ms")?)
+        .bind(ie_i64(now_ms, "now_ms")?)
+        .fetch_optional(&mut **tx)
+        .await?;
+    let Some(epoch) = issued else {
+        let live: Option<(i64, String, i64, i64)> = sqlx::query_as(CLAIM_ROW_SQL)
+            .bind(&session_key)
+            .fetch_optional(&mut **tx)
             .await?;
         let Some((epoch, live_holder, live_ttl, last_heartbeat)) = live else {
             return Err(InboxError::CorruptRow {

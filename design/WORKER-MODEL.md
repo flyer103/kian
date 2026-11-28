@@ -1,437 +1,422 @@
-# Worker model — the worker-domain contract
+# Worker model
 
-- **Status**: normative; the contract is implemented.
-  **Amended 2026-11-18**: binding release by thread close, the explicit release verb and the
-  bounded idle reclaim ([ADR-035](decisions/ADR-035-worker-release-and-idle-reclaim.md)).
+- **Status**: normative
 - **Date**: 2026-11-08
-- **Owns**: worker-domain *semantics* — identity, membership lifecycle, binding and dispatch rules,
-  catalog/discovery, security boundary, version/upgrade policy, degradation, boundaries, UNVERIFIED,
-  and the change protocol for all of the above.
-- **Does not own**: wire frames/params/errors ([API-CONTRACT](API-CONTRACT.md) §8/§9), event
-  envelope/kinds/payload bytes ([EVENT-MODEL](EVENT-MODEL.md) — unchanged by this contract), serving
-  forms ([READ-MODEL](READ-MODEL.md)), assembly/HOW ([DESIGN](DESIGN.md) §4.1/§4.3/§4.7), rationale
-  ([ADR-020](decisions/ADR-020-durable-worker-binding.md),
-  [ADR-021](decisions/ADR-021-runtime-worker-membership.md)), product scope (`docs/SPEC.md`).
+- **Owns**: worker identity, membership, binding, release, queueing, dispatch, catalog,
+  security, protocol compatibility, failure behavior, degradation, and the change rules for those
+  semantics.
+- **Does not own**: wire serialization details, event-envelope mechanics, storage implementation,
+  process assembly, CLI presentation, or prompt wording. Those artifacts must realize the
+  semantics in this specification without adding authority or weakening an invariant.
 
-## 0. Scope and authority split
+## 0. Contract invariants
 
-| Question | Owner |
-|---|---|
-| What is a worker, how does membership transition, what may a binding mean, how is a command dispatched or queued, what does the Router see, what is the security boundary, what happens on each failure, how does the wire version upgrade? | **this file** |
-| Why runtime membership, why worker-dial, why a shared token and not mTLS, what was rejected | [ADR-021](decisions/ADR-021-runtime-worker-membership.md) |
-| Why a durable per-session binding, why 1:1, why the binding rides two existing events | [ADR-020](decisions/ADR-020-durable-worker-binding.md) (D1–D4, D8–D16; D5/D6/D7 superseded by ADR-021) |
-| Frame names, field names, `PROTOCOL_VERSION`, the rejection reason set, upgrade notes | [API-CONTRACT](API-CONTRACT.md) §8, §9.1/§9.2 |
-| The additive `exec_worker` keys on the delegation wrapper and `thread/started` | [EVENT-MODEL](EVENT-MODEL.md) §3, §4.2 |
-| Queue durability, at-least-once, command-id dedupe, re-drive | [ADR-007](decisions/ADR-007-kiand-delivery-semantics.md) |
-| The 1:1 live-session exclusivity and the single drain it leans on | [ADR-009](decisions/ADR-009-multi-replica-claim-admission.md) |
-| Crate placement, assembly, config surface, CLI verb shape | [DESIGN](DESIGN.md) §4.3/§4.7 |
+| Id | Invariant | Testable consequence |
+|---|---|---|
+| W1 | Membership is live runtime state derived from an authenticated connection and its heartbeat. | After process restart, with no worker connection, every worker is reported `offline`; a durable cached state cannot make one online, routable, or bindable. |
+| W2 | A worker id identifies a machine identity, while a worker session identifies one delegated execution. They are never interchangeable. | A catalog, queue row, and binding refer to the worker id; a thread, liveness decision, and 1:1 check refer to the worker session. |
+| W3 | One worker has at most one live bound worker session. | Spawn admission refuses a candidate that already owns a live binding and names the owning session and thread. |
+| W4 | Binding is immutable for a worker session. | No membership transition, reconnect, restart, release, or failed dispatch rewrites the binding to another worker id. |
+| W5 | Every accepted input row belongs to a session that can still consume it, or admission was refused. | A submit racing a terminal close either lands before the close and makes release refuse `session_busy`, or is refused `session_terminal` after the close. No third outcome exists. |
+| W6 | Delivery is at least once, settlement is once, and re-drive is bounded. | A command id can execute more than once after a transport failure, but only one result settles it and the dispatch-attempt count reaches a finite cap. |
+| W7 | Worker-domain data never enters a prompt or tool schema. | Adding, removing, or changing a member changes no prompt or schema bytes; callers obtain membership only from `list_workers` results. |
 
-This contract introduces **no** new event kind, **no** new table, **no** new HTTP route and **no**
-new metrics key. It fixes one wire version (KiandProto v3, owned by API-CONTRACT §8) and one
-additive config section (`workers:`). ADR-035 adds one ops method (`release_worker`) and one
-`workers:` key (`release_after_ms`) on the same terms: no new kind, table or route.
-
-```mermaid
-graph LR
-  W["worker process<br/>(kiand --register-to)"] -->|register| A[accept listener<br/>private bind + token]
-  A --> D[(membership directory<br/>runtime, disposable)]
-  A --> R[(endpoint_registry<br/>durable projection)]
-  D --> C["Router surface<br/>list_workers / spawn validation"]
-  R --> WD[heartbeat watchdog<br/>absence → health input]
-  A -->|route attach/detach| Q[(exec queue<br/>durable, per worker id)]
-  Q -->|command| W
-  W -->|result| Q
-  S["worker session stream<br/>exec_worker binding"] --> P[per-drive side selection]
-  P --> Q
-```
+The worker domain introduces no new event kind, durable membership table, inbound HTTP route, or metrics key. It defines one worker-release operation, `release_worker`, and the worker configuration surface below.
 
 ## 1. Terms and identity
 
-- **Worker** — an execution endpoint process that runs commands on its own machine. Two carriers,
-  one identity: the `kiand` daemon and the `kian-endpoint` library embedded in a process.
-- **Worker id** (`endpoint_id`, `endpoints[].id`) — the **identity**. An opaque non-empty string,
-  1–200 bytes, no control characters. It is never an address: an address can change, an id must not.
-  A worker that restarts, upgrades or moves reuses its id and is the *same* worker to every rule here.
-- **Execution worker vs worker session** — never conflated. `exec_worker` (the id) names the machine;
-  `worker` on `thread/started` names the worker **session** uuid. The two are different objects with
-  different lifecycles.
-- **Member** — the runtime directory entry for an id: description, protocol version, connection
-  generation, last-seen, observed peer address. Disposable; a projection of live connections.
-- **Last-declared cache** — the two *declaration* facts (description, protocol version) persisted on
-  the registry row for the cold-start catalog (ADR-025). It is a cache, not a membership fact: the
-  live directory wins while the worker is connected, and a row served from the cache is flagged
-  `declaration_stale`. State/liveness/bindability never come from it.
-- **Binding** — the durable, session-immutable assignment of one worker session to one worker id
-  (ADR-020). Not a member, not a connection, not a route.
-- **Route** — the live command channel for one worker id, created when a member registers and torn
-  down when it leaves. The only component that turns queue rows into wire dispatches.
-- **Static worker / dynamic worker** — a static worker is a pinned `endpoints:` entry (kian dials it;
-  its description is config-owned); a dynamic worker is one that registered itself over the
-  registration listener.
-- **Enrolled worker** — a dynamic id listed in `workers.tokens`; it authenticates with its own
-  token, and a listed id never accepts the shared token. With `workers.enrolled_only: true` the
-  enrollment map is the complete admission set ([ADR-031](decisions/ADR-031-worker-enrollment.md)).
-- **Capability declaration** — the optional `capabilities` list a worker sends in `register`
-  (v3, [ADR-032](decisions/ADR-032-worker-declared-capabilities.md)). The server sanitizes it and
-  caches the accepted list on the registry (migration v5); `list_workers` and `kian workers`
-  surface the live declaration or the cached one. It never enters a prompt, a tool schema or the
-  event stream.
-- **Drain holder** — the single process permitted to run a session's drain (ADR-009). Not a worker
-  fact; listed here only because "1:1" and "no split brain" are different rules.
+- **Worker** is an execution endpoint on another machine. The `kiand` daemon and an embedded `kian-endpoint` process are carriers of one worker identity.
+- **Worker id**, carried as `endpoint_id` and `endpoints[].id`, is an opaque non-empty string of 1–200 bytes with no control characters. It is identity, not address; restart, upgrade, or address change preserves it.
+- **Worker session** is one delegated execution bound to a worker. Its catalog key is the worker id; its lifecycle key is the worker-session UUID in `thread/started`.
+- **Member** is a live-directory entry containing connection generation, last heartbeat, protocol version, observed peer address, and accepted declaration. It disappears when the connection ends.
+- **Durable registry row** is the persisted catalog record for an id. It stores last-observed state only as display cache, plus the last-declared description, protocol version, and capabilities. It is neither a member nor membership authority.
+- **Binding** is the durable, session-immutable assignment of one worker session to one worker id. It is reconstructed from the committed thread-start fact on the parent stream, never from a mutable routing map.
+- **Route** is the command channel for one authenticated registration generation. Exactly one transport generation owns a route, and only a route dispatches queue rows onto the wire.
+- **Static worker** is a configured `endpoints:` entry whose address and description are configuration-owned; a **dynamic worker** registers itself over the listener.
+- **Enrolled worker** is a dynamic id in `workers.tokens`. It authenticates only with its own token; under `workers.enrolled_only: true`, the enrollment map is the complete admission set.
+- **Capability declaration** is the optional sanitized `capabilities` list in `register`; it may be cached for display. It proves neither installation nor execution authority.
+- **Drain holder** is the single process permitted to drive a session. It is not a worker, route, member, or binding; one live drain never creates a second bound worker session.
 
 ## 2. Membership lifecycle
 
-A member is `online`, `offline`, or (briefly) `draining`. State is **computed**, never stored: online
-means *a live connection and a heartbeat inside `offline_after_ms`*; draining is the teardown window;
-everything else is offline. The durable projection never carries a third state.
+Membership truth is the live directory derived from the connection plus heartbeat. The durable registry row's `state` column is a last-observed cache used only for cold-start display. It is never consulted for admission, routing, busy checks, release eligibility, or catalog liveness. There is no separate membership table.
 
-| Transition | Trigger | Result |
+After a server restart, the live directory is empty. Registry-recovered rows are therefore displayed as `offline`; a cached `online` value may appear only as historical diagnostic metadata. Cached state cannot restore a route or authorize work.
+
+The live member state is computed:
+
+| State | Derivation | Permitted effect |
 |---|---|---|
-| **Join** | an authenticated `register` on the listener | member online with a new connection generation; a route is attached and immediately re-drives that id's `pending`/`inflight` rows; one audit line |
-| **Heartbeat** | a `heartbeat` frame on the live connection | last-seen advances (server clock); the registry row refreshes; state stays online |
-| **Heartbeat absence** | no heartbeat for `offline_after_ms` while the transport is still up | state computes to offline; the existing watchdog observes the same staleness from the registry's last-heartbeat column and admits the ordinary `endpoint_health` input to affected live worker sessions. The route stays attached (the transport is up; a route is not an authority) |
-| **Graceful leave** | the worker sends `bye`, then exits | route detached, state draining → offline, audit line distinguishes a graceful leave |
-| **Crash** | transport loss with no `bye` | identical in effect to a leave, different audit wording; the row stays durable and parked |
-| **Replace** | a newer authenticated `register` for an id that is currently online | after serializing on the per-id slot: the old connection is closed, its route detached, the new route attached, the generation incremented, one `replaced` audit line. The old connection's outstanding rows re-drive on the new route by the ordinary queue rule — no special fencing code |
-| **Kian restart** | process start | the directory is empty; registry rows persist with stale timestamps, so every id reads offline. The last-declared description/version survive on the registry row and are served for registry-only ids with `declaration_stale: true` (ADR-025) until the worker re-registers — then the live declaration replaces the cache. Dynamic ids are **not** re-seeded: kian does not invent members it has not been told about this process lifetime |
-| **Kian upgrade** | new binary, same identity | same as a restart, plus the version policy (§7). No worker-side config change is ever required |
-| **Worker restart / upgrade** | the worker process restarts with the same id | it reconnects with bounded backoff and re-registers; the binding is unchanged; subsequent commands go to the same id |
-| **Version mismatch** | a peer whose protocol revision differs | typed refusal, one audit line, no state change, no half-compatible connection (§7) |
-| **Id collision (static)** | a dynamic registration whose id is a static pin | refused and audited; the static pin keeps the id and its route |
-| **Id collision (malformed)** | an id violating §1's shape rule | refused and audited; a worker validates its own id at startup, so this is a defence, not a path |
+| `online` | An authenticated, protocol-compatible transport has a live connection and a heartbeat no older than `workers.offline_after_ms`. | The catalog shows online and spawn admission may bind the id. |
+| `draining` | The worker has sent `bye` and its transport is closing. | No new dispatch starts; existing bookkeeping may settle. |
+| `offline` | No live connection exists, the heartbeat is stale, or registration failed. | The catalog shows offline; a known id may receive a durable offline binding, whose commands park. |
 
-Membership facts never enter the event stream: no `worker/joined`, `worker/left` or similar kind, and
-no membership column anywhere durable except the existing registry row (id, addr, last heartbeat,
-state, and the two last-declared cache columns of ADR-025 — declarations, not liveness). **Stale ids
-are never pruned** in this contract: a previously known id stays visible and offline, which is what
-makes §3's offline-known binding honest. (A TTL would make a known worker look
-unknown and turn an honest park into a refusal — the reason the TTL question is deferred.)
+A route is tied to a live authenticated registration generation, not to computed catalog state. A stale heartbeat with an open transport computes the member `offline`, but the route may remain attached until transport failure or replacement. Queue and per-command bounds make that ambiguity finite; the route grants nothing.
 
-## 3. Binding contract
+| Transition | Trigger | Required result |
+|---|---|---|
+| Join | Authenticated `register` on the listener | Serialize on the per-id slot, create a new member and route generation, replace any prior route in the specified order, and re-drive that id's `pending` and `inflight` rows. |
+| Heartbeat | `heartbeat` on the current connection generation | Advance server-clock last-seen and refresh only liveness cache; never mutate binding, declaration, queue, or prompt data. |
+| Heartbeat absence | No heartbeat for `workers.offline_after_ms` | Compute the member offline and admit the ordinary `endpoint_health` input to affected live worker sessions. Do not fabricate a result or reroute a command. |
+| Graceful leave | `bye`, then transport close | Detach the route, show `draining` through teardown, then compute offline; retain durable queued rows and registry display data. |
+| Crash | Transport loss without `bye` | Detach the route, compute offline, retain queued rows and the immutable binding, and write an audit line distinguishing the loss from graceful leave. |
+| Replace | New authenticated registration for an online id | Under the per-id slot, close the old connection, detach its route, attach the new generation, increment the generation, and audit `replaced`. Outstanding rows re-drive through the ordinary queue rule. |
+| Server restart | Process start | Start with an empty live directory, show all workers offline, rebuild bindings from worker streams, preserve registry display data, and park queued rows until routes return. |
+| Worker restart or upgrade | Same id registers again | Reconnect with backoff, preserve the binding, and dispatch subsequent commands to the same id. |
+| Version mismatch | Handshake observes an incompatible protocol revision | Refuse with `version_mismatch`, audit once, close the connection, and leave membership, bindings, and queue rows unchanged. |
+| Static id collision | Dynamic registration uses an id pinned by configuration | Refuse and audit; the static pin keeps the id and its route. |
+| Malformed id | Id violates the identity shape | Refuse with `id_conflict`, audit, and create no member. A malformed optional description is dropped and audited without rejecting an otherwise valid id. |
 
-- **Immutable.** A worker session's binding is durable bytes on its own stream (the delegation wrapper
-  and its `thread/started`, ADR-020) and never changes for that session's lifetime. Nothing in
-  membership touches it: a join, leave, replace or restart never rewrites, reorders or re-emits it.
-- **Derived, never resident.** Routing is a per-drive selection from the session's own stream. There
-  is no binding map, no routing table. Restart rebuild therefore equals replay by construction.
-- **1:1 over live sessions.** One worker has at most one live bound worker session. "Busy" is
-  live-session based, not connection based: `completed`/`cancelled` release the worker,
-  `failed`/`interrupted` hold it until a **release** (the next bullet), and a never-started
-  reservation holds it only until its lease timeout. An **offline** worker with a live bound
-  session is still busy. The binding set is derivable store-wide from every non-terminal session's
-  `thread/started` with a live child; the spawn point remains the refusal, and the derived view
-  (`WorkerBindingView`) is an optimisation and an observability surface, never an authority.
-- **Release is a terminal close, never a reinterpretation.** A thread whose last event is
-  `session/ended{interrupted|failed}` keeps holding the worker — it is resumable — until a release
-  closes it with one atomic `drain/claimed` + `session/ended{cancelled}` batch under a fresh claim
-  epoch (ADR-035). `cancelled` is terminal, so the binding can never be resumed, rebound, rerouted
-  or handed to another id; the 1:1 rule survives because a released thread cannot execute again.
-  A release is refused unless the projection is `idle`, the last end is non-terminal, the inbox has
-  no eligible row, no drain is live, and the worker's durable queue has no `pending`/`inflight`
-  row (a machine still executing or owing a command from the thread is not idle). Two triggers:
-  the `release_worker` ops method / `kian workers release <id>` verb, and the bounded
-  `workers.release_after_ms` reclaim (`0` disables) run by a `kian serve` maintenance tick from the
-  thread's terminal-end timestamp. Every release is audited (one tracing line; an additive
-  `released` object on the end event). No-ops and refusals are honest: `already_released` for a
-  terminal thread, `session_busy` for a running one, `worker_not_bound` for an unknown id or no
-  live binding.
-- **Abnormal interruption converges.** The slot is never held by a thread that can no longer end.
-  A drain that dies (panic / task cancellation) unwinds its bookkeeping so the lease expires and the
-  existing takeover path re-drives it, and a takeover chain is bounded at three un-ended claims
-  (`MAX_UNENDED_CLAIMS`) before it writes one honest `session/ended{failed}` instead of re-driving
-  forever; the model call itself is bounded by `providers.<name>.connect_timeout_ms` /
-  `idle_timeout_ms` (a per-gap idle bound), so a provider that stops sending ends the turn honestly
-  instead of parking the drain. Both roads end in the idle-ended shape the release/reclaim path
-  closes (ADR-041): an abnormal interruption can delay the freeing of a worker but never prevent it.
-- **Offline is a valid binding state.** A spawn may bind a known-but-offline worker: the command is
-  enqueued durably, parks, and runs when the worker returns or ends in the honest queue timeout. The
-  spawn result and one audit line say `offline — commands will queue`.
-- **No failover, ever.** A worker going offline never releases a binding, never reroutes a command,
-  never runs it locally, and never hands it to a different id. A permanently lost worker produces the
-  honest timeout and a parked session — never a takeover.
-- **Legacy unbound.** A worker session with no binding on a server that has workers keeps the legacy
-  first-endpoint route and one `legacy unbound` audit line; it is never rewritten, never rebound, and
-  never counted as bound. Zero configured workers means the whole feature is off and behavior is
-  byte-identical to pre-ADR-020.
-- **Rebuild == replay.** A restarted kian plus a re-registered worker must reach the same state as
-  before the restart: the same binding from the stream, the same directory from the new registrations,
-  the same parked rows from the queue.
+Replacement is serialized per id; two registrations cannot create two live routes for one id. Membership transitions write no membership event history. Static pins and previously observed dynamic ids remain catalog rows. Known ids are never pruned: keeping them visible makes an offline-known binding honest, while pruning would turn a park into an apparent authority transfer.
 
-## 4. Dispatch and queue
+## 3. Binding and release
 
-- **Queue-first by id.** `exec` (and, since v2, each `fs_list`/`fs_read`/`fs_write`) enqueues a
-  durable row keyed by the session's bound worker id **before any dispatch**, and then awaits the
-  correlated outcome. Both command families share one queue, one command-id dedupe and one queue
-  timeout; the row carries its family so a restart re-drives it through the same frame family. A missing route is not an error: the row
-  parks `pending` until a route appears, or `queue_timeout` abandons it honestly (the caller gets a
-  timeout, the row stays terminal and answers a duplicate id with the same honest timeout).
-- **Runtime routes.** A route exists iff the member is online. Attaching a route re-drives that id's
-  `pending` and `inflight` rows; detaching a route leaves the rows durable and parked. Static
-  workers keep their boot-created routes.
-- **At-least-once with command-id dedupe.** Delivery is ADR-007's: a row may be dispatched more than
-  once across a crash or a reconnect, but it **settles once** — the command id is the dedupe key and
-  a settled row answers every re-execution from the durable record. The dispatch side dedupes too
-  ([ADR-037](decisions/ADR-037-endpoint-result-dedupe.md)): the worker records each result frame by
-  command id before sending it (bounded, 24 h TTL) and answers a re-dispatched id from that record
-  instead of running the command again; a duplicate that arrives while the first execution is still
-  running joins it. A cache miss, an oversized result or a disabled cache means *execute again* —
-  at-least-once is unchanged, and no result is ever fabricated. For the v2 filesystem family the
-  same rule is recorded explicitly: `fs_list`/`fs_read` are idempotent, and a repeated `fs_write`
-  writes the same path and content again (mtime may move) — never a different payload.
-- **Re-drive is bounded** ([ADR-033](decisions/ADR-033-bounded-queue-redrive.md)). At-least-once
-  must also terminate, so every dispatch counts an attempt: a `pending` row always dispatches,
-  while an `inflight` row re-drives only while its `dispatch_attempts` are below
-  `1 + workers.queue_max_redrives` (default `1`; `0` = first dispatch only; global by construction,
-  like the queue timeout). A row whose result was lost to a transport loss therefore gets its
-  retry; a row that keeps losing its result because the **command itself** destroyed the ack path
-  — `systemctl restart kian`, `pkill kiand` — can never be acknowledged, so the driver converges
-  it: `inflight → abandoned` once the bound is spent **and** no live lease is held, with one audit
-  line naming command id, endpoint, attempt count and `tool_call_ref`. No result is fabricated, no
-  row is deleted, no new status or event exists; a caller re-attaching after the fact reads
-  `abandoned` and gets the honest timeout. The bound is a recovery cap, not a retry policy: a row
-  abandoned here may have run — the audit line says so. A re-dispatch is additionally delayed by
-  `workers.queue_redrive_grace_ms` (default 5 s, `0` disables) when the row was dispatched more
-  recently than the grace, so a reconnect cannot race an execution that may still be running on the
-  worker; the grace only postpones the dispatch and never settles a row. A dispatch counts only
-  once it **left the process**: when the connection's writer is already closed, the frame never
-  reaches the endpoint, so the transport fails it as `NotWritten`, flips itself offline, and the
-  queue layer refunds the attempt the claim charged. Without that refund a worker reconnecting a
-  moment after a dead write would find its row abandoned — or its bound spent — for a dispatch the
-  endpoint provably never received.
-- **No cross-worker dispatch.** Every driver filters rows by its own id. There is no fallback route,
-  no "any online worker", no local-exec substitution for a bound session.
-- **Honest timeout, bounded per phase** (ADR-030). A wait is bounded by what is actually being
-  waited on, never by one knob for both:
-  - *Dispatch wait* — the row is `pending`: no route has taken it. `queue_timeout` is the bound on
-    an absent worker: the backend takes one value — the max over static
-    `endpoints[].queue_timeout_ms` and `workers.queue_timeout_ms`
-    ([ADR-031](decisions/ADR-031-worker-enrollment.md) D3). Expiry marks the row `abandoned`, which
-    is honest because nothing ran. The bound is global by construction: raising it for an
-    intermittent device also lengthens every queued command's dispatch wait and shifts the
-    execution bound below by the same amount.
-  - *Model call* — a drain's provider request is bounded by the provider's own
-    `connect_timeout_ms` (default 10 000) and `idle_timeout_ms` (default 300 000, `0` disables): the
-    idle bound covers the wait for response headers and each gap between body chunks, never the total
-    request, so a long generation (or a long reasoning silence) is not killed but a stalled stream is.
-    Expiry is a `provider_down`-class transport error, so the turn settles honestly and the ADR-035
-    release/reclaim path frees the worker ([ADR-041](decisions/ADR-041-bounded-model-calls-and-crash-containment.md)).
-  - *Execution wait* — the row is `inflight`: a worker is executing it. The command's own
-    `timeout_ms` (the worker-side kill bound) is what bounds it, so the wait bound is
-    `2 * exec_bound + queue_timeout` (`exec_bound = timeout_ms`, or `queue_timeout` when absent) —
-    one dispatch plus one at-least-once re-dispatch plus slack. Expiry **does not mutate the row**:
-    the caller stops waiting, the queue row keeps the truth and stays re-driveable. Never a
-    fabricated result, never a silent retry against another worker.
-  - The synchronous `exec` (`WaitPolicy::Caller`) takes only the dispatch wait, because it parks a
-    drain; the async `start` observer (`WaitPolicy::Job`) takes both, because nothing is parked.
-    `exec` refuses a `timeout_ms` larger than its own wait bound at call time (fail-closed, no row,
-    no dispatch) instead of running to a timeout that reads like a kill.
-  - A remote wait expiry surfaces what it observed: `row_state` (`pending` — never dispatched and
-    now abandoned; `inflight` — started and still running, result discarded by this call only;
-    `abandoned` — a prior abandonment answered from the row), `still_running`, `row_abandoned` and
-    the bound in force. The success shape stays identical to the local built-in's; the extra keys
-    describe a state only the remote half can be in (the local `exec` kills its own child, so its
-    timeout is already unambiguous and claims nothing about a surviving grandchild). A job observer settles its
-    `async_jobs` row instead of a tool result: phase-A expiry `abandoned` (never dispatched),
-    phase-B expiry `abandoned` ("worker silent past the command's own bound") with the live queue
-    row untouched; `stop` remains the escape hatch.
-- **A budget stop is `interrupted`** (ADR-030). The loop's only intentional-stop producer is
-  iteration-budget exhaustion; the worker records `thread/completed{status:"interrupted"}` with the
-  stop reason as the summary — never `completed`, whose summary would otherwise be the last
-  assistant turn (a pending tool call with empty text). The following `session/ended{completed}`
-  still decides liveness (`Released`), so the worker is reusable. An interrupted worker session
-  that ends without a releasing end holds the worker until §3's release/reclaim (ADR-035); it is
-  never silently released while resumable.
-- **Callers survive route swaps.** A caller's future is attached to the command id, not to a
-  connection, so a detach/attach cycle (replace, restart, reconnect) never severs a live wait.
+### 3.1 Binding is durable, derived, and immutable
 
-## 5. Catalog and discovery
+- A binding is committed before the child's first command as one thread-start fact on the parent session's stream. That fact names the worker id and the worker session id, and replay reconstructs the binding from it; there is no separate routing map.
+- A thread-start fact written by a dispatcher before spawn admission is a reservation, not a live binding. It becomes the live binding only when admission accepts and a child exists; until then it is a reservation bounded by its lease.
+- Join, leave, replacement, restart, upgrade, queue failure, and release never rewrite, reorder, or re-emit the binding.
+- Routing selects the bound worker id afresh for each drive from the committed stream, so restart correctness follows from replay correctness.
+- The store-wide binding view is derived from committed thread-start facts whose worker session is non-terminal and has a live child. It is an observability and selection optimisation surface, never authority.
 
-- **The catalog is runtime data.** It is static config ids ∪ every id the registry has ever seen. It
-  is **not** configuration-only and **not** prompt content.
-- **`list_workers`** (Router-only, read-only, no arguments) returns the live catalog: id, optional
-  description, state (`online`/`offline`/`draining`), the worker-declared `capabilities` array when
-  non-empty (ADR-032), and the live bound session/thread when one exists. A registry-only id's
-  description/version/capabilities come from the last-declared cache and the row carries additive
-  `"declaration_stale": true` (ADR-025/ADR-032); a live registration's row omits the flag and is
-  byte-identical to the pre-cache result. An id with an empty declaration omits the field. Rows
-  are ordered by id. It writes nothing — no event, no row, no wake.
-- **Spawn validation order** (every refusal precedes every side effect): argument shape → feature off
-  (nothing configured) → unknown id (refusal names the known ids) → 1:1 busy (names the owning session
-  and thread) → offline-known allowed (with the queue note) → follow-up ownership → speculation cap →
-  mandate → mint/lineage/admit.
-- **Prompt/schema stability.** The `spawn_worker` schema and the judge prompt contain **no** membership
-  data: `exec_worker` is a plain non-empty string (required whenever membership is on, never an enum),
-  and the prompt carries one frozen instruction line telling the model to call `list_workers` and
-  never invent an id. A join, a leave or a capability-catalog edit therefore changes no prefix byte
-  (capabilities are result-only). New sessions pin a new `superagent.policy.version` when the text
-  changes; live sessions keep their persisted prompts and the drift machinery reports the mismatch
-  instead of rewriting them.
+### 3.2 One worker, one live binding
+
+One worker has at most one live bound worker session. Busyness is based on the live worker session,
+not merely on the connection:
+
+- `completed` and `cancelled` release the worker.
+- `interrupted` and `failed` hold the worker while the thread remains resumable.
+- A never-started reservation holds the worker only until its reservation lease expires.
+- An offline worker with a live bound worker session is still busy.
+
+Placement and selection are advisory. A dispatcher that cannot observe a live binding may
+optimistically select a busy worker. Spawn admission is the only refusal authority: it rechecks the
+derived live binding and refuses the candidate, after which the dispatcher may try the next
+candidate. The optimistic selection creates no binding and is not a second worker session.
+
+No component may treat the derived store-wide view, a catalog row, a cached state, or capability
+declaration as permission to spawn. Only the serialized spawn admission point may create the
+binding.
+
+### 3.3 Release is a terminal close
+
+Release closes an idle, resumable worker session; it does not kill a process, interrupt a live drain,
+cancel a command, or transfer work. A successful release appends `drain/claimed` and
+`session/ended{cancelled}` atomically under a fresh claim epoch and the expected-sequence compare-and-
+swap. `cancelled` is terminal, so the released session can never resume, rebind, reroute, or execute
+again.
+
+Release proceeds only when every gate holds. The list below is the gate set; each gate is
+re-evaluated inside the per-session admission/release critical section immediately before the terminal
+append, and only that inside-lock evaluation is authoritative:
+
+- The session projection is `idle`.
+- The session's last event is a resumable end (`interrupted` or `failed`); a session that has
+  never ended is not releasable.
+- The inbox has no unconsumed input row, whether or not it is eligible yet. A pending row whose
+  eligibility time is in the future still blocks release; closing the session would strand it.
+- No drain is live.
+- The bound worker's durable queue has no live `pending` or `inflight` row.
+
+Release has two triggers: explicit `release_worker`, exposed as `kian workers release <id>`, and automatic reclaim after `workers.release_after_ms` from the resumable end timestamp. The reclaim default is `300_000` ms and `0` disables it.
+
+Each successful release writes one audit line and records a `released` object on the terminal end.
+Refusals are typed and side-effect free:
+
+| Refusal | Meaning |
+|---|---|
+| `session_busy` | The thread is running, has an unconsumed input row (eligible or not), or still owns a live queue row; nothing was closed. |
+| `already_released` | The thread is already terminal; the operation is an idempotent no-op. |
+| `worker_not_bound` | The id is unknown, has no live binding, or names only a never-started reservation. |
+
+### 3.4 Admission and release linearize per session
+
+The store serializes input admission and the terminal close for one session under one per-session write lock or transaction. Admission checks the projected terminal state inside that critical section; a terminal session is refused `session_terminal`.
+
+Every release gate is re-evaluated inside that same critical section immediately before the append; checks performed before entering it are advisory and cannot authorize a close. The authoritative release act is the atomic append of `drain/claimed` plus `session/ended{cancelled}` under the claim epoch and expected-sequence compare-and-swap, performed in the same per-session critical section as admission. A concurrent submit therefore either lands before the in-lock check, making an unconsumed inbox row (eligible or future-ineligible) observable and causing release to refuse `session_busy`, or arrives after the terminal append, causing admission to refuse `session_terminal`.
+
+The no-live-drain gate is fenced by the same expected-sequence append: a drain claim is itself an
+append at that sequence, so a claim and a release cannot both commit. The loser re-reads the stream
+and either refuses or re-evaluates its gates from fresh state.
+
+No accepted-but-unconsumable inbox row can exist. This is invariant W5: every accepted input row belongs to a session that can still consume it, or its admission was refused.
+
+Acceptance is a race test that starts submit and release concurrently against one session and repeats both orderings. Every run must observe exactly one outcome: accepted input with no terminal append and release refusing `session_busy`, or a terminal append with `session_terminal` and no accepted input. The test rejects any interleaving that accepts input and then closes without release observing `session_busy`. A second test admits one unconsumed row with a future eligibility time, then requests release: the release refuses `session_busy`, and after the row becomes eligible the session can consume it or release again.
+
+### 3.5 Release does not provide liveness
+
+Release cannot preempt a running or recoverable drain. A worker remains bound until its worker thread ends. A wedged command is bounded by its worker-side execution timeout and the queue's dispatch, re-drive, and caller-wait bounds; a wedged model call is bounded by the provider's finite connect timeout and per-gap idle timeout. A drain that repeatedly loses its holder is converged by the bounded takeover chain rather than retried forever.
+
+After `MAX_UNENDED_CLAIMS` distinct un-ended claims, takeover writes one honest `session/ended{failed}` instead of taking over again. Release may then close the resumable failure. Worker liveness is therefore provided by bounded per-command queue and execution timeouts, bounded provider connect and idle-gap timeouts, and the bounded takeover chain. It is not provided by release. A provider idle bound configured as `0` removes the per-gap bound and is outside a deployment profile that claims bounded worker liveness.
+
+### 3.6 Offline binding and no failover
+
+A spawn may bind a known but offline worker. The binding and command are durable; the command parks until a route appears or the honest queue timeout ends it. The spawn result and one audit line say `offline — commands will queue`.
+
+A worker going offline never releases a binding, reroutes a command, executes it locally, or hands it to another worker id. A permanently lost worker produces the honest queue timeout and a parked session. There is no binding failover.
+
+### 3.7 Legacy unbound sessions
+
+When workers are configured, a worker session created without a binding keeps the legacy first-endpoint route and emits one `legacy unbound` audit line. It is never retroactively bound, counted as a live worker binding, or treated as a candidate for cross-worker dispatch. With no workers configured, the worker feature is off.
+
+## 4. Command queue and dispatch
+
+### 4.1 Queue before dispatch
+
+Every `exec`, `fs_list`, `fs_read`, and `fs_write` command creates a durable queue row keyed by the session's bound worker id before any transport write. The row carries the command family, command id, command payload or durable reference, attempt count, and current state.
+
+One queue serves both families. A missing route is not an admission error: the row remains `pending` until a route appears or it becomes `abandoned` at `queue_timeout`. Settlement is durable; a duplicate command id reads the prior settled outcome, including the same timeout.
+
+Attaching a route re-drives the id's `pending` and `inflight` rows; detaching leaves them durable. Every driver filters by its own worker id; there is no fallback route, any-online candidate, local substitution, or cross-worker dispatch.
+
+### 4.2 At-least-once delivery, once-only settlement
+
+A command may be dispatched again after a crash or reconnect. Its command id is the dedupe key, and exactly one durable result settles the row.
+
+The worker also dedupes by command id. Before sending a result, it records the result in a bounded local cache with a 24-hour TTL. A re-dispatched cache hit is answered without re-execution; a duplicate arriving during the first execution joins it. A cache miss, oversized result, or disabled cache re-executes the command and never fabricates a result.
+
+Filesystem command replay preserves its payload: `fs_list` and `fs_read` are idempotent, and repeated `fs_write` uses the same path and bytes. Modification time may move; path and payload may not change.
+
+### 4.3 Bounded re-drive and NotWritten refund
+
+Every effective dispatch increments `dispatch_attempts`. A `pending` row always dispatches. An `inflight` row re-drives only while attempts are below `1 + workers.queue_max_redrives`; the default is `1`, the ceiling is `16`, and `0` means no re-drive after the first dispatch.
+
+Within `workers.queue_redrive_grace_ms` of the last dispatch, the driver waits for the remaining grace before re-sending. The default is `5_000` ms, the ceiling is `60_000` ms, and `0` disables the delay. Grace postpones dispatch only; it never settles a row or changes a timeout.
+
+After the re-drive bound is spent and no live lease holds the row, the driver converges `inflight` to `abandoned` and writes one audit line naming the command id, worker id, attempt count, and tool-call reference. The command may have run; the result is unknown and no result is invented.
+
+An attempt counts only after its frame leaves the process. If the writer is already closed, transport reports `NotWritten`, marks the route generation unusable, and the queue refunds the charged attempt. Without the refund, a worker reconnecting after a dead write could find a command abandoned even though it provably never received it.
+
+### 4.4 Honest, phase-specific waits
+
+A wait names what it actually observes:
+
+| Phase | Row state | Bound and result |
+|---|---|---|
+| Dispatch wait | `pending` | `queue_timeout`. Expiry moves `pending` to `abandoned`; no worker received the command. |
+| Execution wait | `inflight` | The command's own `timeout_ms` bounds worker execution. The caller's upper bound is `2 * exec_bound + queue_timeout`, covering the first dispatch, one at-least-once re-dispatch, and slack. |
+| Model call | live drain | Provider `connect_timeout_ms` bounds connection establishment; default `10_000` ms. Provider `idle_timeout_ms` bounds response headers and each body-chunk gap; default `300_000` ms. The idle bound is not a total-generation bound. |
+
+The backend's dispatch bound is the maximum of static
+`endpoints[].queue_timeout_ms` and `workers.queue_timeout_ms`. A row's execution wait timeout does not
+mutate the row: the caller stops waiting, while the queue row remains truthful and re-driveable.
+
+The synchronous `exec` wait uses only the dispatch bound because it parks a drain. The asynchronous
+`start` observer uses both dispatch and execution bounds because nothing is parked. `exec` refuses a
+`timeout_ms` larger than its own wait bound before creating a row or dispatching, so a configured
+command cannot be represented as a kill it did not cause.
+
+A remote wait expiry reports what it observed:
+
+- `row_state: pending` means the command was never dispatched and is now abandoned.
+- `row_state: inflight` means it started and may still be running; this caller discarded the result.
+- `row_state: abandoned` means a prior abandonment is being answered from the durable row.
+- `still_running` says whether execution may continue.
+- `row_abandoned` says whether the durable row is abandoned.
+- `bound_ms` identifies the wait bound in force.
+
+An asynchronous job observer settles its job row rather than a tool result. A dispatch-phase expiry
+settles the job row `abandoned`. An execution-phase expiry also settles it `abandoned` while leaving
+the live queue row untouched. `stop` remains the command's explicit escape hatch.
+
+### 4.5 Budget stop and caller attachment
+
+Iteration-budget exhaustion is an intentional stop. The worker records
+`thread/completed{status: "interrupted"}` with the stop reason as the summary. It never records
+`completed`, because the last assistant turn may be only a pending tool call with empty text. The
+following `session/ended{completed}` decides binding liveness and may release the worker.
+
+A resumable interrupted end that does not release the worker holds it until explicit release or
+automatic reclaim. It is never silently released while it can resume.
+
+A caller waits on the durable command id, not on a route, connection, or command frame. A detach,
+attach, replacement, restart, or reconnect does not sever the wait.
+
+## 5. Catalog, discovery, and spawn authority
+
+The catalog is runtime data: the union of configured static ids and every id in the durable registry.
+It is not configuration-only and never prompt content.
+
+`list_workers` is Router-only, read-only, has no arguments, and writes no event, row, wake, or
+dispatch. It returns rows ordered by id with:
+
+- worker id;
+- optional description;
+- computed live state `online`, `offline`, or `draining`;
+- protocol version;
+- optional non-empty worker-declared capabilities;
+- the live bound worker session and thread, when one exists.
+
+For a registry-only id, description, protocol version, and capabilities may come from the
+last-declared cache, and the row includes `declaration_stale: true`. That flag describes declaration
+data only. It cannot change the computed state, make the worker bindable, or make a claim about the
+worker's live execution authority. A live registration omits the flag. An empty declaration omits
+its optional field.
+
+Spawn validation has this order:
+
+1. argument shape;
+2. feature-off check when no workers are configured;
+3. unknown-id refusal, naming known ids;
+4. 1:1 busy refusal, naming the owning session and thread;
+5. offline-known handling, with the queue note;
+6. follow-up ownership;
+7. speculation cap;
+8. mandate;
+9. mint, lineage, and admission.
+
+Every refusal occurs before any side effect. Only step 9 may create the durable binding. Catalog
+selection before step 4 is advisory and may race with another admission.
+
+`spawn_worker.exec_worker` is a required plain non-empty string whenever membership is enabled. It is
+never an enum or a catalog object. The prompt contains one frozen instruction to call `list_workers`
+and never invent an id. Joins, leaves, state changes, and declaration changes therefore alter no
+prompt or schema byte. Capabilities appear only in result data.
 
 ## 6. Security boundary
 
-- **Private listener by default.** The registration listener binds loopback, RFC1918, CGNAT
-  `100.64.0.0/10` or IPv6 ULA. A wildcard or public bind refuses startup unless
-  `workers.allow_public: true` is set explicitly; no doc example sets it. Reaching a private listener
-  from another machine is SSH tunnel or Tailscale/WireGuard — never a published port.
-- **Env-only tokens.** `workers.token_env` names the shared token's environment variable;
-  `workers.tokens` maps an id to its own variable name. The listener refuses to start when a named
-  variable is absent or blank. Values are compared constant-time, never written to config, argv,
-  logs, events, error text or metrics, and are held in a redacting type so an accidental `{:?}`
-  cannot print them. Failed attempts are bounded (one per connection; a per-peer window bound), and
-  every refusal is audited without secret material.
-- **Enrollment narrows the shared-token limitation.** A listed id authenticates only with its own
-  token: the shared token cannot replace it. With `workers.enrolled_only: true` (requires a
-  non-empty enrollment map and forbids `token_env`) only listed ids are admitted at all. In hybrid
-  mode (both configured) an unlisted id still falls back to the shared token — the limitation
-  **narrows, it does not disappear**. **mTLS / per-worker certificates is the planned fix** and remains
-  a prerequisite for any hosted or multi-tenant use; per-worker bearer tokens are not a substitute
-  ([ADR-031](decisions/ADR-031-worker-enrollment.md)).
-- **No new inbound HTTP surface.** The listener is the KiandProto socket, not an HTTP route; `/rpc`,
-  `/ops/rpc` and `/metrics` keep their existing (unauthenticated, deployment-bounded) posture. A
-  worker never gets control-plane access.
-- **Fs root is a guard, not a sandbox.** The v2 filesystem commands resolve under the worker's
-  `--workspace-root` and refuse `..` lexically; `exec` already runs arbitrary programs as the same
-  user, so fs adds no authority. A symlink can still point outside the root — recorded, not
-  claimed as isolation (same caveat as the local built-in fs tools).
+The worker listener binds only loopback, RFC1918, CGNAT `100.64.0.0/10`, or IPv6 ULA addresses by
+default. A wildcard or public bind refuses startup unless `workers.allow_public: true` is explicitly
+configured. Remote access is expected through an SSH tunnel or private overlay network.
 
-## 7. Version and upgrade policy
+Tokens are environment-only:
 
-- **KiandProto v3.** `PROTOCOL_VERSION = 3` in both halves (`kian-exec`, `kian-endpoint`), declared
-  independently and pinned by dual goldens in the same change; frames (exec + the v2 filesystem
-  pair + the v3 optional `register.capabilities` field) and the closed rejection reason set live in
-  [API-CONTRACT](API-CONTRACT.md) §8. ADR-031's enrollment and queue-bound parts are config-only
-  (no wire change); its D2 config catalog is superseded by ADR-032's worker declaration.
-- **Upgrade order: kian first, workers second.** During the window a v0 static endpoint is refused
-  with a typed terminal version error plus one audit line (its route stays offline; never a fake
-  connect); a v0 worker — which has no register mode at all — simply never registers and reads
-  offline; and a v1 worker (no filesystem frames) is refused `version_mismatch` until upgraded,
-  with its parked commands staying parked (no lost work, no dispatch to a wrong machine). Both are
-  visible and honest, and neither is a half-compatible connection.
-- **No compatibility shim.** A peer on the wrong revision is refused, never silently accepted: the v0
-  and v1 steady states differ only by the version integer, so "compatibility" would buy nothing except
-  an invisible half-upgraded deployment.
-- The registration frame carries the worker's declared revision; `welcome` carries the server's. The
-  server also directs the heartbeat cadence in `welcome`, so liveness policy stays server-owned.
+- `workers.token_env` names the shared token's environment variable.
+- `workers.tokens` maps an enrolled worker id to its own token variable name.
+- Startup refuses when a named variable is absent or blank.
+- Token values are compared in constant time and are never written to configuration, argv, logs,
+  events, errors, or metrics.
+- Token values use a redacting representation so formatting cannot print them.
+- Failed authentication attempts are bounded per connection and per peer; every refusal is audited
+  without secret material.
+
+An enrolled id authenticates only with its own token; the shared token never replaces it. With
+`workers.enrolled_only: true`, only listed ids are admitted. Strict mode requires a non-empty
+`workers.tokens` map and forbids `workers.token_env`. In hybrid mode, an unlisted id may still use the
+shared token, so enrollment narrows the shared-token limitation without eliminating it.
+
+The listener is a KiandProto socket, not HTTP. The worker domain adds no inbound HTTP surface, and a
+worker receives no control-plane authority. The filesystem root is a lexical guard, not a sandbox.
+The v2 filesystem commands resolve under `--workspace-root` and refuse `..`; `exec` already runs
+arbitrary programs as the same user, so filesystem commands add no authority. A symlink may still
+point outside the root.
+
+Per-worker bearer tokens remain identity claims, not cryptographic machine attestation. Without mTLS,
+a deployment must treat a leaked token as full impersonation of that worker id.
+
+## 7. Protocol version and upgrade policy
+
+The worker wire protocol is KiandProto v3. Both halves declare `PROTOCOL_VERSION = 3`
+independently and pin golden frames. The worker-domain frame set consists of registration
+(`register`, `welcome`, `heartbeat`, `bye`), command frames for `exec` and the v2 filesystem family,
+their correlated result frames, and the closed typed rejection set. Registration carries the peer's
+protocol revision and optional capabilities; `welcome` carries the server's revision and heartbeat
+cadence.
+
+Kian upgrades before workers. During the mixed-version window:
+
+- A v0 static endpoint is refused with a typed terminal version error and an audit line; its route
+  stays offline and no fake connection is reported.
+- A v0 worker that cannot use registration remains offline.
+- A v1 worker that lacks the filesystem frames is refused `version_mismatch` until upgraded.
+- Parked commands remain parked; none is lost or sent to a wrong machine.
+
+A peer whose declaration does not match the accepted revision is refused
+`version_mismatch`; it is never accepted into a half-compatible state. No compatibility shim
+translates between protocol revisions. The v0 and v1 steady states differ by more than a no-op
+integer rewrite, and silent translation would make a partially upgraded deployment appear healthy.
 
 ## 8. Failure and degradation
 
-| Condition | Detection | Behavior | Blast radius |
+| Condition | Detection | Required behavior | Blast radius |
 |---|---|---|---|
-| Worker absent (never registered yet, or offline) | no route / no member | spawn is allowed only for a **known** id; commands park durably; the honest queue timeout is the bound | that worker's sessions, parked — nothing else |
-| Worker transport loss mid-command | connection closed | route detached, member offline, row stays `inflight`; re-drive on re-registration (at-least-once, dedupe at settlement) | that worker |
-| Re-dispatch of a command the worker already ran | command id present in the worker's result cache | answered from the cache (one audit line), the command does **not** run again — a crash-replayed `systemctl restart` cannot restart twice; a miss, an oversized result or a disabled cache re-executes | that command only |
-| Heartbeat silence on a live connection | `offline_after_ms` of staleness | state offline; the existing watchdog admits the ordinary `endpoint_health` input to affected live sessions (it reads the last-heartbeat column only and never writes); the route stays attached | that worker |
-| Duplicate id, newer registration | authenticated `register` while online | replace: old connection closed, route swapped, generation incremented, audited | that id only |
-| Duplicate id vs static pin | registration | refused and audited; static pin unchanged | that id only |
-| Malformed registration payload | validation | refused (`id_conflict`) or the description is dropped with an audit line; no state change | that connection |
-| Version mismatch | handshake | typed refusal + audit; connection closed; no state change | that worker |
-| Bad/absent token, or an unlisted id in strict mode | comparison | typed `bad_token` refusal + audit, one attempt per connection, per-peer bound, rate-limited closes beyond the window; strict mode does not reveal whether the id is enrolled | that peer |
-| Listener configured but token env unset/blank | startup validation | the whole `serve` process refuses to start | whole process (configured capability) |
-| Public/non-private bind without `allow_public` | startup validation | the whole `serve` process refuses to start | whole process |
-| Kian crash / restart | process start | directory empty, registry rows stale ⇒ every worker reads offline; the last-declared cache keeps the description/version (flagged stale) for registry-only ids; bindings rebuild from streams; rows re-drive | all workers, transiently |
-| Listener shutdown / drain | shutdown | live members get a `bye`, routes detach, rows stay parked; registering peers are refused | all workers |
-| Fs path escapes the root (`..`) | server-side lexical check before enqueue; worker-side re-check | honest `InvalidCall` (no row) or a typed `io` error result — never a write outside the intended path | that call |
-| Fs body over 1 MiB / non-UTF-8 read | worker-side bound / decode | typed `io` error surfaced as the local `{"error": …}` tool result; no truncation, no partial write | that call |
-| Queue timeout | timer | row abandoned honestly, caller gets a timeout; a duplicate command id answers with the same timeout | that command |
-| Bound session's drain died (panic / cancellation) or its model call stalled | lease expiry, or the provider's `idle_timeout_ms` | the drain's bookkeeping unwinds so the sweep takes over (one honest `failed` end at most `MAX_UNENDED_CLAIMS` claims — audited with `crashed`), and a stalled turn settles `failed`; the ADR-035 release/reclaim then frees the worker | that thread; the worker is freed, no command moves |
-| Bound thread ended `interrupted`/`failed` | projection `idle` + last end non-terminal + no live queue row | holds the worker until `release_worker` / the `workers.release_after_ms` tick closes it (`cancelled` after a claim; audited) | that thread; the worker is freed, no command moves |
-| Release refused (running / eligible input / live queue row) | the release gates | honest refusal (`session_busy`), no append; the operator interrupts/waits and retries; the tick skips this beat | that thread |
+| Worker absent or offline | No route, or live state offline | Allow spawn only for a known id; park commands durably until route return or `queue_timeout`. | That worker's sessions and commands |
+| Transport loss during command | Connection closes | Detach route, compute offline, leave the row truthful (`inflight` or re-driveable), and resume by command id on reconnect. | That worker |
+| Re-dispatch after execution | Command id found in worker result cache | Return cached result without re-execution; on cache miss or eviction, execute again. | That command |
+| Heartbeat silence with open transport | Last heartbeat exceeds `workers.offline_after_ms` | Compute offline, admit `endpoint_health` to affected live worker sessions, and retain the route until transport loss or replacement. | That worker |
+| Newer registration for a live id | Authenticated `register` | Serialize replacement: close old transport, swap route, increment generation, audit. | That id |
+| Dynamic id collides with static pin | Registration validation | Refuse and audit; keep the static pin and route. | That id |
+| Malformed registration | Identity or payload validation | Refuse malformed id with `id_conflict`; drop and audit malformed optional description; create no state. | That connection |
+| Incompatible protocol | Handshake | Refuse `version_mismatch`, audit, close, and preserve parked work. | That worker |
+| Bad or absent token; unlisted id in strict mode | Authentication | Refuse `bad_token`, audit, allow one attempt per connection, and rate-limit closes after the peer window; strict mode does not reveal enrollment state. | That peer |
+| Named token variable missing or blank | Startup validation | Refuse to start `kian serve`. | Whole configured process |
+| Public or wildcard bind without override | Startup validation | Refuse to start `kian serve`. | Whole configured process |
+| Server crash or restart | Process start | Empty live directory, all workers offline, bindings rebuilt from streams, queue rows preserved, and routes recreated by registration. | All workers transiently |
+| Listener shutdown | Shutdown | Send `bye` where possible, detach routes, preserve queued rows, and refuse new registrations. | All workers |
+| Filesystem path escapes root | Server lexical check, then worker re-check | Return a typed `io` result or `InvalidCall` before any write; never write outside the intended path. | That call |
+| Filesystem body over 1 MiB or non-UTF-8 read | Worker bound or decode | Return a typed `io` tool error; never truncate or partially write. | That call |
+| Queue timeout | Timer | Move `pending` to `abandoned`; duplicate command ids receive the same timeout. | That command |
+| Drain dies or model call stalls | Lease expiry, provider timeout, or panic cleanup | Unwind bookkeeping, let the bounded takeover chain take over, and settle one honest end; never continue hiding a lost holder. | That thread; no command moves |
+| Bound thread ends `interrupted` or `failed` | Idle resumable projection with no live inbox or queue row | Hold the worker until explicit release or `workers.release_after_ms` reclaim. | That thread; no command moves |
+| Release sees running work or any unconsumed input row (eligible or future-ineligible) | Gate failure | Refuse `session_busy`, append nothing, and let the caller wait or interrupt before retrying. | That thread |
+| Release sees an already terminal thread | Terminal projection | Return idempotent `already_released` and append nothing. | That thread |
+| Release targets an unknown or unbound id | Binding lookup | Return `worker_not_bound` and append nothing. | That id |
+| Child ignores graceful termination | Worker execution timeout | Enforce the command's configured kill bound and return a timeout result; release does not force-kill the child and cannot free the binding before the thread ends. | That command and worker session |
 
-No degradation path maps onto a `completed` session, invents a result, silently swallows a command, or
-fails a command over to another worker. Every row above is an audit line plus an honest error at the
-seam.
+No row in this table converts an abort, crash, missing result, timeout, or interrupt into
+`completed`. No degradation path invents a result, silently drops a command, or fails a command over
+to another worker.
 
 ## 9. Boundaries and non-goals
 
-- **One kian instance.** A worker registers to exactly one `kian serve`. There is no federation, no
-  relay, no "register to all replicas", no cross-instance dispatch. A second kian is a different
-  deployment with a different membership.
-- **No live rebind / retirement / takeover.** The contract guarantees only that the *same* worker id coming
-  back reattaches to its binding. A permanently lost worker ends in the honest timeout. The rebind
-  design (durable intent, fencing for the old worker's queued rows, a seq-range projection rule) is
-  recorded in ADR-020 §Deferred and ADR-021 §Deferred and is an owner gate, not a spec detail.
-  Release (ADR-035) is *not* rebind: it terminates the old thread and mints nothing; it never moves
-  a session or a command to another worker.
-- **Release is not a force-kill.** A `running`/`recoverable` thread cannot be released; `interrupt`
-  is the stop surface and must settle first. No released thread can be resumed
-  (`cancelled` is terminal). The old thread's command rows are never cancelled by a release — the
-  release gate requires the queue to have no live row, so there is nothing to cancel.
-- **No mTLS and no per-worker certificates; no token rotation without restart.** Per-worker bearer
-  tokens (ADR-031) narrow the shared-token hole but are not an identity proof; the planned fix remains
-  mTLS. Rotation today is "set a new env value and restart".
-- **No worker pools**: 1:1 stays.
-- **Capabilities are declarations, not authority.** The worker declares them in `register` (v3);
-  the server sanitizes (lowercase `[a-z0-9._-]`, ≤16, unique) and caches the accepted list. A
-  wrong or stale entry misleads selection; it grants nothing. When something selects a worker
-  (job step placement, `design/JOB-MODEL.md` §9) a capability is an eligibility input; eligibility
-  grants nothing, and enforcement stays with the worker's own tool grants and sandbox.
-  Capability-based spawn validation and enforcement are out of scope. Static pins have no
-  declaration in this phase (`hello` unchanged); their catalog row omits the field.
-- **No per-id queue timeout, rebind or failover.** The dynamic bound (`workers.queue_timeout_ms`)
-  is one backend-level value; the ADR-020 deferred machinery is unchanged.
-- **The worker fs surface is the three text tools** (`fs_list`/`fs_read`/`fs_write`, 1 MiB bounds,
-  `--workspace-root`, lexical `..` guard; [ADR-023](decisions/ADR-023-worker-fs-tools.md)). Binary
-  bodies, streaming/large files, `fs_edit`/glob, a symlink-proof sandbox and fs tools on the Router
-  or plain sessions are out of scope.
-- **No membership data in prompts or tool schemas** — `list_workers` results only. The last-declared
-  cache is non-authoritative: the live directory wins, a cached row is labeled `declaration_stale`,
-  and no membership decision (identity, state, bindability, routing, spawn legality) reads it.
-- **No public listener**; no hosted multi-tenant concerns.
-- **No new event kind, table or HTTP route.** One additive registry-column migration (v5, the
-  capability cache) is part of ADR-032; one additive ops method (`release_worker`) and one
-  `workers:` key (`release_after_ms`) are ADR-035's.
-- Deployment (Vultr, WeChat) remains the owner's later discussion.
+- **One kian instance.** A worker registers to exactly one `kian serve`. There is no federation,
+  relay, multi-register mode, or cross-instance dispatch.
+- **No live rebind, retirement, or worker takeover.** Reconnect is valid only for the same worker id.
+  A lost worker produces timeout and a parked session. Release terminates the old worker session and
+  mints no replacement binding.
+- **Release is not force-kill.** A running or recoverable drain cannot be released. `interrupt` is
+  the stop surface and must settle before release. A successful release cannot be resumed, and the
+  queue has no live row at the close, so release has no command to cancel.
+- **No mTLS or per-worker certificates.** Per-worker bearer tokens narrow the shared-token risk but
+  are not machine attestation. Token rotation requires changing the environment value and restarting
+  the relevant process.
+- **No worker pools.** The one-live-binding rule remains the unit of concurrency.
+- **Capabilities are declarations, not authority.** The server sanitizes
+  `[a-z0-9._-]`, at most 16 unique entries, and caches the accepted list for display. A wrong or
+  stale declaration may mislead a selector; it grants nothing. A selector may use a capability as an
+  eligibility hint, but the worker's own tool grants and sandbox enforce execution.
+- **No per-worker queue timeout or failover.** `workers.queue_timeout_ms` is a backend-level bound.
+  The effective bound is the maximum of static endpoint bounds and this value.
+- **No capability-based spawn authorization.** Spawn eligibility is identity, one-live-binding,
+  ownership, speculation, and mandate. A declaration does not bypass any of them.
+- **The worker filesystem surface is text-only.** `fs_list`, `fs_read`, and `fs_write` have 1 MiB
+  bounds and use `--workspace-root` with a lexical `..` guard. Binary bodies, streaming or large
+  files, `fs_edit`, glob, symlink-proof sandboxing, and filesystem tools on unbound Router sessions
+  are outside this domain.
+- **No membership data in prompts or schemas.** `list_workers` results are the only membership
+  channel. The last-declared cache never participates in identity, liveness, bindability, routing,
+  spawn legality, or release eligibility.
+- **No public listener by default.** Hosted multi-tenant identity is not claimed by the bearer-token
+  boundary.
+- **No new event kind, membership table, HTTP route, or metrics key.** The durable model is the
+  existing worker-session stream, command queue, and one registry row per known id. There is no
+  separate membership table.
+- **No new operational surface beyond release.** The worker domain defines `release_worker` and the
+  configuration keys `workers.listen`, `workers.token_env`, `workers.tokens`,
+  `workers.enrolled_only`, `workers.allow_public`, `workers.offline_after_ms`,
+  `workers.queue_timeout_ms`, `workers.queue_max_redrives`,
+  `workers.queue_redrive_grace_ms`, and `workers.release_after_ms`. The numeric defaults are
+  `offline_after_ms: 30_000`, `queue_timeout_ms: 60_000`, `queue_max_redrives: 1`,
+  `queue_redrive_grace_ms: 5_000`, and `release_after_ms: 300_000`; the remaining keys are
+  flags or environment-variable names with no numeric default.
 
-## 10. UNVERIFIED (must stay visible)
+## 10. Change protocol
 
-- The real v0→v1 upgrade window has not been exercised with an old build; the typed
-  refusal is verified at L1 and the process-level window stays unverified until it is measured.
-- Process-death windows (kian dying mid-handshake or mid-command, worker dying mid-command) are
-  reproduced only where the L2 harness can inject a kill; the L1 fixtures cover the *states* those
-  windows leave behind, not the death itself.
-- Tailscale/SSH-tunnel reachability and any non-loopback bind are deployment properties: documented,
-  not tested. Only loopback legs run in CI.
-- Per-spawn cost (directory snapshot + registry read) is unmeasured; small scale is assumed.
-- The shared-token impersonation limitation is a design fact, not a tested behaviour: the tests can
-  only assert that no *other* identity channel exists. Per-worker tokens and strict enrollment are
-  tested over real loopback TCP (accept/refuse matrix) and config validation; token rotation,
-  leak revocation and a real multi-device deployment are unverified.
-- The capability declaration is worker-supplied and tested through `register` → the directory →
-  `list_workers`/`kian workers` (sanitization, live view, cached view). Drift between the declared
-  list and the worker's actual build is undetected by construction (a declaration is not an
-  execution proof), and there is no L3 evidence.
-- The global `workers.queue_timeout_ms` trade-off is documented, not measured: no test exercises a
-  phone-length bound against a static worker's timeout expectation.
-- No L3 (real deployment) evidence exists for this contract.
-- The v1 → v2 upgrade window has not been exercised with a real old worker binary; the
-  typed refusal is L1 and the queue's legacy-row decode is tested, but the cross-version deployment
-  window stays unverified until measured.
-- Binding release/reclaim (ADR-035) is exercised at L1/L2 (state gates, claim+batch, tick, CLI/RPC);
-  no real two-machine interrupt→release run exists, and the check→append window against a
-  concurrent public `submit` is reasoned rather than race-tested.
-- Abnormal-interruption convergence (ADR-041) is exercised at L1 (provider stall bounds, drain
-  panic cleanup, the bounded takeover chain) and L2 (real `kian serve` + a stalling provider, a
-  seeded crash chain, plus the crash→reclaim composition that frees a bound worker with no operator
-  call). No real provider-proxy stall on a deployed worker exists, and `connect_timeout_ms` has no
-  deterministic test (a blackholed peer needs network shaping); the crash bound is driven by real
-  panics plus a seeded chain, not by three live process kills.
+| Change | Treatment |
+|---|---|
+| Worker identity, membership state, pruning, or binding policy | Change this specification first; then update implementation, durable schema, and tests. A change to the reason or rejected alternatives requires a separate decision record. |
+| A worker frame, field, typed error, rejection reason, or protocol version | Define the worker-domain meaning here and update both protocol implementations, golden frames, public client fixtures, and this section in one logical change. |
+| A `workers:` configuration field or default | Update this specification, configuration validation, catalog or CLI surfaces, examples, and fail-closed tests in one change. |
+| Binding, release, admission linearization, or reclaim semantics | Update this specification, the per-session critical section, claim/append implementation, operation surface, payload evidence, and concurrency tests in one change. |
+| A worker command family or dispatch semantic | Update this specification, queue row schema, command and result handling, dedupe behavior, timeout bounds, and transport integration tests. |
+| A durable registry column or declaration-cache change | Prove it remains non-authoritative, update this specification, the registry schema and migration, storage tests, and catalog output together. |
+| A new event kind or authoritative table | Requires an explicit architectural decision before implementation; this worker specification may define the semantics but may not silently expand durable truth. |
+| Assembly, crate placement, CLI formatting, or presentation | Implement without changing worker authority; a presentation change must still expose the refusals, defaults, and state meanings defined here. |
 
-## 11. Change protocol
+Three rules bind every worker-domain change:
 
-| Change | Starts here? | Also required in the same change |
-|---|---|---|
-| Membership semantics (lifecycle, states, pruning, bind policy) | **yes** | `design/WORKER-MODEL.md` first; then code + tests; ADR if the *why* changes |
-| A wire frame/field/error/reason, `PROTOCOL_VERSION` | no — [API-CONTRACT](API-CONTRACT.md) §8, §9.1/§9.2 | both halves' goldens, SDK fixtures if any, this file's §7 pointer if the policy changes |
-| A `workers:` config field (`tokens`, `enrolled_only`, `queue_timeout_ms`, `release_after_ms`) | **yes** — this file | `kian-cli` config validation + assembly, `list_workers`/`kian workers` surfaces, ADR when the security or timeout *why* changes |
-| Binding release / idle reclaim (the terminal close, its gates, the triggers) | **yes** — this file | ADR + `kian-orchestrator` claim+batch + `kian-cli` ops method/tick; API-CONTRACT §4 for the wire, EVENT-MODEL for the end payload key |
-| An event payload key (`exec_worker`, `thread/started`) | no — [EVENT-MODEL](EVENT-MODEL.md) §3/§4.2 | code, tests, DESIGN §4.1 |
-| The worker command families (exec, fs) / dispatch semantics | **yes** — this file | API-CONTRACT §8 for frames; code + L2 tests; ADR when the family set changes |
-| A durable registry column / last-declared cache change | **yes** — this file | ADR + kian-exec migration; code + store tests; `list_workers`/CLI surfaces |
-| A new event kind or authoritative table | **owner gate** (ADR + EVENT-MODEL) — not a spec decision | — |
-| Assembly/HOW, crate placement, config surface, CLI shape | no — [DESIGN](DESIGN.md) §4.3/§4.7 | config validation tests, docs map |
-| Rationale, alternatives, deferred seams | no — a new ADR (append-only; supersede by linking) | — |
-| Product scope / status row | no — `docs/SPEC.md` §5 (closeout card) | — |
-
-Two rules that bind every change here: **membership is liveness, not truth** (no membership fact may
-become durable state outside the existing registry projection), and **membership never touches a
-prompt or a tool schema** (data flows through `list_workers` results only).
+1. Membership remains live runtime state; no durable cache becomes admission or routing authority.
+2. Binding remains immutable and reconstructible from its committed thread-start fact; no new
+   mutable routing table appears.
+3. No accepted input row survives a terminal close without being consumable, and no deployment
+   path converts loss into fabricated completion.

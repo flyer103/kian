@@ -684,6 +684,11 @@ pub trait ResidentTurn: Send + Sync {
         self.deliver(session, content, idempotency_key)
     }
 
+    /// Refuses a job run whose derived session already names another stream.
+    fn ensure_job_identity(&self, _session: SessionId, _marker: &Value) -> Result<(), String> {
+        Ok(())
+    }
+
     /// The default `overlap: skip` judgement (CRON-MODEL §5.1): a firing
     /// must not pile onto a session that is still working. `Ok(Some(reason))`
     /// records the slot as `skipped_overlap`; `Err` is a real failure
@@ -730,6 +735,9 @@ where
     /// ADR-060: the off-peak planner, armed only when the serve config
     /// declares a defer: section. None keeps every firing immediate.
     deferral: Option<crate::defer::DeferCalendar>,
+    /// The job identity preflight reads the derived session's committed
+    /// stream. Absent in unit fakes; production arms it at assembly.
+    store: Option<EventStore>,
 }
 
 impl<D> EngineTurn<D>
@@ -747,7 +755,16 @@ where
             handle,
             bootstrap,
             deferral: None,
+            store: None,
         }
+    }
+
+    /// Arms the job identity preflight with the store the scheduler admits
+    /// through.
+    #[must_use]
+    pub fn with_store(mut self, store: EventStore) -> Self {
+        self.store = Some(store);
+        self
     }
 
     /// Arms the off-peak planner (ADR-060). Without it every firing is
@@ -799,7 +816,9 @@ where
                     session.0
                 ));
             }
-            if let Some(bootstrap) = &self.bootstrap
+            let job_row = content.get(kian_superagent::job::status::JOB_KEY).is_some();
+            if !job_row
+                && let Some(bootstrap) = &self.bootstrap
                 && let Err(error) = bootstrap.bootstrap(session).await
             {
                 tracing::warn!(
@@ -859,6 +878,41 @@ where
         self.admit(session, content, idempotency_key, eligible_at_ms)
     }
 
+    fn ensure_job_identity(&self, session: SessionId, marker: &Value) -> Result<(), String> {
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        let expected = read_job_marker(marker)?;
+        self.handle.block_on(async {
+            let events = store
+                .rebuild(session)
+                .await
+                .map_err(|error| format!("run identity read: {error}"))?;
+            if events.is_empty() {
+                let rows = store
+                    .input_rows(session)
+                    .await
+                    .map_err(|error| format!("run identity inbox read: {error}"))?;
+                let Some(row) = rows.first() else {
+                    return Ok(());
+                };
+                let Some(existing) = row.payload.get(kian_superagent::job::status::JOB_KEY) else {
+                    return Err(run_identity_conflict(session));
+                };
+                return same_job_identity(existing, &expected, session);
+            }
+            match kian_superagent::job::status::marker(&events) {
+                Some(Ok(existing)) if existing.same_frozen_identity(&expected) => Ok(()),
+                Some(Ok(_)) => Err(run_identity_conflict(session)),
+                Some(Err(error)) => Err(format!(
+                    "run_identity_conflict: derived session {} carries an invalid job marker: {error}",
+                    session.0
+                )),
+                None => Err(run_identity_conflict(session)),
+            }
+        })
+    }
+
     fn should_skip(&self, session: SessionId) -> Result<Option<String>, String> {
         self.handle
             .block_on(async {
@@ -915,6 +969,31 @@ pub fn slot_of_firing(firing_id: &str) -> Result<&str, String> {
         return Err(format!("firing id `{firing_id}` carries an empty slot"));
     }
     Ok(slot)
+}
+
+fn read_job_marker(marker: &Value) -> Result<kian_superagent::job::status::JobMarker, String> {
+    kian_superagent::job::status::parse_marker(marker)
+        .map_err(|error| format!("invalid job marker: {error}"))
+}
+
+fn same_job_identity(
+    existing: &Value,
+    expected: &kian_superagent::job::status::JobMarker,
+    session: SessionId,
+) -> Result<(), String> {
+    let existing = read_job_marker(existing)?;
+    if existing.same_frozen_identity(expected) {
+        Ok(())
+    } else {
+        Err(run_identity_conflict(session))
+    }
+}
+
+fn run_identity_conflict(session: SessionId) -> String {
+    format!(
+        "run_identity_conflict: derived session {} already exists without the same job marker",
+        session.0
+    )
 }
 
 /// The operator-facing reason a job run failed (JOB-MODEL §5.5).
@@ -1046,6 +1125,7 @@ impl CronDispatcher for ResidentDispatcher {
                 "cron": cron,
                 "job": admission.marker,
             });
+            self.turn.ensure_job_identity(session, &content["job"])?;
             return self.turn.deliver(session, content, Some(admission.key));
         }
         let mut content = serde_json::json!({ "content": schedule.prompt, "cron": cron });
@@ -2324,7 +2404,7 @@ mod tests {
         let target = SessionId(uuid::Uuid::new_v4());
         rt.block_on(async {
             seed_frozen_session(&store, target, EndReason::Completed).await;
-            store
+            let error = store
                 .admit(InputRow {
                     id: uuid::Uuid::new_v4(),
                     session: target,
@@ -2334,7 +2414,11 @@ mod tests {
                     idempotency_key: Some("leftover".into()),
                 })
                 .await
-                .expect("leftover row");
+                .expect_err("a terminal session refuses a new row");
+            assert!(matches!(
+                error,
+                kian_store::InboxError::SessionTerminal { session } if session == target
+            ));
         });
         let target_events_before = rt.block_on(store.rebuild(target)).expect("rebuild").len();
 
@@ -2382,7 +2466,7 @@ mod tests {
             .expect("row");
         assert_eq!(row.state.as_str(), "succeeded", "{row:?}");
 
-        // The frozen target is untouched: same events, its leftover row pending.
+        // The frozen target is untouched: its attempted leftover row was refused.
         assert_eq!(
             rt.block_on(store.rebuild(target)).expect("rebuild").len(),
             target_events_before,
@@ -2392,8 +2476,8 @@ mod tests {
             rt.block_on(store.eligible_inputs(target, 1_900_000_000_000))
                 .expect("eligible read")
                 .len(),
-            1,
-            "the target's leftover row is still pending (audit fact)"
+            0,
+            "the terminal target admitted no leftover row"
         );
         let fired = rt.block_on(store.rebuild(derived)).expect("rebuild");
         assert!(
@@ -2558,6 +2642,96 @@ mod tests {
         (resolved.schedules.remove(0), plan)
     }
 
+    fn job_catalog(
+        id: &str,
+        job: &str,
+    ) -> (
+        crate::config::CronRuntimeSchedule,
+        Arc<crate::job_config::JobCatalog>,
+    ) {
+        let yaml = format!(
+            "jobs:\n  - id: {job}\n    plan:\n      - id: fetch\n        prompt: fetch the news\n        produces: {{ name: raw, max_bytes: 1024 }}\n        verify: [{{ check: final_message_present }}]\ntriggers:\n  - id: {id}\n    job: {job}\n    expr: \"* * * * *\"\n"
+        );
+        let section: crate::job_config::JobsSection =
+            serde_yaml::from_str(&yaml).expect("the job fixture parses");
+        let mut resolved = section
+            .resolve(&channels(), &std::collections::BTreeSet::new(), Utc::now())
+            .expect("the job fixture resolves");
+        (resolved.schedules.remove(0), Arc::new(resolved.catalog))
+    }
+
+    #[test]
+    fn a_job_run_refuses_a_derived_session_from_another_stream() {
+        let rt = runtime();
+        let dir = TempDir::new("job-identity-conflict");
+        let sqlite = dir.path().join("cron.sqlite").to_string_lossy().to_string();
+        let store = rt.block_on(EventStore::open(&sqlite)).expect("store opens");
+        let (schedule, catalog) = job_catalog("digest-morning", "digest");
+        let firing_id = format!("{}@2027-01-15T08:05:00Z", schedule.id);
+        let slot = slot_of_firing(&firing_id).expect("slot");
+        let session = kian_superagent::job::plan::run_session("digest", slot);
+        rt.block_on(append_created(&store, session));
+
+        let turn = Arc::new(
+            EngineTurn::new(engine_for(&store), rt.handle().clone(), None)
+                .with_store(store.clone()),
+        );
+        let dispatcher = ResidentDispatcher::new(turn).with_jobs(catalog);
+        let error = dispatcher
+            .dispatch(&schedule, &firing_id, "{}", Some(session))
+            .expect_err("another stream owns the derived identity");
+        assert!(error.contains("run_identity_conflict"), "{error}");
+        let rows = rt.block_on(store.input_rows(session)).expect("rows");
+        assert!(rows.is_empty(), "nothing may be admitted into the conflict");
+    }
+
+    #[test]
+    fn a_job_run_accepts_a_derived_session_with_the_same_marker() {
+        let rt = runtime();
+        let dir = TempDir::new("job-identity-same");
+        let sqlite = dir.path().join("cron.sqlite").to_string_lossy().to_string();
+        let store = rt.block_on(EventStore::open(&sqlite)).expect("store opens");
+        let (schedule, catalog) = job_catalog("digest-morning", "digest");
+        let firing_id = format!("{}@2027-01-15T08:05:00Z", schedule.id);
+        let slot = slot_of_firing(&firing_id).expect("slot");
+        let session = kian_superagent::job::plan::run_session("digest", slot);
+        let declared = catalog.job("digest").expect("job").plan.clone();
+        let marker =
+            kian_superagent::job::status::marker_payload("digest", slot, "cron", &declared);
+        rt.block_on(async {
+            append_created(&store, session).await;
+            store
+                .append(
+                    session,
+                    cron_event(
+                        session,
+                        2,
+                        Epoch(1),
+                        EventKind::InputAdmitted,
+                        serde_json::json!({"role": "user", "content": "run", "job": marker}),
+                    ),
+                    AppendGuard {
+                        epoch: Epoch(1),
+                        expected_seq: 2,
+                    },
+                )
+                .await
+                .expect("existing marker");
+        });
+
+        let turn = Arc::new(
+            EngineTurn::new(engine_for(&store), rt.handle().clone(), None)
+                .with_store(store.clone()),
+        );
+        let dispatcher = ResidentDispatcher::new(turn).with_jobs(catalog);
+        dispatcher
+            .dispatch(&schedule, &firing_id, "{}", Some(session))
+            .expect("the same marker names the same run");
+        let rows = rt.block_on(store.input_rows(session)).expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].payload.get("job").is_some());
+    }
+
     /// Seed a job run stream through its settling end: created, claimed, the
     /// marker-carrying firing input, optionally one run verdict, then
     /// `completed` (the end reason a job run always has when it finishes).
@@ -2596,6 +2770,7 @@ mod tests {
         let mut seq = 4;
         if let Some(outcome) = outcome {
             let payload = kian_superagent::job::status::run_verdict_payload(
+                None,
                 outcome,
                 &plan.digest(),
                 &[],

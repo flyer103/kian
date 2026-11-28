@@ -29,12 +29,12 @@ use std::path::Path;
 use std::time::Duration;
 
 use kian_core::events::{Event, EventKind, SCHEMA_VERSION};
-use kian_core::model::{Epoch, SessionId};
-use sqlx::PgPool;
+use kian_core::model::{Epoch, LeaseRecord, SessionId};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
 };
+use sqlx::{PgPool, Postgres, Sqlite, Transaction};
 
 use crate::migrations;
 
@@ -53,6 +53,24 @@ pub struct AppendGuard {
 pub struct Head {
     pub next_seq: u64,
     pub epoch: Epoch,
+}
+
+/// A per-session admission/release critical section.
+///
+/// Admission and the terminal release append take this handle before
+/// observing session state, so the last-event check and the inbox insert (or
+/// the terminal batch) share one serialization point. `AppendGuard` remains
+/// the event-stream CAS; this transaction supplies the admission/close
+/// ordering around it.
+pub enum SessionWrite {
+    Sqlite {
+        session: SessionId,
+        tx: Transaction<'static, Sqlite>,
+    },
+    Postgres {
+        session: SessionId,
+        tx: Transaction<'static, Postgres>,
+    },
 }
 
 /// Store failures as typed, matchable facts — a rejected CAS is not an
@@ -145,6 +163,29 @@ pub enum EventStore {
 }
 
 impl EventStore {
+    /// Starts the per-session admission/release critical section.
+    ///
+    /// SQLite uses `BEGIN IMMEDIATE`: the writer reservation is acquired
+    /// before the caller reads the terminal fact or writes the inbox row.
+    /// Postgres takes a transaction-scoped advisory lock derived from the
+    /// session UUID, so unrelated sessions remain concurrent.
+    pub async fn begin_session_write(
+        &self,
+        session: SessionId,
+    ) -> Result<SessionWrite, StoreError> {
+        match self {
+            EventStore::Sqlite(pool) => {
+                let tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+                Ok(SessionWrite::Sqlite { session, tx })
+            }
+            EventStore::Postgres(pool) => {
+                let mut tx = pool.begin().await?;
+                crate::postgres::lock_session_write(&mut tx, session).await?;
+                Ok(SessionWrite::Postgres { session, tx })
+            }
+        }
+    }
+
     /// Opens (creating if needed) a sqlite database file, applies the
     /// sqlite migration chain, and returns a pooled store. This stays
     /// *the* `open` — sqlite remains the default backend.
@@ -345,36 +386,7 @@ impl EventStore {
         events: &[Event],
         guard: AppendGuard,
     ) -> Result<(), StoreError> {
-        if events.is_empty() {
-            return Err(StoreError::GuardMismatch("empty batch append"));
-        }
-        for (i, event) in events.iter().enumerate() {
-            if event.version > SCHEMA_VERSION {
-                return Err(StoreError::UnsupportedVersion {
-                    found: event.version,
-                    current: SCHEMA_VERSION,
-                });
-            }
-            if event.session != session {
-                return Err(StoreError::GuardMismatch(
-                    "event.session disagrees with the session argument",
-                ));
-            }
-            if event.epoch != guard.epoch {
-                return Err(StoreError::GuardMismatch(
-                    "guard.epoch disagrees with event.epoch",
-                ));
-            }
-            if event.seq != guard.expected_seq + i as u64 {
-                return Err(StoreError::GuardMismatch(
-                    "batch seqs must be contiguous from guard.expected_seq",
-                ));
-            }
-        }
-        let envelopes = events
-            .iter()
-            .map(serde_json::to_string)
-            .collect::<Result<Vec<_>, _>>()?;
+        let envelopes = validate_batch(session, events, guard)?;
         match self {
             EventStore::Sqlite(pool) => {
                 crate::sqlite::append_batch(pool, session, events, &envelopes, guard).await
@@ -425,6 +437,48 @@ impl EventStore {
         match self {
             EventStore::Sqlite(pool) => crate::sqlite::scan_kind(pool, session, kind).await,
             EventStore::Postgres(pool) => crate::postgres::scan_kind(pool, session, kind).await,
+        }
+    }
+
+    /// Reads a bounded kind-filtered slice across every session, ordered by
+    /// `(session, seq)`. This is a projection read over the truth table, not
+    /// a second authority: the caller must tolerate an incomplete slice at
+    /// the limit and rebuild after the committed tail changes.
+    pub async fn scan_kind_across_sessions(
+        &self,
+        kind: EventKind,
+        limit: u64,
+    ) -> Result<Vec<Event>, StoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        match self {
+            EventStore::Sqlite(pool) => {
+                crate::sqlite::scan_kind_across_sessions(pool, kind, limit).await
+            }
+            EventStore::Postgres(pool) => {
+                crate::postgres::scan_kind_across_sessions(pool, kind, limit).await
+            }
+        }
+    }
+
+    /// Reads a bounded newest-first slice of admitted input rows across
+    /// every session. Rows are durable admission facts, so this also
+    /// exposes a run whose first input has not reached an event yet.
+    pub async fn input_rows_across_sessions(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<kian_core::model::InputRow>, crate::inbox::InboxError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        match self {
+            EventStore::Sqlite(pool) => {
+                crate::sqlite::input_rows_across_sessions(pool, limit).await
+            }
+            EventStore::Postgres(pool) => {
+                crate::postgres::input_rows_across_sessions(pool, limit).await
+            }
         }
     }
 
@@ -511,6 +565,323 @@ impl EventStore {
             EventStore::Postgres(pool) => crate::postgres::version(pool, session).await,
         }
     }
+}
+
+impl SessionWrite {
+    /// The stream head read from inside the critical section.
+    pub async fn head(&mut self) -> Result<Head, StoreError> {
+        match self {
+            Self::Sqlite { session, tx } => crate::sqlite::head_tx(tx, *session).await,
+            Self::Postgres { session, tx } => crate::postgres::head_tx(tx, *session).await,
+        }
+    }
+
+    /// Claims the session from inside the critical section. Claim failure
+    /// leaves the transaction writable and the epoch floor unchanged.
+    pub async fn claim(
+        &mut self,
+        holder: &str,
+        ttl_ms: u64,
+        now_ms: u64,
+    ) -> Result<LeaseRecord, crate::inbox::InboxError> {
+        match self {
+            Self::Sqlite { session, tx } => {
+                crate::sqlite::claim_tx(tx, *session, holder, ttl_ms, now_ms).await
+            }
+            Self::Postgres { session, tx } => {
+                crate::postgres::claim_tx(tx, *session, holder, ttl_ms, now_ms).await
+            }
+        }
+    }
+
+    /// Appends one contiguous event batch under the existing CAS guard.
+    pub async fn append_batch(
+        &mut self,
+        events: &[Event],
+        guard: AppendGuard,
+    ) -> Result<(), StoreError> {
+        let session = self.session();
+        let envelopes = validate_batch(session, events, guard)?;
+        match self {
+            Self::Sqlite { tx, .. } => {
+                crate::sqlite::append_batch_tx(tx, session, events, &envelopes, guard).await
+            }
+            Self::Postgres { tx, .. } => {
+                crate::postgres::append_batch_tx(tx, session, events, &envelopes, guard).await
+            }
+        }
+    }
+
+    /// Reads the complete stream from inside the critical section.
+    pub async fn scan_all(&mut self) -> Result<Vec<Event>, StoreError> {
+        match self {
+            Self::Sqlite { session, tx } => {
+                crate::sqlite::scan_tx(tx, *session, 0..i64::MAX as u64).await
+            }
+            Self::Postgres { session, tx } => {
+                crate::postgres::scan_tx(tx, *session, 0..i64::MAX as u64).await
+            }
+        }
+    }
+
+    /// Any durable input row not consumed by a committed event. Eligibility
+    /// is deliberately absent: a future-dated row still blocks release.
+    pub async fn has_unconsumed_inputs(&mut self) -> Result<bool, crate::inbox::InboxError> {
+        match self {
+            Self::Sqlite { session, tx } => {
+                crate::sqlite::has_unconsumed_inputs_tx(tx, *session).await
+            }
+            Self::Postgres { session, tx } => {
+                crate::postgres::has_unconsumed_inputs_tx(tx, *session).await
+            }
+        }
+    }
+
+    /// Linearized input admission. A committed same-key row is returned
+    /// first; only a would-be new row is checked against the terminal stream
+    /// fact.
+    pub async fn admit(
+        &mut self,
+        input: kian_core::model::InputRow,
+    ) -> Result<crate::inbox::AdmitOutcome, crate::inbox::InboxError> {
+        let session = self.session();
+        if input.session != session {
+            return Err(crate::inbox::InboxError::CorruptRow {
+                session,
+                input_id: input.id,
+                reason: "input session disagrees with the SessionWrite session".into(),
+            });
+        }
+        if let Some(key) = input.idempotency_key.as_deref()
+            && let Some(existing) = self.input_by_key(key).await?
+        {
+            return Ok(crate::inbox::AdmitOutcome {
+                input: existing,
+                deduplicated: true,
+            });
+        }
+        if self.last_event_is_terminal().await? {
+            return Err(crate::inbox::InboxError::SessionTerminal { session });
+        }
+        let payload = serde_json::to_string(&input.payload)?;
+        let inserted = match self {
+            Self::Sqlite { tx, .. } => crate::sqlite::insert_input_tx(tx, &input, &payload).await?,
+            Self::Postgres { tx, .. } => {
+                crate::postgres::insert_input_tx(tx, &input, &payload).await?
+            }
+        };
+        if inserted {
+            return Ok(crate::inbox::AdmitOutcome {
+                input,
+                deduplicated: false,
+            });
+        }
+        let Some(key) = input.idempotency_key.as_deref() else {
+            return Err(crate::inbox::InboxError::CorruptRow {
+                session,
+                input_id: input.id,
+                reason: "insert skipped without an idempotency key".into(),
+            });
+        };
+        let existing =
+            self.input_by_key(key)
+                .await?
+                .ok_or_else(|| crate::inbox::InboxError::CorruptRow {
+                    session,
+                    input_id: input.id,
+                    reason: "unique index reported a collision but no row was found".into(),
+                })?;
+        Ok(crate::inbox::AdmitOutcome {
+            input: existing,
+            deduplicated: true,
+        })
+    }
+
+    /// Channel admission: same-key rows in this session and an already
+    /// consumed row (or archived receipt) anywhere suppress before the
+    /// terminal check, preserving replay semantics.
+    pub async fn admit_channel(
+        &mut self,
+        input: kian_core::model::InputRow,
+    ) -> Result<crate::inbox::AdmitOutcome, crate::inbox::InboxError> {
+        let session = self.session();
+        if input.session != session {
+            return Err(crate::inbox::InboxError::CorruptRow {
+                session,
+                input_id: input.id,
+                reason: "input session disagrees with the SessionWrite session".into(),
+            });
+        }
+        let Some(key) = input.idempotency_key.as_deref() else {
+            return Err(crate::inbox::InboxError::CorruptRow {
+                session,
+                input_id: input.id,
+                reason: "channel admit requires an idempotency key".into(),
+            });
+        };
+        if let Some(existing) = self.input_by_key(key).await? {
+            return Ok(crate::inbox::AdmitOutcome {
+                input: existing,
+                deduplicated: true,
+            });
+        }
+        if let Some(existing) = self.consumed_input_by_key(key).await? {
+            return Ok(crate::inbox::AdmitOutcome {
+                input: existing,
+                deduplicated: true,
+            });
+        }
+        if let Some(existing) = self.receipt_by_key(key).await? {
+            return Ok(crate::inbox::AdmitOutcome {
+                input: existing,
+                deduplicated: true,
+            });
+        }
+        if self.last_event_is_terminal().await? {
+            return Err(crate::inbox::InboxError::SessionTerminal { session });
+        }
+        let payload = serde_json::to_string(&input.payload)?;
+        let inserted = match self {
+            Self::Sqlite { tx, .. } => {
+                crate::sqlite::insert_channel_input_tx(tx, &input, &payload).await?
+            }
+            Self::Postgres { tx, .. } => {
+                crate::postgres::insert_channel_input_tx(tx, &input, &payload).await?
+            }
+        };
+        if inserted {
+            return Ok(crate::inbox::AdmitOutcome {
+                input,
+                deduplicated: false,
+            });
+        }
+        if let Some(existing) = [
+            self.input_by_key(key).await?,
+            self.consumed_input_by_key(key).await?,
+            self.receipt_by_key(key).await?,
+        ]
+        .into_iter()
+        .flatten()
+        .next()
+        {
+            return Ok(crate::inbox::AdmitOutcome {
+                input: existing,
+                deduplicated: true,
+            });
+        }
+        Err(crate::inbox::InboxError::CorruptRow {
+            session,
+            input_id: input.id,
+            reason: "channel admit was refused but no suppressing row was found".into(),
+        })
+    }
+
+    /// Commits the admission/release critical section.
+    pub async fn commit(self) -> Result<(), StoreError> {
+        match self {
+            Self::Sqlite { tx, .. } => tx.commit().await.map_err(StoreError::from),
+            Self::Postgres { tx, .. } => tx.commit().await.map_err(StoreError::from),
+        }
+    }
+
+    /// Explicitly rolls the critical section back.
+    pub async fn rollback(self) -> Result<(), StoreError> {
+        match self {
+            Self::Sqlite { tx, .. } => tx.rollback().await.map_err(StoreError::from),
+            Self::Postgres { tx, .. } => tx.rollback().await.map_err(StoreError::from),
+        }
+    }
+
+    fn session(&self) -> SessionId {
+        match self {
+            Self::Sqlite { session, .. } | Self::Postgres { session, .. } => *session,
+        }
+    }
+
+    async fn input_by_key(
+        &mut self,
+        key: &str,
+    ) -> Result<Option<kian_core::model::InputRow>, crate::inbox::InboxError> {
+        match self {
+            Self::Sqlite { session, tx } => crate::sqlite::input_by_key_tx(tx, *session, key).await,
+            Self::Postgres { session, tx } => {
+                crate::postgres::input_by_key_tx(tx, *session, key).await
+            }
+        }
+    }
+
+    async fn consumed_input_by_key(
+        &mut self,
+        key: &str,
+    ) -> Result<Option<kian_core::model::InputRow>, crate::inbox::InboxError> {
+        match self {
+            Self::Sqlite { tx, .. } => crate::sqlite::consumed_input_by_key_tx(tx, key).await,
+            Self::Postgres { tx, .. } => crate::postgres::consumed_input_by_key_tx(tx, key).await,
+        }
+    }
+
+    async fn receipt_by_key(
+        &mut self,
+        key: &str,
+    ) -> Result<Option<kian_core::model::InputRow>, crate::inbox::InboxError> {
+        match self {
+            Self::Sqlite { tx, .. } => crate::sqlite::receipt_by_key_tx(tx, key).await,
+            Self::Postgres { tx, .. } => crate::postgres::receipt_by_key_tx(tx, key).await,
+        }
+    }
+
+    async fn last_event_is_terminal(&mut self) -> Result<bool, StoreError> {
+        let last = match self {
+            Self::Sqlite { session, tx } => crate::sqlite::last_event_tx(tx, *session).await?,
+            Self::Postgres { session, tx } => crate::postgres::last_event_tx(tx, *session).await?,
+        };
+        Ok(matches!(
+            last.map(|event| event.kind),
+            Some(EventKind::SessionEnded {
+                reason: kian_core::events::EndReason::Completed
+                    | kian_core::events::EndReason::Cancelled
+                    | kian_core::events::EndReason::Rotated
+            })
+        ))
+    }
+}
+
+fn validate_batch(
+    session: SessionId,
+    events: &[Event],
+    guard: AppendGuard,
+) -> Result<Vec<String>, StoreError> {
+    if events.is_empty() {
+        return Err(StoreError::GuardMismatch("empty batch append"));
+    }
+    for (i, event) in events.iter().enumerate() {
+        if event.version > SCHEMA_VERSION {
+            return Err(StoreError::UnsupportedVersion {
+                found: event.version,
+                current: SCHEMA_VERSION,
+            });
+        }
+        if event.session != session {
+            return Err(StoreError::GuardMismatch(
+                "event.session disagrees with the session argument",
+            ));
+        }
+        if event.epoch != guard.epoch {
+            return Err(StoreError::GuardMismatch(
+                "guard.epoch disagrees with event.epoch",
+            ));
+        }
+        if event.seq != guard.expected_seq + i as u64 {
+            return Err(StoreError::GuardMismatch(
+                "batch seqs must be contiguous from guard.expected_seq",
+            ));
+        }
+    }
+    events
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::from)
 }
 
 #[cfg(test)]
@@ -1272,6 +1643,82 @@ mod tests {
         assert!(
             store
                 .scan_kind(SessionId::new(), EventKind::MemoryNote)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        store.close().await;
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn scan_kind_across_sessions_is_balanced_bounded_and_ordered() {
+        let (store, path) = test_store().await;
+        let first = SessionId(Uuid::from_u128(10));
+        let second = SessionId(Uuid::from_u128(20));
+        seed(&store, first, 4, Epoch(1)).await;
+        seed(&store, second, 3, Epoch(1)).await;
+
+        let got = store
+            .scan_kind_across_sessions(EventKind::TurnStart, 3)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 3);
+        let keys: Vec<(String, u64)> = got
+            .iter()
+            .map(|event| (event.session.0.to_string(), event.seq))
+            .collect();
+        let mut expected_keys = keys.clone();
+        expected_keys.sort();
+        assert_eq!(keys, expected_keys, "session then seq order");
+        assert_eq!(keys[0], (first.0.to_string(), 2));
+        assert_eq!(keys[1], (first.0.to_string(), 3));
+        assert_eq!(keys[2], (first.0.to_string(), 4));
+
+        assert!(
+            store
+                .scan_kind_across_sessions(EventKind::MemoryNote, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .scan_kind_across_sessions(EventKind::TurnStart, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        store.close().await;
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn input_rows_across_sessions_is_newest_first_and_bounded() {
+        let (store, path) = test_store().await;
+        let first = SessionId(Uuid::from_u128(10));
+        let second = SessionId(Uuid::from_u128(20));
+        for (session, at, key) in [(first, 10, "a"), (first, 20, "b"), (second, 30, "c")] {
+            store
+                .admit(kian_core::model::InputRow {
+                    id: Uuid::new_v4(),
+                    session,
+                    payload: json!({"content": key}),
+                    admitted_at: at,
+                    eligible_at: at,
+                    idempotency_key: Some(key.to_string()),
+                })
+                .await
+                .expect("admit");
+        }
+
+        let got = store.input_rows_across_sessions(2).await.unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].idempotency_key.as_deref(), Some("c"));
+        assert_eq!(got[1].idempotency_key.as_deref(), Some("b"));
+        assert!(
+            store
+                .input_rows_across_sessions(0)
                 .await
                 .unwrap()
                 .is_empty()

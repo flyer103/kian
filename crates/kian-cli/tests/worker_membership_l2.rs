@@ -1078,20 +1078,15 @@ async fn join_without_restart_cli_list_spawn_exec_prefix() {
         WORKER_TOKEN,
     );
 
-    // The real operator verb shows the worker online (durable view).
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        let board = kian_workers_json(&config).await;
-        if cli_state(&board, "dyn-1") == Some("online") {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "kian workers never showed dyn-1 online; board: {board}"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
     wait_registry_view(&fx, "dyn-1", true, offline_after).await;
+    // The read-only CLI process has no live directory connection, so its
+    // durable projection remains offline even after the join.
+    let board = kian_workers_json(&config).await;
+    assert_eq!(
+        cli_state(&board, "dyn-1"),
+        Some("offline"),
+        "registry cache is not membership: {board}"
+    );
 
     // The Router's `list_workers` tool sees it (R4) and `spawn_worker`
     // binds it (R1: plain-string required exec_worker honored).
@@ -1114,6 +1109,10 @@ async fn join_without_restart_cli_list_spawn_exec_prefix() {
     assert!(
         listed.contains("\"description\":\"l2 membership daemon\""),
         "the registered description is model-visible via the tool result: {listed}"
+    );
+    assert!(
+        listed.contains("\"protocol_version\":3"),
+        "the registered protocol version is model-visible via the tool result: {listed}"
     );
 
     let (worker_session, _thread, exec_worker) = nth_spawn(&fx, 0).await;
@@ -2267,7 +2266,8 @@ async fn async_tools_follow_the_dynamic_worker() {
 
 /// L2 (v3, ADR-029): a real `kiand --register-to --capability` declares
 /// its capabilities on the wire; the real `kian workers --json` board
-/// shows the cached declaration while the worker is online.
+/// shows the cached declaration. The read-only board reports the row
+/// offline because it does not own the live directory connection.
 #[tokio::test]
 async fn worker_declared_capabilities_reach_the_operator_board() {
     force_no_proxy();
@@ -2311,7 +2311,7 @@ async fn worker_declared_capabilities_reach_the_operator_board() {
             .iter()
             .find(|row| row["id"].as_str() == Some("dyn-caps"));
         if let Some(row) = row
-            && row["state"].as_str() == Some("online")
+            && row["state"].as_str() == Some("offline")
             && row["capabilities"] == serde_json::json!(["exec", "apple-calendar", "apple-health"])
         {
             break;

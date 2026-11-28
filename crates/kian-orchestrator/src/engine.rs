@@ -59,6 +59,8 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dashmap::{DashMap, Entry};
+use std::future::Future;
+
 use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt};
 use serde_json::{Value, json};
@@ -179,6 +181,10 @@ pub enum EngineError {
     Store(#[from] StoreError),
     #[error("inbox: {0}")]
     Inbox(#[from] kian_store::InboxError),
+    #[error("session {session:?} is terminal; input admission refused")]
+    SessionTerminal { session: SessionId },
+    #[error("release queue gate failed: {0}")]
+    ReleaseQueueGate(String),
     #[error("projection: {0}")]
     Projection(#[from] kian_core::state::ProjectionError),
     #[error(
@@ -285,6 +291,9 @@ pub enum ReleaseOutcome {
     /// A drain holds the session, or a fresh lease on another replica
     /// blocked the claim — nothing was written; retry later.
     Busy,
+    /// The caller's worker-queue gate still has a live pending/inflight row
+    /// — nothing was written; retry after the queue settles.
+    QueueBusy,
     /// The session is not an idle, already-ended session (running,
     /// never ended, or holding eligible work) — nothing was written.
     NotEligible,
@@ -356,6 +365,15 @@ const APPEND_ATTEMPTS: usize = 4;
 /// so `3` = the original attempt plus at most one retry. The count is
 /// derived from the committed stream, never stored.
 const MAX_UNENDED_CLAIMS: u64 = 3;
+
+fn map_admit_error(error: kian_store::InboxError) -> EngineError {
+    match error {
+        kian_store::InboxError::SessionTerminal { session } => {
+            EngineError::SessionTerminal { session }
+        }
+        other => EngineError::Inbox(other),
+    }
+}
 
 /// Removes this drain's in-process handle on every exit path — the normal
 /// return, a panic unwind and task cancellation (ADR-041). Without it a
@@ -1392,13 +1410,13 @@ where
     /// release safe (a terminal session can never resume into the slot
     /// a newer thread now holds).
     ///
-    /// Fail-closed gates, all before the claim: the projection is
-    /// `idle`, the last event is `session/ended{interrupted|failed}`
-    /// (a session that never ended is not releasable), no eligible
-    /// inbox row exists (queued/resumable work is never discarded), and
-    /// no drain is in flight. The claim then fences a live holder on
-    /// another replica. The batch is one transaction: a crash before it
-    /// leaves the projection `idle` (retryable), never a half-close.
+    /// Fail-closed gates, all re-evaluated inside the per-session write
+    /// transaction: the projection is `idle`, the last event is
+    /// `session/ended{interrupted|failed}`, no unconsumed inbox row exists
+    /// (future-eligible rows included), and no local drain is in flight.
+    /// Guarded callers evaluate their queue gate in that same transaction.
+    /// The claim and terminal batch are one transaction: a failure leaves the
+    /// projection `idle` (retryable), never a half-close.
     ///
     /// The caller owns the domain meaning of `end_bytes` (the worker
     /// release payload); the engine only needs a JSON object.
@@ -1407,13 +1425,31 @@ where
         session: SessionId,
         end_bytes: Value,
     ) -> Result<ReleaseOutcome, EngineError> {
+        self.release_idle_guarded(session, end_bytes, async { Ok(true) })
+            .await
+    }
+
+    /// Releases an idle, resumable session while evaluating the caller's
+    /// queue-liveness gate inside the per-session admission/release critical
+    /// section. `true` means the bound worker's queue has no live row.
+    pub async fn release_idle_guarded<F>(
+        &self,
+        session: SessionId,
+        end_bytes: Value,
+        queue_gate: F,
+    ) -> Result<ReleaseOutcome, EngineError>
+    where
+        F: Future<Output = Result<bool, EngineError>>,
+    {
         match self.drains.entry(session) {
             Entry::Occupied(_) => return Ok(ReleaseOutcome::Busy),
             Entry::Vacant(v) => {
                 v.insert(DrainHandle::new(session, self.clock.now_ms()));
             }
         }
-        let outcome = self.release_idle_inner(session, end_bytes).await;
+        let outcome = self
+            .release_idle_inner(session, end_bytes, queue_gate)
+            .await;
         self.drains.remove(&session);
         if !matches!(outcome, Ok(ReleaseOutcome::Released { .. })) && self.wakes.take(&session) {
             // A wake folded onto this release (e.g. a submit raced it):
@@ -1528,12 +1564,17 @@ where
         })
     }
 
-    async fn release_idle_inner(
+    async fn release_idle_inner<F>(
         &self,
         session: SessionId,
         end_bytes: Value,
-    ) -> Result<ReleaseOutcome, EngineError> {
-        let events = self.store.rebuild(session).await?;
+        queue_gate: F,
+    ) -> Result<ReleaseOutcome, EngineError>
+    where
+        F: Future<Output = Result<bool, EngineError>>,
+    {
+        let mut write = self.store.begin_session_write(session).await?;
+        let events = write.scan_all().await?;
         if events.is_empty() {
             return Ok(ReleaseOutcome::Unknown);
         }
@@ -1553,20 +1594,22 @@ where
         if !ended {
             return Ok(ReleaseOutcome::NotEligible);
         }
-        let now = self.clock.now_ms();
-        if !self.store.eligible_inputs(session, now).await?.is_empty() {
-            return Ok(ReleaseOutcome::NotEligible);
+        if write.has_unconsumed_inputs().await? {
+            return Ok(ReleaseOutcome::Busy);
         }
-        let lease = match self
-            .store
-            .claim(session, &self.config.holder, self.config.lease_ttl_ms, now)
+        if !queue_gate.await? {
+            return Ok(ReleaseOutcome::QueueBusy);
+        }
+        let now = self.clock.now_ms();
+        let lease = match write
+            .claim(&self.config.holder, self.config.lease_ttl_ms, now)
             .await
         {
             Ok(lease) => lease,
             Err(kian_store::InboxError::ClaimRejected { .. }) => return Ok(ReleaseOutcome::Busy),
             Err(e) => return Err(e.into()),
         };
-        let head = self.store.head(session).await?;
+        let head = write.head().await?;
         let claim = Event {
             seq: head.next_seq,
             session,
@@ -1587,16 +1630,23 @@ where
             bytes: end_bytes,
             version: SCHEMA_VERSION,
         };
-        self.store
+        match write
             .append_batch(
-                session,
                 &[claim, end],
                 AppendGuard {
                     epoch: lease.epoch,
                     expected_seq: head.next_seq,
                 },
             )
-            .await?;
+            .await
+        {
+            Ok(()) => {}
+            Err(StoreError::StaleEpoch { .. } | StoreError::SeqMismatch { .. }) => {
+                return Ok(ReleaseOutcome::Busy);
+            }
+            Err(error) => return Err(error.into()),
+        }
+        write.commit().await?;
         // Mirror the drain's accounting for the two events in the batch:
         // the claim and the terminal end are two state transitions, and
         // the end is one end write.
@@ -1740,7 +1790,11 @@ where
             eligible_at: now,
             idempotency_key: Some(idempotency_key),
         };
-        let outcome = self.store.admit_channel(input).await?;
+        let outcome = self
+            .store
+            .admit_channel(input)
+            .await
+            .map_err(map_admit_error)?;
         self.publish_admit_wake(session).await;
         Ok(outcome)
     }
@@ -1851,7 +1905,7 @@ where
             eligible_at: eligible_at_ms,
             idempotency_key,
         };
-        Ok(self.store.admit(input).await?)
+        self.store.admit(input).await.map_err(map_admit_error)
     }
 
     /// Steers a running session: a synthetic (strippable) input that
@@ -2068,7 +2122,7 @@ where
                 target_epoch,
             )),
         };
-        let outcome = self.store.admit(input).await?;
+        let outcome = self.store.admit(input).await.map_err(map_admit_error)?;
         if outcome.deduplicated {
             tracing::debug!(
                 session = %session.0,
@@ -2643,7 +2697,9 @@ where
                     // requests a rotation at its park boundary; the
                     // session ends `rotated` (terminal), and the rotation
                     // ticker completes the successor.
-                    end_reason = if reason == kian_core::seams::ROTATION_STOP_REASON {
+                    end_reason = if reason == kian_core::seams::TERMINAL_CANCEL_STOP_REASON {
+                        EndReason::Cancelled
+                    } else if reason == kian_core::seams::ROTATION_STOP_REASON {
                         EndReason::Rotated
                     } else {
                         EndReason::Completed
@@ -2700,7 +2756,7 @@ where
         // stays for the resumer.
         match ctx.take_control_inputs().await {
             Ok(fired) => {
-                if fired {
+                if fired && end_reason != EndReason::Cancelled {
                     end_reason = EndReason::Interrupted;
                 }
             }
@@ -2759,7 +2815,9 @@ where
                     }
                 }
                 LoopOutcome::Stopped { reason } => {
-                    if interrupted() {
+                    if reason == kian_core::seams::TERMINAL_CANCEL_STOP_REASON {
+                        Supervised::Stopped { reason }
+                    } else if interrupted() {
                         Supervised::Interrupted
                     } else {
                         Supervised::Stopped { reason }
@@ -3448,14 +3506,10 @@ mod tests {
         cleanup(&path);
     }
 
-    /// CRON-MODEL §5.1 / DESIGN §2.3: a terminal (frozen) session's leftover
-    /// inbox rows are audit facts, not runnable work. The old answer — `true`
-    /// because `eligible_inputs` was non-empty — was a permanently stuck
-    /// "busy": no drain can ever consume a frozen stream, so `overlap: skip`
-    /// dropped every slot forever while `wake_now` refused the same session
-    /// as terminal.
+    /// W5: a terminal session refuses new input atomically, so it cannot
+    /// accumulate unconsumable rows. It also reads as no open work.
     #[tokio::test]
-    async fn frozen_session_with_leftover_input_reads_as_no_open_work() {
+    async fn frozen_session_refuses_late_input_and_reads_as_no_open_work() {
         let (store, path) = open_store().await;
         let eng = engine(&store, Arc::new(ScriptedDriver::default_happy()));
         let sid = SessionId::new();
@@ -3473,17 +3527,22 @@ mod tests {
             "the session ends completed"
         );
 
-        // A row admitted after the freeze: durable, and never consumable.
         let late = eng
             .admit_quiet(sid, json!("late"), Some("late".into()))
-            .await
-            .expect("late admit");
-        assert!(!late.deduplicated);
-        assert_eq!(
-            store.eligible_inputs(sid, T0).await.unwrap().len(),
-            1,
-            "the leftover row stays durable and pending (audit fact)"
+            .await;
+        assert!(matches!(
+            late,
+            Err(EngineError::SessionTerminal { session }) if session == sid
+        ));
+        assert!(
+            !store.has_unconsumed_inputs(sid).await.unwrap(),
+            "the refused row is not durable"
         );
+        let replay = eng
+            .admit_quiet(sid, json!("ignored replay"), Some("first".into()))
+            .await
+            .expect("a committed same-key row remains an idempotent success");
+        assert!(replay.deduplicated);
         assert_eq!(
             eng.terminal_state(sid).await.expect("terminal read"),
             Some(SessionState::Completed),
@@ -3533,10 +3592,8 @@ mod tests {
         cleanup(&path);
     }
 
-    /// Startup NoLostWork: the rebuild skips a frozen session's leftover
-    /// rows (waking it only spawns a drain that projects terminal and exits)
-    /// while still draining every live session, and the leftover row survives
-    /// as the audit fact it is.
+    /// Startup NoLostWork: the rebuild skips a frozen session while still
+    /// draining every live session.
     #[tokio::test]
     async fn startup_rebuild_skips_frozen_sessions_but_recovers_live_ones() {
         let (store, path) = open_store().await;
@@ -3557,11 +3614,6 @@ mod tests {
             .await,
             "the session ends completed"
         );
-        first
-            .admit_quiet(frozen, json!("late"), Some("late".into()))
-            .await
-            .expect("late admit");
-
         // Restart shape: a fresh engine over the same store; a live session
         // also holds a durable row (admitted with no wake at all).
         let live = SessionId::new();
@@ -3582,10 +3634,9 @@ mod tests {
             0,
             "no wake is registered for the frozen session"
         );
-        assert_eq!(
-            store.eligible_inputs(frozen, T0).await.unwrap().len(),
-            1,
-            "the frozen session's leftover row is preserved, not consumed"
+        assert!(
+            !store.has_unconsumed_inputs(frozen).await.unwrap(),
+            "no late row can be admitted to the frozen session"
         );
         assert!(
             !eng.has_open_work(frozen).await.expect("open work"),
@@ -3601,8 +3652,8 @@ mod tests {
     async fn startup_rebuild_survives_an_unprojectable_stream() {
         let (store, path) = open_store().await;
         let corrupt = SessionId::new();
-        // created -> ended without a claim: illegal per the transition table,
-        // but the store's CAS accepts the bytes (a real corruption shape).
+        // created -> failed-without-claim is illegal per the transition table,
+        // but leaves a resumable last event so admission remains legal.
         store
             .append(
                 corrupt,
@@ -3631,7 +3682,7 @@ mod tests {
                     epoch: Epoch(1),
                     ts: T0 + 2,
                     kind: EventKind::SessionEnded {
-                        reason: EndReason::Completed,
+                        reason: EndReason::Failed,
                     },
                     bytes: json!({}),
                     version: SCHEMA_VERSION,
@@ -5322,6 +5373,127 @@ mod tests {
 
     // -- ADR-035: the release of an idle-ended session ----------------------
 
+    #[tokio::test]
+    async fn terminal_cancel_stop_wins_over_a_consumed_interrupt_flag() {
+        let (store, path) = open_store().await;
+        let gate = Arc::new(Notify::new());
+        let driver = Arc::new(ScriptedDriver::scripted(vec![vec![
+            Step::BeginTurn,
+            Step::Gate(Arc::clone(&gate)),
+            Step::EndTurn,
+            Step::Outcome(LoopOutcome::Stopped {
+                reason: kian_core::seams::TERMINAL_CANCEL_STOP_REASON.to_string(),
+            }),
+        ]]));
+        let eng = engine(&store, Arc::clone(&driver));
+        let sid = eng.create_session().await.unwrap();
+        eng.admit(sid, json!("cancel this run"), None)
+            .await
+            .unwrap();
+        assert!(
+            wait_for(5_000, || async {
+                driver.log().iter().any(|entry| entry.starts_with("begin:"))
+            })
+            .await,
+            "the driver reached its safe boundary"
+        );
+        assert_eq!(
+            eng.interrupt(sid).await.unwrap(),
+            InterruptOutcome::Requested
+        );
+        gate.notify_one();
+        assert!(
+            wait_for(5_000, || async {
+                !eng.is_draining(&sid)
+                    && events_of(&store, sid).await.last().is_some_and(|event| {
+                        matches!(
+                            event.kind,
+                            EventKind::SessionEnded {
+                                reason: EndReason::Cancelled
+                            }
+                        )
+                    })
+            })
+            .await,
+            "the terminal-cancel end commits despite the interrupt flag"
+        );
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn ordinary_interrupt_still_ends_interrupted() {
+        let (store, path) = open_store().await;
+        let gate = Arc::new(Notify::new());
+        let eng = engine(
+            &store,
+            Arc::new(ScriptedDriver::scripted(vec![vec![
+                Step::BeginTurn,
+                Step::Gate(Arc::clone(&gate)),
+                Step::EndTurn,
+                Step::Outcome(LoopOutcome::Stopped {
+                    reason: "ordinary stop".into(),
+                }),
+            ]])),
+        );
+        let sid = eng.create_session().await.unwrap();
+        eng.admit(sid, json!("interrupt this turn"), None)
+            .await
+            .unwrap();
+        assert!(
+            wait_for(5_000, || async { eng.is_draining(&sid) }).await,
+            "the drain is in flight"
+        );
+        eng.interrupt(sid).await.unwrap();
+        gate.notify_one();
+        assert!(
+            wait_for(5_000, || async {
+                !eng.is_draining(&sid)
+                    && events_of(&store, sid).await.last().is_some_and(|event| {
+                        matches!(
+                            event.kind,
+                            EventKind::SessionEnded {
+                                reason: EndReason::Interrupted
+                            }
+                        )
+                    })
+            })
+            .await,
+            "ordinary interrupt keeps its resumable interrupted end"
+        );
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn rotation_stop_still_ends_rotated() {
+        let (store, path) = open_store().await;
+        let eng = engine(
+            &store,
+            Arc::new(ScriptedDriver::scripted(vec![vec![Step::Outcome(
+                LoopOutcome::Stopped {
+                    reason: kian_core::seams::ROTATION_STOP_REASON.to_string(),
+                },
+            )]])),
+        );
+        let sid = eng.create_session().await.unwrap();
+        eng.admit(sid, json!("rotate"), None).await.unwrap();
+        assert!(
+            wait_for(5_000, || async {
+                !eng.is_draining(&sid)
+                    && events_of(&store, sid).await.last().is_some_and(|event| {
+                        matches!(
+                            event.kind,
+                            EventKind::SessionEnded {
+                                reason: EndReason::Rotated
+                            }
+                        )
+                    })
+            })
+            .await,
+            "rotation keeps its terminal rotated end"
+        );
+        cleanup(&path);
+    }
+
     /// Seeds a session in the worker-release shape: claimed once, an
     /// input admitted, then `session/ended{interrupted}` — projection
     /// `idle`, resumable, no drain.
@@ -5521,10 +5693,10 @@ mod tests {
         cleanup(&path);
     }
 
-    /// (ADR-035) Eligible work is never discarded: an inbox row makes
+    /// (ADR-035/W5) Unconsumed work is never discarded: an inbox row makes
     /// the release refuse and write nothing.
     #[tokio::test]
-    async fn release_idle_never_discards_eligible_work() {
+    async fn release_idle_never_discards_unconsumed_work() {
         let (store, path) = open_store().await;
         let eng = engine(&store, Arc::new(ScriptedDriver::default_happy()));
         let sid = seed_interrupted_idle(&store, &eng).await;
@@ -5535,7 +5707,7 @@ mod tests {
 
         assert_eq!(
             eng.release_idle(sid, json!({})).await.unwrap(),
-            ReleaseOutcome::NotEligible
+            ReleaseOutcome::Busy
         );
         assert_eq!(
             store.head(sid).await.unwrap().next_seq,
@@ -5543,6 +5715,83 @@ mod tests {
             "nothing was appended"
         );
         assert_eq!(projection_of(&store, sid).await, SessionState::Idle);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn release_idle_blocks_a_future_row_until_it_is_consumed() {
+        let (store, path) = open_store().await;
+        let eng = engine(&store, Arc::new(ScriptedDriver::default_happy()));
+        let sid = seed_interrupted_idle(&store, &eng).await;
+        let future = eng.now_ms().saturating_add(60_000);
+        let admitted = eng
+            .admit_at(sid, json!("future work"), Some("future".into()), future)
+            .await
+            .unwrap();
+        let before = store.head(sid).await.unwrap();
+
+        assert_eq!(
+            eng.release_idle(sid, json!({})).await.unwrap(),
+            ReleaseOutcome::Busy,
+            "eligibility time does not make an unconsumed row invisible"
+        );
+        assert_eq!(
+            store.head(sid).await.unwrap().next_seq,
+            before.next_seq,
+            "the refused release writes nothing"
+        );
+
+        store
+            .mark_consumed(sid, admitted.input.id, 3)
+            .await
+            .expect("tie the future row to an already-committed event");
+        assert!(matches!(
+            eng.release_idle(sid, json!({})).await.unwrap(),
+            ReleaseOutcome::Released { .. }
+        ));
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn release_queue_gate_runs_while_the_session_write_is_open() {
+        let (store, path) = open_store().await;
+        let eng = engine(&store, Arc::new(ScriptedDriver::default_happy()));
+        let sid = seed_interrupted_idle(&store, &eng).await;
+        let entered = Arc::new(Notify::new());
+        let finish_gate = Arc::new(Notify::new());
+        let gate_entered = Arc::clone(&entered);
+        let gate_finish = Arc::clone(&finish_gate);
+        let release_engine = Arc::clone(&eng);
+        let release = tokio::spawn(async move {
+            release_engine
+                .release_idle_guarded(sid, json!({}), async move {
+                    gate_entered.notify_one();
+                    gate_finish.notified().await;
+                    Ok(true)
+                })
+                .await
+        });
+
+        entered.notified().await;
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                store.admit(row(sid, 88, json!("blocked admission")))
+            )
+            .await
+            .is_err(),
+            "admission stays blocked while the queue gate awaits inside the transaction"
+        );
+        finish_gate.notify_one();
+        assert!(matches!(
+            release.await.unwrap().unwrap(),
+            ReleaseOutcome::Released { .. }
+        ));
+        assert!(matches!(
+            eng.admit_quiet(sid, json!("late"), Some("late".into()))
+                .await,
+            Err(EngineError::SessionTerminal { session }) if session == sid
+        ));
         cleanup(&path);
     }
 

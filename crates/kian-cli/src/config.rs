@@ -183,10 +183,11 @@ pub struct ServeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media: Option<MediaConfig>,
     /// The selfdev: section (SELF-EVOLUTION-MODEL §13 A18). None (the section
-    /// absent) is self-dev publish off: a plan that declares a publish step is
-    /// still admitted, and its attempt fails with "publish is not configured"
-    /// (§14 V32). Present means the conductor may write one derived worktree,
-    /// one commit and one gate run.
+    /// absent) is self-dev publish off: a frozen plan that declares the retired
+    /// publish step is still admitted, and its attempt fails with "publish is
+    /// not configured" (§14 V32). Present means the conductor may replay one
+    /// derived worktree, one commit and one gate run; a new plan cannot name
+    /// the action (ADR-084).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selfdev: Option<SelfdevSection>,
 }
@@ -1844,6 +1845,9 @@ pub struct ConfirmAnswersConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SuperAgentConfig {
+    /// The resident Router. Omitted/`null` disables the Router while the
+    /// worker and job surfaces remain available.
+    #[serde(default, deserialize_with = "deserialize_optional_router")]
     pub router: SuperAgentRouterConfig,
     pub worker: SuperAgentWorkerConfig,
     /// The IM reply budget (`superagent.im.reply_units`): the hard unit
@@ -2015,6 +2019,13 @@ pub struct SuperAgentConfig {
     /// V1..V22).
     #[serde(default)]
     pub jobs: crate::job_config::JobsSection,
+}
+
+fn deserialize_optional_router<'de, D>(deserializer: D) -> Result<SuperAgentRouterConfig, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<SuperAgentRouterConfig>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 /// 's default: follow-up ownership is **on** — the honest default
@@ -2841,6 +2852,26 @@ pub struct SuperAgentRouterConfig {
     /// not accepted).
     #[serde(default)]
     pub rotate_after_events: Option<u64>,
+}
+
+impl Default for SuperAgentRouterConfig {
+    fn default() -> Self {
+        Self {
+            session_id: String::new(),
+            agent: String::new(),
+            slot: default_router_slot(),
+            speculation: None,
+            rotate_after_events: None,
+        }
+    }
+}
+
+impl SuperAgentRouterConfig {
+    /// Whether this deployment mounts a resident Router.
+    #[must_use]
+    pub fn is_disabled(&self) -> bool {
+        self.session_id.trim().is_empty() && self.agent.trim().is_empty()
+    }
 }
 
 /// The `superagent.router.speculation` section:
@@ -4004,6 +4035,16 @@ pub struct SelfdevPublishSection {
     /// in S2a, never written to an event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_env: Option<String>,
+    /// Whether the publish tool runs the gate inside the worktree (§9.5). The
+    /// operator owns this: a plan or an agent never sets it.
+    #[serde(default = "default_publish_gates")]
+    pub gates: bool,
+    /// S2b: the publish tool pushes the branch after the gate passes.
+    #[serde(default)]
+    pub push: bool,
+    /// S2b: the publish tool opens a pull request after the push.
+    #[serde(default)]
+    pub pull_request: bool,
 }
 
 /// The commit author of a publish (§13 A18).
@@ -4026,6 +4067,10 @@ fn default_publish_remote() -> String {
 
 fn default_publish_gate() -> String {
     "./scripts/selfcheck.sh".to_string()
+}
+
+fn default_publish_gates() -> bool {
+    true
 }
 
 impl SelfdevSection {
@@ -4052,7 +4097,7 @@ impl SelfdevPublishSection {
         }
         if self.gate.trim().is_empty() {
             return Err(invalid(
-                "invalid publish config: selfdev.publish.gate names the command the conductor runs",
+                "invalid publish config: selfdev.publish.gate names the command the publish tool runs",
             ));
         }
         if self.base.trim().is_empty() || self.base.chars().any(char::is_whitespace) {
@@ -4084,6 +4129,16 @@ impl SelfdevPublishSection {
         {
             return Err(invalid(
                 "invalid publish config: selfdev.publish.token_env names an environment variable",
+            ));
+        }
+        if self.push && self.token_env.is_none() {
+            return Err(invalid(
+                "invalid publish config: selfdev.publish.push needs token_env: a push carries one credential from the operator's environment",
+            ));
+        }
+        if self.pull_request && !self.push {
+            return Err(invalid(
+                "invalid publish config: selfdev.publish.pull_request needs push: a pull request needs a pushed branch",
             ));
         }
         Ok(())
@@ -4827,7 +4882,29 @@ impl ServeConfig {
 
         // The superagent section's cross-references.
         if let Some(sa) = &self.superagent {
-            if sa.channels.is_empty() {
+            let router_enabled = !sa.router.is_disabled();
+            if !router_enabled {
+                let router_only = [
+                    (!sa.subscriptions.is_empty(), "subscriptions"),
+                    (!sa.classes.is_empty(), "classes"),
+                    (!sa.speak_rules.is_empty(), "speak_rules"),
+                    (!sa.confirm_answers.channels.is_empty(), "confirm_answers"),
+                    (sa.outbox.is_some(), "outbox"),
+                    (!sa.roster.is_empty(), "roster"),
+                    (sa.async_tools, "async_tools"),
+                    (sa.recall.worker, "recall.worker"),
+                    (
+                        sa.shaping.as_ref().is_some_and(|shaping| shaping.vision),
+                        "shaping.vision",
+                    ),
+                ];
+                if let Some((_, key)) = router_only.iter().find(|(enabled, _)| *enabled) {
+                    return Err(invalid(format!(
+                        "superagent.{key} requires superagent.router; a Router-free deployment mounts jobs, workers, and the ordinary loop only"
+                    )));
+                }
+            }
+            if sa.channels.is_empty() && router_enabled {
                 return Err(invalid(
                     "superagent.channels must declare at least one channel",
                 ));
@@ -5174,8 +5251,8 @@ impl ServeConfig {
             )?;
             reject_cron_targeting_the_rotating_router(
                 &resolved_cron,
-                Some(sa.router.session_id.as_str()),
-                sa.router.rotate_after_events.is_some(),
+                router_enabled.then_some(sa.router.session_id.as_str()),
+                router_enabled && sa.router.rotate_after_events.is_some(),
             )?;
             // ADR-060: a schedule may only declare defer: off_peak when
             // the defer: section exists — otherwise the firing would be
@@ -5189,71 +5266,69 @@ impl ServeConfig {
                     )));
                 }
             }
-            uuid::Uuid::parse_str(&sa.router.session_id).map_err(|_| {
-                invalid(format!(
-                    "superagent.router.session_id `{}` is not a uuid",
-                    sa.router.session_id
-                ))
-            })?;
-            if sa.router.rotate_after_events == Some(0) {
-                return Err(invalid(
-                    "superagent.router.rotate_after_events must be >= 1 (omit the key to \
-                     disable boot-time rotation)",
-                ));
-            }
-            let router_agent = self.agents.get(&sa.router.agent).ok_or_else(|| {
-                invalid(format!(
-                    "superagent.router.agent `{}` is not defined in agents",
-                    sa.router.agent
-                ))
-            })?;
-            if !router_agent.model_slots.contains_key(&sa.router.slot) {
-                return Err(invalid(format!(
-                    "superagent.router.slot `{}` is not defined in agents.{}.model_slots",
-                    sa.router.slot, sa.router.agent
-                )));
-            }
-            // the Router judge loop does not evaluate permissions
-            // this round (ADR-015) — a table on it would be silently
-            // ignored, so it refuses boot.
-            if !router_agent.permissions.is_empty() {
-                return Err(invalid(format!(
-                    "agents.{} carries a permissions table but the Router judge loop does not \
-                     evaluate permissions (ADR-015) — remove the section or move it to the \
-                     worker/default agent",
-                    sa.router.agent
-                )));
-            }
-            // (ADR-065) The channel-image flag is inert without its two
-            // prerequisites — a media edge to store the pixels and a
-            // vision-capable Router slot to read them — so it refuses
-            // boot rather than silently admitting text only.
-            if sa.shaping.as_ref().is_some_and(|shaping| shaping.vision) {
-                if self.media.is_none() {
+            if router_enabled {
+                uuid::Uuid::parse_str(&sa.router.session_id).map_err(|_| {
+                    invalid(format!(
+                        "superagent.router.session_id `{}` is not a uuid",
+                        sa.router.session_id
+                    ))
+                })?;
+                if sa.router.rotate_after_events == Some(0) {
                     return Err(invalid(
-                        "superagent.shaping.vision requires a `media:` section: the image \
-                         references it admits point at artifacts only the media edge stores \
-                         (ADR-065)",
+                        "superagent.router.rotate_after_events must be >= 1 (omit the key to \
+                         disable boot-time rotation)",
                     ));
                 }
-                let slot = router_agent
-                    .model_slots
-                    .get(&sa.router.slot)
-                    .ok_or_else(|| {
-                        invalid(format!(
-                            "superagent.router.slot `{}` is not defined in agents.{}.model_slots",
-                            sa.router.slot, sa.router.agent
-                        ))
-                    })?;
-                let vision = profile_for(&self.model_profiles, &slot.provider, &slot.model)
-                    .is_some_and(|profile| profile.vision);
-                if !vision {
+                let router_agent = self.agents.get(&sa.router.agent).ok_or_else(|| {
+                    invalid(format!(
+                        "superagent.router.agent `{}` is not defined in agents",
+                        sa.router.agent
+                    ))
+                })?;
+                if !router_agent.model_slots.contains_key(&sa.router.slot) {
                     return Err(invalid(format!(
-                        "superagent.shaping.vision requires agents.{}.model_slots.{} to resolve a \
-                         model_profiles entry with `vision: true` (provider `{}`, model `{}`): a \
-                         text-only slot would drop every image reference (ADR-065)",
-                        sa.router.agent, sa.router.slot, slot.provider, slot.model
+                        "superagent.router.slot `{}` is not defined in agents.{}.model_slots",
+                        sa.router.slot, sa.router.agent
                     )));
+                }
+                if !router_agent.permissions.is_empty() {
+                    return Err(invalid(format!(
+                        "agents.{} carries a permissions table but the Router judge loop does not \
+                         evaluate permissions (ADR-015) — remove the section or move it to the \
+                         worker/default agent",
+                        sa.router.agent
+                    )));
+                }
+                if sa.shaping.as_ref().is_some_and(|shaping| shaping.vision) {
+                    if self.media.is_none() {
+                        return Err(invalid(
+                            "superagent.shaping.vision requires a `media:` section: the image \
+                             references it admits point at artifacts only the media edge stores \
+                             (ADR-065)",
+                        ));
+                    }
+                    let slot = router_agent
+                        .model_slots
+                        .get(&sa.router.slot)
+                        .ok_or_else(|| {
+                            invalid(format!(
+                                "superagent.router.slot `{}` is not defined in agents.{}.model_slots",
+                                sa.router.slot, sa.router.agent
+                            ))
+                        })?;
+                    let vision = profile_for(&self.model_profiles, &slot.provider, &slot.model)
+                        .is_some_and(|profile| profile.vision);
+                    if !vision {
+                        return Err(invalid(format!(
+                            "superagent.shaping.vision requires agents.{}.model_slots.{} to resolve a \
+                             model_profiles entry with `vision: true` (provider `{}`, model `{}`): a \
+                             text-only slot would drop every image reference (ADR-065)",
+                            sa.router.agent, sa.router.slot, slot.provider, slot.model
+                        )));
+                    }
+                }
+                if let Some(speculation) = &sa.router.speculation {
+                    speculation.to_policy()?;
                 }
             }
             // (ADR-066) The per-turn image budget is only meaningful beside
@@ -5287,11 +5362,6 @@ impl ServeConfig {
                          65536..=67108864 (ADR-066)"
                     )));
                 }
-            }
-            // The speculation section must convert cleanly (
-            // fail-closed — a zero cap or empty label refuses to start).
-            if let Some(speculation) = &sa.router.speculation {
-                speculation.to_policy()?;
             }
             let worker_agent = self.agents.get(&sa.worker.agent).ok_or_else(|| {
                 invalid(format!(
@@ -5381,6 +5451,12 @@ impl ServeConfig {
             // session, an agent that exists and carries a strong
             // `main` slot (the worker-template shape).
             if let Some(watchdog) = &sa.watchdog {
+                if !router_enabled {
+                    return Err(invalid(
+                        "superagent.watchdog requires superagent.router: the watchdog judges the \
+                         resident Router's threads",
+                    ));
+                }
                 let session = uuid::Uuid::parse_str(&watchdog.session_id).map_err(|_| {
                     invalid(format!(
                         "superagent.watchdog.session_id `{}` is not a uuid",
@@ -7837,6 +7913,29 @@ recovery:
 
         // The default agent is untouched shorthand.
         assert_eq!(cfg.agent_def().id, "default");
+    }
+
+    #[test]
+    fn a_job_only_superagent_can_omit_the_router_binding() {
+        let yaml = r#"
+worker:
+  agent: worker
+jobs:
+  jobs:
+    - id: digest
+      plan:
+        - id: fetch
+          prompt: gather
+          verify: [{check: final_message_present}]
+"#;
+        let sa: SuperAgentConfig = serde_yaml::from_str(yaml).expect("job-only superagent");
+        assert!(sa.router.is_disabled());
+        assert_eq!(sa.worker.agent, "worker");
+        assert_eq!(sa.jobs.jobs[0].id, "digest");
+
+        let null_router: SuperAgentConfig =
+            serde_yaml::from_str(&format!("router: null\n{yaml}")).expect("null router is off");
+        assert!(null_router.router.is_disabled());
     }
 
     // -------------------------------------------------------------------
@@ -11941,5 +12040,65 @@ schedules:
         .unwrap_err()
         .to_string();
         assert!(err.contains("only supported for resident"), "{err}");
+    }
+
+    #[test]
+    fn publish_authority_is_operator_config_and_never_a_default() {
+        let repo =
+            std::env::temp_dir().join(format!("kian-publish-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(repo.join(".git")).expect("create repo marker");
+        let repo_dir = repo.display().to_string();
+        let base = format!(
+            "{}selfdev:\n  publish:\n    repo: \"{repo_dir}\"\n",
+            valid_yaml()
+        );
+
+        let cfg = ServeConfig::parse(&base).expect("publish section parses");
+        let publish = cfg
+            .selfdev
+            .as_ref()
+            .and_then(|selfdev| selfdev.publish.as_ref())
+            .expect("publish section");
+        assert!(publish.gates, "the gate runs by default (§9.5)");
+        assert!(!publish.push, "a push is not a default authority (S2b)");
+        assert!(
+            !publish.pull_request,
+            "a pull request is not a default authority"
+        );
+        assert!(publish.token_env.is_none());
+
+        let push_without_token = base.replace("    repo:", "    push: true\n    repo:");
+        let err = ServeConfig::parse(&push_without_token)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("push needs token_env"), "{err}");
+
+        let with_token = format!("{base}    token_env: KIAN_PUBLISH_TOKEN\n");
+        let pr_without_push = format!("{with_token}    pull_request: true\n");
+        let err = ServeConfig::parse(&pr_without_push)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pull_request needs push"), "{err}");
+
+        let push_and_pr = format!("{with_token}    push: true\n    pull_request: true\n");
+        let cfg = ServeConfig::parse(&push_and_pr).expect("a push and a pull request parse");
+        let publish = cfg
+            .selfdev
+            .as_ref()
+            .and_then(|selfdev| selfdev.publish.as_ref())
+            .expect("publish section");
+        assert!(publish.push && publish.pull_request);
+
+        let gate_off = format!("{base}    gates: false\n");
+        let cfg = ServeConfig::parse(&gate_off).expect("an explicit gate-off parses");
+        assert!(
+            !cfg.selfdev
+                .as_ref()
+                .and_then(|selfdev| selfdev.publish.as_ref())
+                .expect("publish section")
+                .gates
+        );
+
+        std::fs::remove_dir_all(repo).ok();
     }
 }

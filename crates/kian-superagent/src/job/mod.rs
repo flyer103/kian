@@ -11,6 +11,7 @@
 
 pub mod alert;
 pub mod conduct;
+pub mod inbox;
 pub mod outcome;
 pub mod placement;
 pub mod plan;

@@ -190,6 +190,9 @@ struct Inner {
     store: ExecStore,
     config: WatchdogConfig,
     clock: Arc<dyn Clock>,
+    /// Registry heartbeats older than this boot cannot establish online
+    /// membership: they are display cache, not a live connection.
+    started_at_ms: u64,
     /// Live per-endpoint state map (the watch-backed current-state view).
     states: watch::Sender<Arc<HashMap<String, EndpointHealth>>>,
     /// Edge events fanned out to [`WatchdogSource`] consumers.
@@ -214,10 +217,12 @@ impl HeartbeatWatchdog {
         let (states, _) = watch::channel(Arc::new(HashMap::new()));
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAP);
         let (shutdown, _) = watch::channel(false);
+        let started_at_ms = clock.now_ms();
         let inner = Arc::new(Inner {
             store,
             config,
             clock,
+            started_at_ms,
             states,
             events,
             metrics: WatchdogMetrics::default(),
@@ -362,7 +367,7 @@ fn observe(
     let mut changed = false;
     for row in rows {
         let age = now.saturating_sub(row.last_heartbeat_ms);
-        let health = if age > offline_after_ms {
+        let health = if age > offline_after_ms || row.last_heartbeat_ms <= inner.started_at_ms {
             EndpointHealth::Offline
         } else {
             EndpointHealth::Online

@@ -79,6 +79,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::post;
+use chrono::{Datelike, Utc};
 use common::{
     ScriptedResponse, force_no_proxy, spawn_scripted_provider, spawn_scripted_provider_gated_at,
     temp_dir,
@@ -2226,13 +2227,16 @@ async fn release_worker_ops_closes_a_stuck_binding_and_frees_it() {
     use serde_json::json;
     force_no_proxy();
     let dir = temp_dir("release-worker");
-    let serve_port = free_port();
     let db = dir.join("kian.sqlite");
     let config = dir.join("kian.yaml");
-    std::fs::write(
-        &config,
-        format!(
-            r#"listen: "127.0.0.1:{serve_port}"
+    let today = Utc::now().weekday().num_days_from_monday();
+    let weekdays = format!(
+        "{}, {}",
+        ["mon", "tue", "wed", "thu", "fri", "sat", "sun"][today as usize],
+        ["mon", "tue", "wed", "thu", "fri", "sat", "sun"][((today + 1) % 7) as usize]
+    );
+    let config_yaml = format!(
+        r#"listen: "127.0.0.1:0"
 storage:
   sqlite: "{db}"
 agent:
@@ -2270,12 +2274,27 @@ recovery:
   rules:
     - class: unknown
       action: fail
+pricing:
+  peak_windows:
+    - weekdays: [{weekdays}]
+      start: "00:00"
+      end: "24:00"
+      timezone: UTC
+defer:
+  sweep_interval_ms: 600000
+  max_wait_ms: 691200000
 "#,
-            db = db.display(),
-            dir = dir.display(),
-        ),
-    )
-    .expect("write l2 config");
+        db = db.display(),
+        dir = dir.display(),
+        weekdays = weekdays,
+    );
+    kian_cli::config::ServeConfig::parse(&config_yaml).expect("release race config parses");
+    let serve_port = free_port();
+    let config_yaml = config_yaml.replace(
+        "listen: \"127.0.0.1:0\"",
+        &format!("listen: \"127.0.0.1:{serve_port}\""),
+    );
+    std::fs::write(&config, config_yaml).expect("write l2 config");
 
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2285,6 +2304,15 @@ recovery:
     let running_session = SessionId::new();
     let stuck_thread = uuid::Uuid::new_v4();
     let running_thread = uuid::Uuid::new_v4();
+    let race_sessions: Vec<_> = (0..6)
+        .map(|index| {
+            (
+                format!("w-race-{index}"),
+                SessionId::new(),
+                uuid::Uuid::new_v4(),
+            )
+        })
+        .collect();
     {
         let store = EventStore::open(&db).await.expect("pre-boot store");
         seed_bound_thread(
@@ -2307,6 +2335,18 @@ recovery:
             now_ms,
         )
         .await;
+        for (worker, worker_session, thread_id) in &race_sessions {
+            seed_bound_thread(
+                &store,
+                SessionId::new(),
+                *worker_session,
+                *thread_id,
+                worker,
+                false,
+                now_ms,
+            )
+            .await;
+        }
         store.close().await;
     }
 
@@ -2365,6 +2405,104 @@ recovery:
         3,
         "the running thread was not touched"
     );
+    store.close().await;
+
+    let terminal_submit = rpc(
+        &client,
+        &base,
+        "/rpc",
+        "submit",
+        json!({
+            "session": stuck_session.0.to_string(),
+            "content": "too late",
+            "idempotency_key": "too-late",
+        }),
+    )
+    .await;
+    assert_eq!(
+        terminal_submit["error"]["code"], -32003,
+        "post-release submit is refused session_terminal: {terminal_submit}"
+    );
+
+    for (worker, session, _) in &race_sessions {
+        let submit = rpc(
+            &client,
+            &base,
+            "/rpc",
+            "submit",
+            json!({
+                "session": session.0.to_string(),
+                "content": "deferred race input",
+                "defer": "off_peak",
+                "idempotency_key": format!("race:{worker}"),
+            }),
+        );
+        let release = rpc(
+            &client,
+            &base,
+            "/ops/rpc",
+            "release_worker",
+            json!({"worker": worker}),
+        );
+        let (submit, release) = tokio::join!(submit, release);
+        if release["result"]["outcome"] == "released" {
+            assert_eq!(
+                submit["error"]["code"], -32003,
+                "release-first admission must be session_terminal: submit={submit} release={release}"
+            );
+        } else {
+            assert_eq!(
+                release["error"]["code"], -32002,
+                "admission-first release must be session_busy: submit={submit} release={release}"
+            );
+            assert_eq!(
+                submit["result"]["deferred"], true,
+                "the future-eligible submit keeps its row out of the drain: {submit}"
+            );
+        }
+    }
+
+    let store = EventStore::open_read_only(&db)
+        .await
+        .expect("race result read store");
+    for (_, session, _) in &race_sessions {
+        let events = store.rebuild(*session).await.expect("race stream");
+        let terminal = events.last().is_some_and(|event| {
+            matches!(
+                event.kind,
+                EK::SessionEnded {
+                    reason: kian_core::events::EndReason::Cancelled
+                }
+            )
+        });
+        if terminal {
+            assert!(
+                store
+                    .input_rows(*session)
+                    .await
+                    .expect("terminal rows")
+                    .is_empty(),
+                "a terminal race session holds no accepted input: {session:?}"
+            );
+        } else {
+            assert!(
+                store
+                    .has_unconsumed_inputs(*session)
+                    .await
+                    .expect("busy input state"),
+                "a busy race session retains the accepted future row: {session:?}"
+            );
+            assert!(
+                matches!(
+                    events.last().map(|event| &event.kind),
+                    Some(EK::SessionEnded {
+                        reason: kian_core::events::EndReason::Interrupted
+                    })
+                ),
+                "session_busy wrote no terminal close: {session:?}"
+            );
+        }
+    }
     store.close().await;
 
     // Idempotent: the slot is already free.

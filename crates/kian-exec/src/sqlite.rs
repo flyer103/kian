@@ -24,6 +24,8 @@ pub(crate) type QueueRow = (
     i64,
 );
 
+pub(crate) type PendingAbandonmentRow = (String, String, Option<String>, i64, i64);
+
 /// One `endpoint_registry` row's raw columns (ADR-025 adds the
 /// last-declared description/version).
 pub(crate) type RegistryRow = (
@@ -122,20 +124,35 @@ pub(crate) async fn mark_done(
     Ok(result.rows_affected())
 }
 
-/// `pending|inflight → abandoned`; returns rows affected (0 = terminal).
+/// `pending → abandoned`; returns rows affected (0 = not pending).
 pub(crate) async fn mark_abandoned(
     pool: &SqlitePool,
     command_id: Uuid,
     now: i64,
 ) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(
-        "UPDATE exec_queue SET status = 'abandoned', updated_at = ? WHERE command_id = ? AND status IN ('pending', 'inflight')",
+        "UPDATE exec_queue SET status = 'abandoned', updated_at = ? WHERE command_id = ? AND status = 'pending'",
     )
     .bind(now)
     .bind(command_id.to_string())
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
+}
+
+pub(crate) async fn abandon_aged_pending(
+    pool: &SqlitePool,
+    created_before: i64,
+    now: i64,
+) -> Result<Vec<PendingAbandonmentRow>, sqlx::Error> {
+    sqlx::query_as::<_, PendingAbandonmentRow>(
+        "UPDATE exec_queue SET status = 'abandoned', updated_at = ? WHERE status = 'pending' AND created_at <= ? AND (claimed_by IS NULL OR claimed_until_ms < ?) RETURNING command_id, endpoint_id, tool_call_ref, created_at, dispatch_attempts",
+    )
+    .bind(now)
+    .bind(created_before)
+    .bind(now)
+    .fetch_all(pool)
+    .await
 }
 
 pub(crate) async fn drivable(
@@ -169,7 +186,7 @@ pub(crate) async fn claim_queue_row(
     max_dispatches: i64,
 ) -> Result<bool, sqlx::Error> {
     let claimed: Option<String> = sqlx::query_scalar(
-        "UPDATE exec_queue SET claimed_by = ?, claimed_until_ms = ?, updated_at = ?, dispatch_attempts = dispatch_attempts + 1 WHERE command_id = ? AND status IN ('pending', 'inflight') AND (claimed_by IS NULL OR claimed_until_ms < ? OR claimed_by = ?) AND (status = 'pending' OR dispatch_attempts < ?) RETURNING command_id",
+        "UPDATE exec_queue SET claimed_by = ?, claimed_until_ms = ?, updated_at = ? WHERE command_id = ? AND status IN ('pending', 'inflight') AND (claimed_by IS NULL OR claimed_until_ms < ? OR claimed_by = ?) AND (status = 'pending' OR dispatch_attempts < ?) RETURNING command_id",
     )
     .bind(holder)
     .bind(now + ttl_ms)
@@ -181,6 +198,23 @@ pub(crate) async fn claim_queue_row(
     .fetch_optional(pool)
     .await?;
     Ok(claimed.is_some())
+}
+
+pub(crate) async fn commit_dispatch_attempt(
+    pool: &SqlitePool,
+    command_id: Uuid,
+    holder: &str,
+    now: i64,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE exec_queue SET dispatch_attempts = dispatch_attempts + 1, updated_at = ? WHERE command_id = ? AND claimed_by = ? AND status = 'inflight'",
+    )
+    .bind(now)
+    .bind(command_id.to_string())
+    .bind(holder)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 /// Converges an exhausted re-drive (ADR-033): `inflight → abandoned` iff the

@@ -53,9 +53,8 @@ type Waiter = oneshot::Sender<Result<CommandOutcome, ExecError>>;
 /// Which waits a caller takes over one durable queue row (ADR-030).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitPolicy {
-    /// The synchronous `exec` tool: one *dispatch* wait, then abandon. A
-    /// parked drain must not stay parked, so the caller never waits for a
-    /// worker that is already executing.
+    /// The synchronous `exec` tool: one *dispatch* wait, then stop waiting.
+    /// A still-pending row is abandoned; an inflight row is left live.
     Caller,
     /// The async `start` observer: a dispatch wait, then an *execution*
     /// wait bounded by the command's own worker-side timeout. Nothing is
@@ -158,9 +157,6 @@ struct Route {
     /// announced `max_concurrent` at each connect (the connection manager's
     /// own per-connection semaphore is the hard cap).
     permits: Mutex<Option<Arc<Semaphore>>>,
-    /// Command ids this process currently has dispatched (prevents the
-    /// driver re-dispatching a row whose dispatch is already parked).
-    dispatching: Mutex<HashSet<CommandId>>,
     /// The registration generation this route belongs to (0 = static).
     generation: u64,
     /// The driver task (joined on detach/shutdown).
@@ -173,6 +169,11 @@ struct QueueCore {
     /// Runtime-mutable route registry (Q2): static pins are inserted at
     /// construction; dynamic routes attach/detach with membership.
     routes: RwLock<HashMap<String, Arc<Route>>>,
+    /// Command ids this process currently has dispatched, across every
+    /// route: a row is in flight once, whichever route attached next. A
+    /// worker reconnect that attaches a new route while the previous
+    /// route's dispatch is still parked must not dispatch the row again.
+    dispatching: Mutex<HashSet<CommandId>>,
     config: RemoteExecConfig,
     /// the exec output redactor. Every `Ok` outcome passes it
     /// once, at settlement ([`QueueCore::complete`]) — the single choke
@@ -195,13 +196,16 @@ struct QueueCore {
     waiters: Mutex<HashMap<CommandId, Vec<(u64, Waiter)>>>,
     waiter_tokens: std::sync::atomic::AtomicU64,
     shutdown: watch::Sender<bool>,
+    orphan_sweeper: Mutex<Option<JoinHandle<()>>>,
+    orphan_sweep_ready: Arc<Notify>,
 }
 
 /// Tuning of the durable queue.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RemoteExecConfig {
-    /// How long a caller waits for the correlated result before the row is
-    /// honestly abandoned (`ExecError::Timeout`).
+    /// How long a caller waits for dispatch before a still-pending row is
+    /// honestly abandoned (`ExecError::Timeout`). An inflight row is never
+    /// mutated by this caller wait.
     pub queue_timeout: Duration,
     /// Idle poll of the queue table while connected (a safety net behind
     /// the wake-up; also refreshes the registry projection).
@@ -395,7 +399,6 @@ impl RemoteExecBackend {
                 nudge: Notify::new(),
                 stop: Notify::new(),
                 permits: Mutex::new(None),
-                dispatching: Mutex::new(HashSet::new()),
                 generation: 0,
                 driver: Mutex::new(None),
             });
@@ -407,6 +410,7 @@ impl RemoteExecBackend {
         let core = Arc::new(QueueCore {
             store,
             routes: RwLock::new(map.clone()),
+            dispatching: Mutex::new(HashSet::new()),
             config,
             redactor,
             row_lease_holder: holder.into(),
@@ -416,7 +420,11 @@ impl RemoteExecBackend {
             waiters: Mutex::new(HashMap::new()),
             waiter_tokens: std::sync::atomic::AtomicU64::new(0),
             shutdown,
+            orphan_sweeper: Mutex::new(None),
+            orphan_sweep_ready: Arc::new(Notify::new()),
         });
+        let sweeper = tokio::spawn(sweep_orphaned_pending(core.clone()));
+        *core.orphan_sweeper.lock().unwrap() = Some(sweeper);
         // One driver per boot-created (static) route, all sharing the
         // final core (dispatch completion resolves waiters through it).
         // Dynamic routes spawn their drivers in `attach_route`.
@@ -519,7 +527,6 @@ impl RemoteExecBackend {
             nudge: Notify::new(),
             stop: Notify::new(),
             permits: Mutex::new(None),
-            dispatching: Mutex::new(HashSet::new()),
             generation,
             driver: Mutex::new(None),
         });
@@ -581,6 +588,12 @@ impl RemoteExecBackend {
         &self.core.store
     }
 
+    /// Waits until the startup orphan sweep has completed its first pass.
+    #[doc(hidden)]
+    pub async fn await_initial_orphan_sweep(&self) {
+        self.core.orphan_sweep_ready.notified().await;
+    }
+
     /// The row-lease identity this backend's drivers claim queue
     /// rows under: `(holder, ttl)`.
     pub fn row_lease(&self) -> (&str, Duration) {
@@ -595,8 +608,8 @@ impl RemoteExecBackend {
     /// Enqueue-first tracked execution (the [`crate::RemoteExecTool`] path):
     /// the row is durable before any dispatch, the command id is the
     /// caller's dedupe key, and the caller's future resolves from the
-    /// correlated result — or an honest [`ExecError::Timeout`] with the row
-    /// `abandoned`.
+    /// correlated result — or an honest [`ExecError::Timeout`]. Only a
+    /// still-pending row is abandoned by that timeout.
     ///
     /// Queue-first (Q1): a live route is **never** a precondition. The
     /// row enqueues durably by the bound worker id; with no route it
@@ -779,6 +792,10 @@ impl RemoteExecBackend {
         for route in routes {
             stop_route(&route).await;
         }
+        let sweeper = self.core.orphan_sweeper.lock().unwrap().take();
+        if let Some(sweeper) = sweeper {
+            let _ = sweeper.await;
+        }
     }
 }
 
@@ -790,6 +807,46 @@ async fn stop_route(route: &Arc<Route>) {
     let driver = route.driver.lock().unwrap().take();
     if let Some(handle) = driver {
         let _ = handle.await;
+    }
+}
+
+async fn sweep_orphaned_pending(core: Arc<QueueCore>) {
+    let mut shutdown = core.shutdown.subscribe();
+    let mut first_pass = true;
+    loop {
+        if *core.shutdown.borrow() {
+            return;
+        }
+        let now = now_ms();
+        let cutoff = now.saturating_sub(duration_ms_i64(core.config.queue_timeout));
+        match core.store.abandon_aged_pending(cutoff, now).await {
+            Ok(rows) => {
+                for row in rows {
+                    tracing::warn!(
+                        target: "kian::exec",
+                        command_id = %row.command_id,
+                        endpoint = %row.endpoint_id,
+                        dispatch_attempts = row.dispatch_attempts,
+                        tool_call_ref = row.tool_call_ref.as_deref().unwrap_or(""),
+                        created_at = row.created_at,
+                        "queue orphan sweep: aged pending row abandoned; no dispatch was written"
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(%error, "queue orphan sweep failed"),
+        }
+        if first_pass {
+            first_pass = false;
+            core.orphan_sweep_ready.notify_one();
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(core.config.poll_interval) => {}
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -846,31 +903,49 @@ impl QueueCore {
             .await
             .map_err(ExecWaitError::Failure)?;
         match policy {
-            WaitPolicy::Caller => {
-                // The historical contract: the parked drain gives up and the
-                // row is abandoned whatever it was doing.
-                match self.store.mark_abandoned(command_id).await {
+            WaitPolicy::Caller => match now {
+                RowNow::Done(outcome) => Ok(*outcome),
+                RowNow::Abandoned => Err(ExecWaitError::Timeout {
+                    row: ExpiredRow::Abandoned,
+                    bound_ms: millis(dispatch_bound),
+                }),
+                RowNow::Inflight => Err(ExecWaitError::Timeout {
+                    row: ExpiredRow::Inflight,
+                    bound_ms: millis(dispatch_bound),
+                }),
+                RowNow::Gone => Err(ExecWaitError::Failure(ExecError::Io(
+                    "exec queue row vanished".into(),
+                ))),
+                RowNow::Pending => match self.store.mark_abandoned(command_id).await {
                     Ok(true) => Err(ExecWaitError::Timeout {
-                        row: match now {
-                            RowNow::Inflight => ExpiredRow::Inflight,
-                            RowNow::Abandoned => ExpiredRow::Abandoned,
-                            _ => ExpiredRow::Pending,
-                        },
+                        row: ExpiredRow::Pending,
                         bound_ms: millis(dispatch_bound),
                     }),
-                    // The row settled concurrently — the real result (or a
-                    // competing abandonment) won the race against the timer.
-                    Ok(false) => match self.settled_outcome(command_id).await {
-                        Ok(Some(outcome)) => Ok(outcome),
-                        Ok(None) => Err(ExecWaitError::Timeout {
+                    Ok(false) => match self
+                        .row_now(command_id)
+                        .await
+                        .map_err(ExecWaitError::Failure)?
+                    {
+                        RowNow::Done(outcome) => Ok(*outcome),
+                        RowNow::Abandoned => Err(ExecWaitError::Timeout {
                             row: ExpiredRow::Abandoned,
                             bound_ms: millis(dispatch_bound),
                         }),
-                        Err(e) => Err(ExecWaitError::Failure(e)),
+                        RowNow::Inflight => Err(ExecWaitError::Timeout {
+                            row: ExpiredRow::Inflight,
+                            bound_ms: millis(dispatch_bound),
+                        }),
+                        RowNow::Pending => Err(ExecWaitError::Timeout {
+                            row: ExpiredRow::Pending,
+                            bound_ms: millis(dispatch_bound),
+                        }),
+                        RowNow::Gone => Err(ExecWaitError::Failure(ExecError::Io(
+                            "exec queue row vanished".into(),
+                        ))),
                     },
                     Err(e) => Err(ExecWaitError::Failure(store_error(e))),
-                }
-            }
+                },
+            },
             WaitPolicy::Job => match now {
                 RowNow::Done(outcome) => Ok(*outcome),
                 RowNow::Abandoned => Err(ExecWaitError::Timeout {
@@ -1126,7 +1201,7 @@ async fn drive_route(core: Arc<QueueCore>, route: Arc<Route>) {
             }
         };
         let fresh: Vec<QueuedCommand> = {
-            let mut dispatching = route.dispatching.lock().unwrap();
+            let mut dispatching = core.dispatching.lock().unwrap();
             let now = now_ms();
             let grace_ms = duration_ms_i64(core.config.redrive_grace);
             rows.into_iter()
@@ -1176,7 +1251,7 @@ async fn drive_route(core: Arc<QueueCore>, route: Arc<Route>) {
 async fn drive_row(core: Arc<QueueCore>, route: Arc<Route>, row: QueuedCommand) {
     let id = row.command_id;
     let result = drive_row_inner(&core, &route, row).await;
-    route.dispatching.lock().unwrap().remove(&id);
+    core.dispatching.lock().unwrap().remove(&id);
     if let Err(e) = result {
         tracing::warn!(command_id = %id, error = %e, "dispatch ended without a result; row stays parked for the next connect");
     }
@@ -1229,11 +1304,10 @@ async fn drive_row_inner(
     // Same-holder claims always land, so single-process behavior is
     // unchanged.
     //
-    // The same statement counts the dispatch attempt and enforces the
-    // re-drive bound (ADR-033): a `pending` row always dispatches, an
-    // `inflight` row only while its attempts are below `1 + max_redrives`.
-    // At-least-once therefore terminates even for a command that destroys
-    // its own ack path.
+    // The claim enforces the re-drive bound (ADR-033) without spending an
+    // attempt: a `pending` row always dispatches, an `inflight` row only
+    // while its committed attempts are below `1 + max_redrives`. The
+    // attempt commits only after the transport reports its frame written.
     let max_dispatches = 1u32.saturating_add(core.config.max_redrives);
     let lease_ttl_ms = duration_ms_i64(core.row_lease_ttl);
     match core
@@ -1292,10 +1366,20 @@ async fn drive_row_inner(
         }
         Err(e) => return Err(format!("row lease claim failed: {e}")),
     }
-    // pending → inflight. A false return means the row was already inflight
-    // (presumed lost across a restart) — proceed, at-least-once.
-    if let Err(e) = core.store.mark_inflight(row.command_id).await {
-        return Err(format!("mark_inflight failed: {e}"));
+    // pending → inflight. A false return may mean the row was already
+    // inflight (presumed lost across a restart) — proceed, at-least-once.
+    // A settled row is dropped; a failed transition never spends an attempt.
+    let marked = core
+        .store
+        .mark_inflight(row.command_id)
+        .await
+        .map_err(|e| format!("mark_inflight failed: {e}"))?;
+    if !marked {
+        match core.store.get(row.command_id).await {
+            Ok(Some(current)) if current.status == QueueStatus::Inflight => {}
+            Ok(_) => return Ok(()),
+            Err(e) => return Err(format!("mark_inflight re-read failed: {e}")),
+        }
     }
     // Heartbeat the row lease while the dispatch flies (liveness only —
     // mirrors the engine's drain heartbeat). Losing the lease mid-flight
@@ -1313,10 +1397,22 @@ async fn drive_row_inner(
             row_lease_heartbeat(store, id, holder, ttl, stop).await;
         })
     };
+    let (written_tx, written_rx) = oneshot::channel();
+    let commit_attempt = {
+        let store = core.store.clone();
+        let holder = core.row_lease_holder.clone();
+        let id = row.command_id;
+        tokio::spawn(async move {
+            if written_rx.await.is_err() {
+                return Ok(false);
+            }
+            store.commit_dispatch_attempt(id, &holder).await
+        })
+    };
     let outcome: Result<CommandOutcome, crate::error::ConnectionError> = match &row.command {
         WorkerCommand::Exec(cmd) => route
             .transport
-            .dispatch_with_id(row.command_id, cmd.clone())
+            .dispatch_with_id_after_write(row.command_id, cmd.clone(), written_tx)
             .await
             .map(|reply| match reply {
                 Ok(result) => CommandOutcome::Ok { result },
@@ -1324,44 +1420,47 @@ async fn drive_row_inner(
             }),
         WorkerCommand::Fs(cmd) => route
             .transport
-            .dispatch_fs_with_id(row.command_id, cmd.clone())
+            .dispatch_fs_with_id_after_write(row.command_id, cmd.clone(), written_tx)
             .await
             .map(|reply| match reply {
                 Ok(result) => CommandOutcome::Fs { result },
                 Err(error) => CommandOutcome::Err { error },
             }),
     };
+    match commit_attempt.await {
+        Ok(Ok(true)) => {}
+        Ok(Ok(false)) if matches!(&outcome, Err(ConnectionError::NotWritten)) => {}
+        Ok(Ok(false)) => tracing::warn!(
+            command_id = %row.command_id,
+            "command frame was written but its dispatch attempt could not be committed (lease moved)"
+        ),
+        Ok(Err(e)) => tracing::warn!(
+            command_id = %row.command_id,
+            error = %e,
+            "command frame was written but dispatch-attempt commit failed"
+        ),
+        Err(e) => tracing::warn!(
+            command_id = %row.command_id,
+            error = %e,
+            "dispatch-attempt commit task failed"
+        ),
+    }
     hb_stop.notify_one();
     let _ = heartbeat.await;
     match outcome {
         Ok(outcome) => core.complete(row.command_id, outcome).await,
         // The frame never left this process (the connection's writer was
         // already closed): the endpoint provably never received the
-        // command, so refund the attempt the claim just charged. Charging it
-        // would let a worker that reconnects a moment later find its row
-        // abandoned (or its re-drive bound spent) after a dispatch that
-        // never happened. The transport already flipped itself offline, so
-        // this route stops dispatching until a new connection attaches.
+        // command. The two-phase commit above leaves the attempt unspent
+        // when the writer reports this failure; the refund primitive remains
+        // the recovery path for any deployment that charged before the write.
+        // The transport already flipped itself offline, so this route stops
+        // dispatching until a new connection attaches.
         Err(ConnectionError::NotWritten) => {
-            match core
-                .store
-                .refund_dispatch_attempt(row.command_id, &core.row_lease_holder)
-                .await
-            {
-                Ok(true) => tracing::debug!(
-                    command_id = %row.command_id,
-                    "command frame never written; dispatch attempt refunded"
-                ),
-                Ok(false) => tracing::debug!(
-                    command_id = %row.command_id,
-                    "command frame never written; no owned attempt to refund"
-                ),
-                Err(e) => tracing::warn!(
-                    command_id = %row.command_id,
-                    error = %e,
-                    "command frame never written and the attempt refund failed; the row's re-drive bound may be one attempt short"
-                ),
-            }
+            tracing::debug!(
+                command_id = %row.command_id,
+                "command frame never written; dispatch attempt not committed"
+            );
             return Err("command frame not written; the connection writer is closed".to_string());
         }
         // Transport loss / manager stop: fail honestly *without* settling

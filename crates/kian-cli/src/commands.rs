@@ -1302,11 +1302,9 @@ pub struct WorkerRow {
     /// is the durable declaration, not a live fact.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
-    /// `online` iff the registry row says `online` **and**
-    /// `now - last_heartbeat_ms <= offline_after_ms` for this id (the
-    /// conjunction of the transport view and freshness — D-L2).
-    /// `offline` otherwise; `draining` never appears (runtime-only,
-    /// M9).
+    /// Always `offline` for the read-only board: this process has no live
+    /// worker connection, so a durable registry row and cached heartbeat
+    /// cannot establish membership. `draining` never appears here.
     pub state: &'static str,
     pub last_seen_ms: u64,
     /// The live bound worker session, when one exists (the
@@ -1328,19 +1326,6 @@ pub async fn run_workers(config_path: &Path, db: Option<&Path>, json: bool) -> C
     // per-id `offline_after_ms` bounds and tells us whether a
     // superagent Router (the bound-session source) is configured.
     let config = ServeConfig::load(config_path).ok();
-    let offline_after = |id: &str| -> u64 {
-        match &config {
-            Some(cfg) => cfg
-                .endpoints
-                .iter()
-                .find(|ep| ep.id == id)
-                .map(|ep| ep.offline_after_ms)
-                .or_else(|| cfg.workers.as_ref().map(|w| w.offline_after_ms))
-                .unwrap_or(30_000),
-            None => 30_000,
-        }
-    };
-
     // The durable projection, read-only.
     let exec = kian_exec::ExecStore::open_read_only(&db)
         .await
@@ -1424,13 +1409,7 @@ pub async fn run_workers(config_path: &Path, db: Option<&Path>, json: bool) -> C
     let rows: Vec<WorkerRow> = registry
         .into_iter()
         .map(|row| {
-            let fresh =
-                now.saturating_sub(row.last_heartbeat_ms) <= offline_after(&row.endpoint_id);
-            let state = if row.state == "online" && fresh {
-                "online"
-            } else {
-                "offline"
-            };
+            let state = "offline";
             let (bound_session, bound_thread) = bound
                 .get(&row.endpoint_id)
                 .map(|(s, t)| (Some(s.clone()), Some(t.clone())))
@@ -2672,6 +2651,14 @@ pub async fn run_workers_release(
         .release_worker(worker, reason)
         .await
         .map_err(|e| format!("workers release `{worker}`: {e}"))?;
+    tracing::info!(
+        target: "kian::workers",
+        worker = %receipt.worker,
+        session = %receipt.session,
+        thread_id = %receipt.thread_id,
+        outcome = %receipt.outcome.as_str(),
+        "worker release audit: explicit release succeeded"
+    );
     if json {
         return serde_json::to_string_pretty(&json!({
             "worker": receipt.worker,

@@ -64,8 +64,8 @@ impl MemberState {
 pub struct MemberView {
     pub id: String,
     pub description: Option<String>,
-    /// The worker's declared protocol revision — `None` when only the
-    /// durable registry row knows the id.
+    /// The worker's declared protocol revision. A registry-only row may
+    /// carry the last-declared cache alongside `declaration_stale`.
     pub version: Option<u32>,
     /// The worker-declared, sanitized capability list (v3, ADR-029):
     /// live for a connected member, the last-declared cache for a

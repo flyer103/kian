@@ -82,6 +82,22 @@ impl RouteTransport {
         }
     }
 
+    pub async fn dispatch_with_id_after_write(
+        &self,
+        id: CommandId,
+        cmd: ExecCommand,
+        written: oneshot::Sender<()>,
+    ) -> Result<Result<ExecResult, CommandError>, ConnectionError> {
+        match self {
+            Self::Managed(manager) => manager.dispatch_with_id_after_write(id, cmd, written).await,
+            Self::Registered(registered) => {
+                registered
+                    .dispatch_with_id_after_write(id, cmd, written)
+                    .await
+            }
+        }
+    }
+
     /// Dispatch one filesystem command (v2, ADR-023) and await its
     /// correlated result.
     pub async fn dispatch_fs_with_id(
@@ -92,6 +108,26 @@ impl RouteTransport {
         match self {
             Self::Managed(manager) => manager.dispatch_fs_with_id(id, cmd).await,
             Self::Registered(registered) => registered.dispatch_fs_with_id(id, cmd).await,
+        }
+    }
+
+    pub async fn dispatch_fs_with_id_after_write(
+        &self,
+        id: CommandId,
+        cmd: FsCommand,
+        written: oneshot::Sender<()>,
+    ) -> Result<Result<FsResult, CommandError>, ConnectionError> {
+        match self {
+            Self::Managed(manager) => {
+                manager
+                    .dispatch_fs_with_id_after_write(id, cmd, written)
+                    .await
+            }
+            Self::Registered(registered) => {
+                registered
+                    .dispatch_fs_with_id_after_write(id, cmd, written)
+                    .await
+            }
         }
     }
 }
@@ -266,7 +302,24 @@ impl RegisteredTransport {
         cmd: ExecCommand,
     ) -> Result<Result<ExecResult, CommandError>, ConnectionError> {
         match self
-            .dispatch_frame(id, ServerFrame::Command { id, cmd })
+            .dispatch_frame(id, ServerFrame::Command { id, cmd }, None)
+            .await?
+        {
+            DispatchReply::Exec(outcome) => Ok(outcome),
+            DispatchReply::Fs(_) => Err(ConnectionError::Protocol(
+                "fs result on an exec command id".into(),
+            )),
+        }
+    }
+
+    pub async fn dispatch_with_id_after_write(
+        &self,
+        id: CommandId,
+        cmd: ExecCommand,
+        written: oneshot::Sender<()>,
+    ) -> Result<Result<ExecResult, CommandError>, ConnectionError> {
+        match self
+            .dispatch_frame(id, ServerFrame::Command { id, cmd }, Some(written))
             .await?
         {
             DispatchReply::Exec(outcome) => Ok(outcome),
@@ -284,7 +337,24 @@ impl RegisteredTransport {
         cmd: FsCommand,
     ) -> Result<Result<FsResult, CommandError>, ConnectionError> {
         match self
-            .dispatch_frame(id, ServerFrame::FsCommandFrame { id, cmd })
+            .dispatch_frame(id, ServerFrame::FsCommandFrame { id, cmd }, None)
+            .await?
+        {
+            DispatchReply::Fs(outcome) => Ok(outcome),
+            DispatchReply::Exec(_) => Err(ConnectionError::Protocol(
+                "exec result on an fs command id".into(),
+            )),
+        }
+    }
+
+    pub async fn dispatch_fs_with_id_after_write(
+        &self,
+        id: CommandId,
+        cmd: FsCommand,
+        written: oneshot::Sender<()>,
+    ) -> Result<Result<FsResult, CommandError>, ConnectionError> {
+        match self
+            .dispatch_frame(id, ServerFrame::FsCommandFrame { id, cmd }, Some(written))
             .await?
         {
             DispatchReply::Fs(outcome) => Ok(outcome),
@@ -296,7 +366,12 @@ impl RegisteredTransport {
 
     /// Park the correlation slot, write one frame, await the correlated
     /// reply. The permit is held for the whole flight (the announced cap).
-    async fn dispatch_frame(&self, id: CommandId, frame: ServerFrame) -> DispatchOutcome {
+    async fn dispatch_frame(
+        &self,
+        id: CommandId,
+        frame: ServerFrame,
+        written: Option<oneshot::Sender<()>>,
+    ) -> DispatchOutcome {
         let permit = self
             .permits
             .clone()
@@ -316,6 +391,9 @@ impl RegisteredTransport {
             // on a command the endpoint provably never received.
             self.status.send_modify(|status| status.connected = false);
             return Err(ConnectionError::NotWritten);
+        }
+        if let Some(written) = written {
+            let _ = written.send(());
         }
         let outcome = receiver
             .await

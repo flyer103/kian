@@ -42,9 +42,12 @@ use crate::ops::{
 use crate::plugins::{
     LocalToolsPlugin, OpenAiCompatPlugin, ReActPlugin, RemoteExecPlugin, SuperAgentPlugin,
 };
-use crate::superagent::{ServeLoopDriver, SuperAgentRuntime, SuperAgentServices};
+use crate::superagent::{JobOnlyServices, ServeLoopDriver, SuperAgentRuntime, SuperAgentServices};
 use crate::webhook::{WebhookError, WebhookLimits, WebhookPlane};
 use crate::worker_release::ReleaseWorkerReceipt;
+
+#[path = "job_metrics.rs"]
+mod job_metrics;
 
 /// Everything assembling `kian serve` can fail with. All of them refuse
 /// to start — none degrade to defaults.
@@ -60,6 +63,11 @@ pub enum ServeError {
     Store(#[from] kian_store::StoreError),
     #[error("engine: {0}")]
     Engine(#[from] EngineError),
+}
+
+enum AssembledServices {
+    Super(Arc<SuperAgentServices>),
+    JobOnly(Arc<JobOnlyServices>),
 }
 
 /// The assembled single-machine server.
@@ -594,11 +602,16 @@ impl Server {
         // prompt.
         let mut boot_rotation: Option<crate::rotation::BootRotation> = None;
         let superagent_services: Option<()> = if let Some(sa) = superagent_cfg {
+            let router_enabled = !sa.router.is_disabled();
             // Super-agent mode: the bundle plugin builds all three
             // loops (router/worker/plain); `react-loop` is absent.
-            let router_agent = config
-                .named_agent_def(&sa.router.agent)
-                .ok_or_else(|| ServeError::Assembly("router agent missing".into()))?;
+            let router_agent = if router_enabled {
+                config
+                    .named_agent_def(&sa.router.agent)
+                    .ok_or_else(|| ServeError::Assembly("router agent missing".into()))?
+            } else {
+                config.agent_def()
+            };
             let worker_agent = config
                 .named_agent_def(&sa.worker.agent)
                 .ok_or_else(|| ServeError::Assembly("worker agent missing".into()))?;
@@ -616,10 +629,15 @@ impl Server {
                 .named_agent(&sa.worker.agent)
                 .map(|agent| agent.evidence_gate.clone())
                 .ok_or_else(|| ServeError::Assembly("worker agent missing".into()))?;
-            let router_session = kian_core::model::SessionId(
-                uuid::Uuid::parse_str(&sa.router.session_id)
-                    .map_err(|_| ServeError::Assembly("router session id is not a uuid".into()))?,
-            );
+            let router_session = if router_enabled {
+                kian_core::model::SessionId(
+                    uuid::Uuid::parse_str(&sa.router.session_id).map_err(|_| {
+                        ServeError::Assembly("router session id is not a uuid".into())
+                    })?,
+                )
+            } else {
+                kian_core::model::SessionId(uuid::Uuid::nil())
+            };
             // the boot-time re-arm walk. A resident Router that
             // ended terminally (session/ended{completed|cancelled} —
             // e.g. The loop's lifetime iteration budget exhausting) is
@@ -629,57 +647,59 @@ impl Server {
             // everywhere the pinned id used to go. Soft-failed sessions
             // project idle and stay generation 0 — the next admitted
             // input re-opens them, no successor needed.
-            let router_pinned = router_session;
-            let mut router_re_arm = kian_superagent::rearm::resolve_re_arm(router_pinned, {
-                let store = store.clone();
-                move |session| Box::pin(crate::rotation::resident_stream(store.clone(), session))
-            })
-            .await
-            .map_err(|e| {
-                ServeError::Assembly(format!(
-                    "router re-arm resolution (pinned {}): {e}",
-                    router_pinned.0
-                ))
-            })?;
-            // ADR-040 phase 0: retire the live Router at boot when its
-            // stream grew past the configured threshold. The close is one
-            // atomic claim+end batch; the walk then resolves the fresh
-            // successor, and every surface below binds it as usual.
-            if sa.router.rotate_after_events.is_some() {
-                let rotation = crate::rotation::rotate_at_boot(
-                    &store,
-                    sa.router.rotate_after_events,
-                    router_re_arm.live,
-                    &config.drain.holder,
-                    config.drain.lease_ttl_ms,
-                    &memory_redactor,
-                )
+            let (router_session, router_re_arm) = if router_enabled {
+                let router_pinned = router_session;
+                let mut router_re_arm = kian_superagent::rearm::resolve_re_arm(router_pinned, {
+                    let store = store.clone();
+                    move |session| {
+                        Box::pin(crate::rotation::resident_stream(store.clone(), session))
+                    }
+                })
                 .await
-                .map_err(ServeError::Assembly)?;
-                if rotation.is_some() {
-                    router_re_arm = kian_superagent::rearm::resolve_re_arm(router_pinned, {
-                        let store = store.clone();
-                        move |session| {
-                            Box::pin(crate::rotation::resident_stream(store.clone(), session))
-                        }
-                    })
+                .map_err(|e| {
+                    ServeError::Assembly(format!(
+                        "router re-arm resolution (pinned {}): {e}",
+                        router_pinned.0
+                    ))
+                })?;
+                if sa.router.rotate_after_events.is_some() {
+                    let rotation = crate::rotation::rotate_at_boot(
+                        &store,
+                        sa.router.rotate_after_events,
+                        router_re_arm.live,
+                        &config.drain.holder,
+                        config.drain.lease_ttl_ms,
+                        &memory_redactor,
+                    )
                     .await
-                    .map_err(|e| {
-                        ServeError::Assembly(format!(
-                            "router re-arm resolution after rotation (pinned {}): {e}",
-                            router_pinned.0
-                        ))
-                    })?;
-                    boot_rotation = rotation;
+                    .map_err(ServeError::Assembly)?;
+                    if rotation.is_some() {
+                        router_re_arm = kian_superagent::rearm::resolve_re_arm(router_pinned, {
+                            let store = store.clone();
+                            move |session| {
+                                Box::pin(crate::rotation::resident_stream(store.clone(), session))
+                            }
+                        })
+                        .await
+                        .map_err(|e| {
+                            ServeError::Assembly(format!(
+                                "router re-arm resolution after rotation (pinned {}): {e}",
+                                router_pinned.0
+                            ))
+                        })?;
+                        boot_rotation = rotation;
+                    }
                 }
-            }
-            let router_session = router_re_arm.live;
+                (router_re_arm.live, router_re_arm.ended)
+            } else {
+                (router_session, Vec::new())
+            };
             // (ADR-065) The flag is configuration, but the live Router's
             // target is session state: a session created before the flag
             // (or before the profile declared `vision`) keeps its
             // text-only binding — ADR-006 forbids a runtime swap, so the
             // only honest recovery is rotation (ADR-040).
-            if sa.shaping.as_ref().is_some_and(|shaping| shaping.vision) {
+            if router_enabled && sa.shaping.as_ref().is_some_and(|shaping| shaping.vision) {
                 let missing = match store.rebuild(router_session).await {
                     Ok(events) => kian_llm::slots::SessionSlots::replay(router_session, &events)
                         .ok()
@@ -714,14 +734,14 @@ impl Server {
             // (R15-C5): with the block present, the child inactivity
             // plan carries the live Router session (pin P5's walk
             // root) and the converted bounds.
-            if let Some(limits) = multiagent_limits {
+            if router_enabled && let Some(limits) = multiagent_limits {
                 child_timeout_plan = Some((Arc::clone(&router_binding), limits));
             }
-            if router_re_arm.is_succession() {
+            if router_enabled && !router_re_arm.is_empty() {
                 tracing::info!(
                     pinned = %sa.router.session_id,
                     live = %router_session.0,
-                    ended = router_re_arm.ended.len(),
+                    ended = router_re_arm.len(),
                     "superagent: resident Router re-armed onto a successor session"
                 );
             }
@@ -965,6 +985,7 @@ impl Server {
             let harness_mounts =
                 assemble_harness_mounts(sa, capture_hub.as_ref(), &hooks, harness_markers.clone())?;
             plugins.register(SuperAgentPlugin {
+                router_enabled: !sa.router.is_disabled(),
                 router_binding: Arc::clone(&router_binding),
                 router_rotate_after_events: sa.router.rotate_after_events,
                 router_agent,
@@ -985,7 +1006,7 @@ impl Server {
                     .unwrap_or_default(),
                 default_permissions: config.agent.permissions.clone(),
                 router_session,
-                router_rearm: router_re_arm.ended,
+                router_rearm: router_re_arm,
                 router_slot: sa.router.slot.clone(),
                 speculation: sa
                     .router
@@ -1093,20 +1114,32 @@ impl Server {
         let plugin_disposer = plugins.activate(&mut ctx)?;
 
         // -- 3. driver resolution -----------------------------------------
-        let (mut driver, services) = if superagent_cfg.is_some() {
-            let services = ctx
-                .resolve::<SuperAgentServices>()
-                .ok_or_else(|| ServeError::Assembly("superagent plugin did not register".into()))?;
-            (
-                Arc::new(ServeLoopDriver::SuperAgent(Arc::clone(&services.driver))),
-                Some(services),
-            )
-        } else {
-            let loop_ = ctx
-                .resolve::<ReActLoop>()
-                .ok_or_else(|| ServeError::Assembly("react-loop plugin did not register".into()))?;
-            (Arc::new(ServeLoopDriver::Plain(loop_)), None)
-        };
+        let (mut driver, assembled_services): (Arc<ServeLoopDriver>, Option<AssembledServices>) =
+            if superagent_cfg
+                .as_ref()
+                .is_some_and(|sa| !sa.router.is_disabled())
+            {
+                let services = ctx.resolve::<SuperAgentServices>().ok_or_else(|| {
+                    ServeError::Assembly("superagent plugin did not register".into())
+                })?;
+                (
+                    Arc::new(ServeLoopDriver::SuperAgent(Arc::clone(&services.driver))),
+                    Some(AssembledServices::Super(services)),
+                )
+            } else if superagent_cfg.is_some() {
+                let services = ctx.resolve::<JobOnlyServices>().ok_or_else(|| {
+                    ServeError::Assembly("job-only plugin did not register".into())
+                })?;
+                (
+                    Arc::new(ServeLoopDriver::SuperAgent(Arc::clone(&services.driver))),
+                    Some(AssembledServices::JobOnly(services)),
+                )
+            } else {
+                let loop_ = ctx.resolve::<ReActLoop>().ok_or_else(|| {
+                    ServeError::Assembly("react-loop plugin did not register".into())
+                })?;
+                (Arc::new(ServeLoopDriver::Plain(loop_)), None)
+            };
         // The memory assembly (a `memory:` section): ordinary sessions
         // keep the exact plain-loop handle above — the router only
         // adds the dream side for streams carrying a dream request
@@ -1236,16 +1269,20 @@ impl Server {
 
         // The bundle's inbox port learns the engine (the cycle
         // breaker closes here, before any wake can fire).
-        let superagent = match services {
-            Some(services) => {
-                if services.inbox.install(Arc::clone(&engine)).is_err() {
-                    return Err(ServeError::Assembly(
-                        "engine inbox already installed".into(),
-                    ));
-                }
-                Some(Arc::clone(&services))
+        if let Some(services) = assembled_services.as_ref() {
+            let inbox = match services {
+                AssembledServices::Super(services) => &services.inbox,
+                AssembledServices::JobOnly(services) => &services.inbox,
+            };
+            if inbox.install(Arc::clone(&engine)).is_err() {
+                return Err(ServeError::Assembly(
+                    "engine inbox already installed".into(),
+                ));
             }
-            None => None,
+        }
+        let superagent = match assembled_services.as_ref() {
+            Some(AssembledServices::Super(services)) => Some(Arc::clone(services)),
+            _ => None,
         };
 
         // The resolved cron schedules (CRON-MODEL §3). The load-time gate
@@ -1283,8 +1320,16 @@ impl Server {
         // (JOB-MODEL §13.3) the alert port learns the catalogue it admits
         // against. Without it a failed run is still recorded honestly; only
         // the pushed alert is missing, never invented.
-        if let (Some(services), Some(catalog)) = (superagent.as_ref(), job_catalog.as_ref()) {
-            services.job_alerts.install(Arc::clone(catalog));
+        if let Some(catalog) = job_catalog.as_ref() {
+            match assembled_services.as_ref() {
+                Some(AssembledServices::Super(services)) => {
+                    services.job_alerts.install(Arc::clone(catalog));
+                }
+                Some(AssembledServices::JobOnly(services)) => {
+                    services.job_alerts.install(Arc::clone(catalog));
+                }
+                None => {}
+            }
         }
         let cron_max_concurrent = superagent_cfg
             .as_ref()
@@ -1402,8 +1447,8 @@ impl Server {
 
         // -- 6. superagent services start (registry → subscriptions →
         //       watchdog → router bootstrap), strictly AFTER the rebuild.
-        let superagent = match superagent {
-            Some(services) => Some(
+        let superagent = match assembled_services {
+            Some(AssembledServices::Super(services)) => Some(
                 crate::superagent::start_services(
                     services,
                     Arc::clone(&server.engine),
@@ -1415,6 +1460,16 @@ impl Server {
                 .await
                 .map_err(ServeError::Assembly)?,
             ),
+            Some(AssembledServices::JobOnly(services)) => {
+                crate::superagent::start_job_services(
+                    services,
+                    server.store.clone(),
+                    server.session_bootstrap.clone(),
+                )
+                .await
+                .map_err(ServeError::Assembly)?;
+                None
+            }
             None => None,
         };
         let mut server = server;
@@ -1710,7 +1765,8 @@ impl Server {
                 Arc::clone(&self.engine),
                 tokio::runtime::Handle::current(),
                 self.session_bootstrap.clone(),
-            );
+            )
+            .with_store(self.store.clone());
             // ADR-060: the planner is armed only with the defer: section;
             // without it an immediate firing keeps its exact old bytes.
             if let Some(defer) = self.defer.as_ref() {
@@ -2628,6 +2684,11 @@ impl Server {
 /// operation name for a clear message.
 fn internal(op: &'static str) -> impl Fn(EngineError) -> ControlError + Send + Sync + 'static {
     move |e| {
+        if let EngineError::SessionTerminal { session }
+        | EngineError::Inbox(kian_store::InboxError::SessionTerminal { session }) = &e
+        {
+            return ControlError::SessionTerminal { session: *session };
+        }
         // Inbox failures carry their own context; keep the message honest.
         ControlError::Internal(format!("{op}: {e}"))
     }
@@ -3181,6 +3242,7 @@ async fn metrics_handler(
         Some(runtime) => runtime.metrics_report(&server.store).await,
         None => serde_json::Value::Null,
     };
+    let jobs = job_metrics::report(&server.store).await;
     // the dream counters (present iff a `memory:` section assembled;
     // pure reads of the shared driver's atomics).
     let memory = match &server.memory {
@@ -3201,6 +3263,7 @@ async fn metrics_handler(
             "cache": cache,
             "usage": usage,
             "superagent": superagent,
+            "jobs": jobs,
             "memory": memory,
             "event_stream": event_stream,
         })),

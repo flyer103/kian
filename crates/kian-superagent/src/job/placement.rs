@@ -25,17 +25,23 @@ pub struct Candidate {
     pub id: String,
     /// Its last declared state.
     pub state: MemberState,
+    /// Whether an earlier attempt of this step did not succeed.
+    pub tried: bool,
     /// Its index in the step's (or job's) `prefer` list; `usize::MAX` when
     /// unpreferred.
     pub declared_rank: usize,
 }
 
 impl Candidate {
-    /// §9.3's sort key: reachable first, then preference, then id — a
-    /// total order, so two conductors place a step identically.
+    /// §9.3's sort key: state, tried rank, preference, then id.
     #[must_use]
-    pub fn sort_key(&self) -> (u8, usize, &str) {
-        (state_rank(self.state), self.declared_rank, self.id.as_str())
+    pub fn sort_key(&self) -> (u8, u8, usize, &str) {
+        (
+            state_rank(self.state),
+            u8::from(self.tried),
+            self.declared_rank,
+            self.id.as_str(),
+        )
     }
 }
 
@@ -94,11 +100,6 @@ pub enum PlacementRefusal {
         /// The capable but unreachable workers.
         workers: Vec<String>,
     },
-    /// Every capable worker already failed this step in this run.
-    AllTried {
-        /// The workers already exhausted.
-        workers: Vec<String>,
-    },
     /// Every admissible worker is bound to a live child; the conductor
     /// waits (`defer_budget_ms`) instead of failing (§9.4).
     AllBusy {
@@ -117,7 +118,6 @@ impl PlacementRefusal {
             Self::PinIneligible { .. } => "pin_ineligible",
             Self::NoCapable { .. } => "no_capable_worker",
             Self::AllOffline { .. } => "all_offline",
-            Self::AllTried { .. } => "all_tried",
             Self::AllBusy { .. } => "all_busy",
         }
     }
@@ -200,25 +200,14 @@ pub fn select(
         reachable
     };
 
-    let untried: Vec<&MemberView> = reachable
-        .iter()
-        .copied()
-        .filter(|member| !facts.tried.iter().any(|tried| tried == &member.id))
-        .collect();
-    if untried.is_empty() {
-        return Err(PlacementRefusal::AllTried {
-            workers: reachable.iter().map(|member| member.id.clone()).collect(),
-        });
-    }
-
-    let free: Vec<&MemberView> = untried
+    let free: Vec<&MemberView> = reachable
         .iter()
         .copied()
         .filter(|member| !facts.busy.iter().any(|busy| busy == &member.id))
         .collect();
     if free.is_empty() {
         return Err(PlacementRefusal::AllBusy {
-            workers: untried.iter().map(|member| member.id.clone()).collect(),
+            workers: reachable.iter().map(|member| member.id.clone()).collect(),
         });
     }
 
@@ -227,6 +216,7 @@ pub fn select(
         .map(|member| Candidate {
             id: member.id.clone(),
             state: member.state,
+            tried: facts.tried.iter().any(|tried| tried == &member.id),
             declared_rank: prefer
                 .iter()
                 .position(|worker| worker == &member.id)
@@ -477,7 +467,7 @@ mod tests {
     }
 
     #[test]
-    fn a_worker_that_already_failed_this_step_is_not_retried() {
+    fn a_tried_worker_is_admissible_but_ranks_after_untried_workers() {
         let members = catalog();
         let tried = vec!["vultr".to_string()];
         let facts = PlacementFacts {
@@ -487,7 +477,7 @@ mod tests {
         };
         let placement =
             select(&plain(&["net.unrestricted"]), &limits(&["vultr"]), &facts).expect("placed");
-        assert_eq!(placement.worker, "mac", "repeat-exclusion beats preference");
+        assert_eq!(placement.worker, "mac", "untried beats preference");
 
         let all_tried = vec!["vultr".to_string(), "mac".to_string(), "nas".to_string()];
         let facts = PlacementFacts {
@@ -495,12 +485,10 @@ mod tests {
             tried: &all_tried,
             ..PlacementFacts::default()
         };
-        assert_eq!(
-            select(&plain(&["net.unrestricted"]), &limits(&[]), &facts),
-            Err(PlacementRefusal::AllTried {
-                workers: vec!["vultr".into(), "mac".into()]
-            })
-        );
+        let placement =
+            select(&plain(&["net.unrestricted"]), &limits(&[]), &facts).expect("still admissible");
+        assert_eq!(placement.worker, "mac", "tried rank precedes id");
+        assert!(placement.candidates.iter().all(|candidate| candidate.tried));
     }
 
     #[test]

@@ -75,6 +75,8 @@ pub(crate) fn is_backend_failure(err: &InboxError) -> bool {
 /// operation is a matchable fact, not an opaque string).
 #[derive(Debug, thiserror::Error)]
 pub enum InboxError {
+    #[error("session {session:?} is terminal; input admission refused")]
+    SessionTerminal { session: SessionId },
     #[error("heartbeat rejected: no lease row for session {session:?}")]
     NoLease { session: SessionId },
     #[error(
@@ -172,12 +174,13 @@ impl EventStore {
     /// any wake may fire). Idempotent by `(session, idempotency_key)`:
     /// re-admitting the same key returns the original row with
     /// `deduplicated: true` — first write wins, exactly one row exists.
-    /// Rows without a key are always inserted.
+    /// Rows without a key are always inserted. The terminal check and insert
+    /// share the session's admission/release critical section.
     pub async fn admit(&self, input: InputRow) -> Result<AdmitOutcome, InboxError> {
-        match self {
-            EventStore::Sqlite(pool) => crate::sqlite::admit(pool, input).await,
-            EventStore::Postgres(pool) => crate::postgres::admit(pool, input).await,
-        }
+        let mut write = self.begin_session_write(input.session).await?;
+        let outcome = write.admit(input).await?;
+        write.commit().await?;
+        Ok(outcome)
     }
 
     /// The channel-scoped admission (ADR-081): `(session, idempotency_key)`
@@ -185,9 +188,20 @@ impl EventStore {
     /// the insert is refused when a row with this key is already *consumed
     /// in any session*, and the result names that suppressed row.
     pub async fn admit_channel(&self, input: InputRow) -> Result<AdmitOutcome, InboxError> {
+        let mut write = self.begin_session_write(input.session).await?;
+        let outcome = write.admit_channel(input).await?;
+        write.commit().await?;
+        Ok(outcome)
+    }
+
+    /// Whether the session has any input row not yet consumed. No clock is
+    /// consulted: a future-eligible row is still unconsumed work.
+    pub async fn has_unconsumed_inputs(&self, session: SessionId) -> Result<bool, InboxError> {
         match self {
-            EventStore::Sqlite(pool) => crate::sqlite::admit_channel(pool, input).await,
-            EventStore::Postgres(pool) => crate::postgres::admit_channel(pool, input).await,
+            EventStore::Sqlite(pool) => crate::sqlite::has_unconsumed_inputs(pool, session).await,
+            EventStore::Postgres(pool) => {
+                crate::postgres::has_unconsumed_inputs(pool, session).await
+            }
         }
     }
 
@@ -342,11 +356,13 @@ mod tests {
 
     use kian_core::events::{EndReason, Event, EventKind, SCHEMA_VERSION};
     use kian_core::model::{Epoch, InputRow, LeaseRecord, SessionId};
+    use kian_core::state::{SessionState, project};
     use serde_json::json;
+    use tokio::sync::Notify;
     use uuid::Uuid;
 
     use super::{AdmitOutcome, InboxError, SessionInbox};
-    use crate::event_store::{AppendGuard, EventStore};
+    use crate::event_store::{AppendGuard, EventStore, SessionWrite, StoreError};
 
     const T0: u64 = 1_761_900_000_000;
 
@@ -454,11 +470,266 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum StoreRelease {
+        Released,
+        Busy,
+        AlreadyTerminal,
+        NotEligible,
+        Unknown,
+    }
+
+    async fn try_release(
+        write: &mut SessionWrite,
+        session: SessionId,
+    ) -> Result<StoreRelease, InboxError> {
+        let events = write.scan_all().await?;
+        if events.is_empty() {
+            return Ok(StoreRelease::Unknown);
+        }
+        let state =
+            project(&events).map_err(|source| InboxError::Projection { session, source })?;
+        if state.is_terminal() {
+            return Ok(StoreRelease::AlreadyTerminal);
+        }
+        if state != SessionState::Idle
+            || !matches!(
+                events.last().map(|event| &event.kind),
+                Some(EventKind::SessionEnded {
+                    reason: EndReason::Interrupted | EndReason::Failed
+                })
+            )
+        {
+            return Ok(StoreRelease::NotEligible);
+        }
+        if write.has_unconsumed_inputs().await? {
+            return Ok(StoreRelease::Busy);
+        }
+        let lease = write.claim("store-test", 5_000, T0 + 10).await?;
+        let head = write.head().await?;
+        write
+            .append_batch(
+                &[
+                    Event {
+                        seq: head.next_seq,
+                        session,
+                        epoch: lease.epoch,
+                        ts: T0 + 10,
+                        kind: EventKind::DrainClaimed,
+                        bytes: json!({"holder": "store-test"}),
+                        version: SCHEMA_VERSION,
+                    },
+                    Event {
+                        seq: head.next_seq + 1,
+                        session,
+                        epoch: lease.epoch,
+                        ts: T0 + 10,
+                        kind: EventKind::SessionEnded {
+                            reason: EndReason::Cancelled,
+                        },
+                        bytes: json!({"released": true}),
+                        version: SCHEMA_VERSION,
+                    },
+                ],
+                AppendGuard {
+                    epoch: lease.epoch,
+                    expected_seq: head.next_seq,
+                },
+            )
+            .await?;
+        Ok(StoreRelease::Released)
+    }
+
     async fn row_count(store: &EventStore, sql: &str) -> i64 {
         sqlx::query_scalar(sql)
             .fetch_one(store.pool())
             .await
             .expect("count query")
+    }
+
+    #[tokio::test]
+    async fn admission_first_makes_release_busy_and_writes_nothing() {
+        let (store, path) = test_store().await;
+        let sid = SessionId::new();
+        seed_interrupted(&store, sid, Epoch(1)).await;
+
+        let mut admission = store.begin_session_write(sid).await.unwrap();
+        admission
+            .admit(input(sid, Some("race"), T0, T0, json!("queued")))
+            .await
+            .unwrap();
+        let head_after_admission = admission.head().await.unwrap();
+
+        let release_gate = Notify::new();
+        let release = async {
+            release_gate.notified().await;
+            let mut write = store.begin_session_write(sid).await.unwrap();
+            let outcome = try_release(&mut write, sid).await.unwrap();
+            write.rollback().await.unwrap();
+            outcome
+        };
+        let commit = async {
+            release_gate.notify_one();
+            admission.commit().await.unwrap();
+        };
+        let ((), outcome) = tokio::join!(commit, release);
+        assert_eq!(outcome, StoreRelease::Busy);
+        assert_eq!(
+            store.head(sid).await.unwrap().next_seq,
+            head_after_admission.next_seq,
+            "session_busy appended no release events"
+        );
+        assert_eq!(store.input_rows(sid).await.unwrap().len(), 1);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn release_first_makes_admission_session_terminal_and_writes_no_row() {
+        let (store, path) = test_store().await;
+        let sid = SessionId::new();
+        seed_interrupted(&store, sid, Epoch(1)).await;
+
+        let mut release = store.begin_session_write(sid).await.unwrap();
+        assert_eq!(
+            try_release(&mut release, sid).await.unwrap(),
+            StoreRelease::Released
+        );
+        let admission_gate = Notify::new();
+        let admission = async {
+            admission_gate.notified().await;
+            store
+                .admit(input(sid, Some("race"), T0, T0, json!("late")))
+                .await
+        };
+        let commit = async {
+            admission_gate.notify_one();
+            release.commit().await.unwrap();
+        };
+        let ((), admitted) = tokio::join!(commit, admission);
+        assert!(matches!(
+            admitted,
+            Err(InboxError::SessionTerminal { session }) if session == sid
+        ));
+        assert!(
+            store.input_rows(sid).await.unwrap().is_empty(),
+            "terminal admission inserted no row"
+        );
+        let events = store.rebuild(sid).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event.kind,
+                    EventKind::SessionEnded {
+                        reason: EndReason::Cancelled
+                    }
+                ))
+                .count(),
+            1
+        );
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn future_unconsumed_row_blocks_release_until_consumed() {
+        let (store, path) = test_store().await;
+        let sid = SessionId::new();
+        seed_interrupted(&store, sid, Epoch(1)).await;
+        let future = input(
+            sid,
+            Some("future"),
+            T0,
+            T0.saturating_add(60_000),
+            json!("future"),
+        );
+        let admitted = store.admit(future).await.unwrap();
+
+        let mut write = store.begin_session_write(sid).await.unwrap();
+        assert_eq!(
+            try_release(&mut write, sid).await.unwrap(),
+            StoreRelease::Busy
+        );
+        write.rollback().await.unwrap();
+
+        store
+            .mark_consumed(sid, admitted.input.id, 3)
+            .await
+            .unwrap();
+        let mut write = store.begin_session_write(sid).await.unwrap();
+        assert_eq!(
+            try_release(&mut write, sid).await.unwrap(),
+            StoreRelease::Released
+        );
+        write.commit().await.unwrap();
+        assert!(matches!(
+            store
+                .append(
+                    sid,
+                    ev(sid, 5, Epoch(1), EventKind::InputAdmitted,),
+                    AppendGuard {
+                        epoch: Epoch(1),
+                        expected_seq: 5,
+                    }
+                )
+                .await,
+            Err(StoreError::StaleEpoch { .. })
+        ));
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn committed_same_key_stays_deduplicated_after_terminal() {
+        let (store, path) = test_store().await;
+        let sid = SessionId::new();
+        let first = input(sid, Some("same"), T0, T0, json!("first"));
+        let admitted = store.admit(first).await.unwrap();
+        assert!(!admitted.deduplicated);
+        seed_completed(&store, sid, Epoch(1)).await;
+
+        let replay = store
+            .admit(input(sid, Some("same"), T0, T0, json!("different")))
+            .await
+            .unwrap();
+        assert!(replay.deduplicated);
+        assert_eq!(replay.input.id, admitted.input.id);
+        assert_eq!(store.input_rows(sid).await.unwrap().len(), 1);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn channel_consumed_key_suppression_precedes_terminal_refusal() {
+        let (store, path) = test_store().await;
+        let completed_source = SessionId::new();
+        let source = SessionId::new();
+        append_ok(&store, source, 1, Epoch(1), EventKind::SessionCreated).await;
+        let original = input(
+            source,
+            Some("channel:same"),
+            T0,
+            T0,
+            json!({"kian": {"type": "channel_event"}}),
+        );
+        let admitted = store.admit_channel(original).await.unwrap();
+        store
+            .mark_consumed(source, admitted.input.id, 1)
+            .await
+            .unwrap();
+        seed_completed(&store, completed_source, Epoch(1)).await;
+
+        let replay = store
+            .admit_channel(input(
+                completed_source,
+                Some("channel:same"),
+                T0,
+                T0,
+                json!({"kian": {"type": "channel_event"}}),
+            ))
+            .await
+            .unwrap();
+        assert!(replay.deduplicated);
+        assert_eq!(replay.input.id, admitted.input.id);
+        assert!(store.input_rows(completed_source).await.unwrap().is_empty());
+        cleanup(&path);
     }
 
     // -- admit ---------------------------------------------------------------

@@ -75,8 +75,8 @@ pub use registration::{
 };
 pub use route::{RegisteredTransport, RouteTransport};
 pub use store::{
-    CommandOutcome, EndpointRegistryRow, EnqueueOutcome, ExecStore, QueueStatus, QueueStoreError,
-    QueuedCommand,
+    CommandOutcome, EndpointRegistryRow, EnqueueOutcome, ExecStore, PendingAbandonment,
+    QueueStatus, QueueStoreError, QueuedCommand,
 };
 pub use tool::{RemoteExecTool, RemoteFsTool};
 pub use watchdog::{

@@ -150,7 +150,10 @@ impl ToolProvider for RemoteExecTool {
                         "timed_out": true,
                         "row_state": row.as_str(),
                         "still_running": row.still_running(),
-                        "row_abandoned": true,
+                        "row_abandoned": matches!(
+                            row,
+                            crate::ExpiredRow::Pending | crate::ExpiredRow::Abandoned
+                        ),
                         "wait_bound_ms": bound_ms,
                         "hint": "this call stopped waiting; a still_running command keeps                                  executing on the worker and its result is discarded — use                                  `start` for long work and never poll with `sleep`",
                     }),

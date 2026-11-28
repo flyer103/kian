@@ -9,10 +9,9 @@
 //!
 //! - the projection is `idle` and the last event is a non-terminal end;
 //! - `now_ms - last.ts >= after_ms` (the configured grace);
-//! - the durable command queue has no `pending`/`inflight` row for that
-//!   worker id (the machine is not still executing or owing a command);
-//! - the engine's own gates add: no eligible inbox row, no live drain, a
-//!   fresh claim.
+//! - the engine re-evaluates no unconsumed inbox row, no live drain, the
+//!   worker queue gate, and a fresh claim inside one per-session write
+//!   transaction.
 //!
 //! The tick writes nothing of its own: the only write is the engine's
 //! atomic claim + `cancelled` end. Errors are swallowed and logged — a
@@ -113,28 +112,6 @@ pub async fn tick<D>(
             if now_ms.saturating_sub(last.ts) < after_ms {
                 continue;
             }
-            match exec_store.drivable(&worker).await {
-                Ok(rows) if rows.is_empty() => {}
-                Ok(rows) => {
-                    tracing::debug!(
-                        target: "kian::workers",
-                        worker = %worker,
-                        session = %thread.worker_session.0,
-                        live_rows = rows.len(),
-                        "worker release tick: worker still holds live command rows — skipped"
-                    );
-                    continue;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "kian::workers",
-                        worker = %worker,
-                        error = %e,
-                        "worker release tick: queue read failed — skipped (fail-closed)"
-                    );
-                    continue;
-                }
-            }
             let payload = json!({
                 "released": {
                     "worker": worker,
@@ -145,7 +122,21 @@ pub async fn tick<D>(
                     ),
                 }
             });
-            match engine.release_idle(thread.worker_session, payload).await {
+            let queue_gate = async {
+                exec_store
+                    .drivable(&worker)
+                    .await
+                    .map(|rows| rows.is_empty())
+                    .map_err(|e| {
+                        kian_orchestrator::EngineError::ReleaseQueueGate(format!(
+                            "durable queue read failed: {e}"
+                        ))
+                    })
+            };
+            match engine
+                .release_idle_guarded(thread.worker_session, payload, queue_gate)
+                .await
+            {
                 Ok(ReleaseOutcome::Released { seq, epoch }) => {
                     tracing::info!(
                         target: "kian::workers",

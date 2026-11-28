@@ -89,6 +89,7 @@ pub mod self_evidence;
 pub mod self_inspect;
 pub mod self_verify;
 mod selfdev_publish;
+mod selfdev_tool;
 pub mod server;
 pub mod sidecars;
 pub mod superagent;
@@ -97,6 +98,7 @@ pub mod views;
 pub mod voice_edge;
 pub mod webhook;
 pub mod wechat_login;
+pub mod worker_binding;
 pub mod worker_release;
 pub mod worker_release_tick;
 

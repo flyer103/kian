@@ -238,6 +238,8 @@ pub struct DeferredAdmission {
 pub enum ControlError {
     #[error("unknown session {session:?}")]
     UnknownSession { session: SessionId },
+    #[error("session {session:?} is terminal")]
+    SessionTerminal { session: SessionId },
     /// READ-MODEL §3: `since` is ahead of the durable head — the
     /// client is ahead or pointed at another store (`-32602`).
     #[error("since {since} is ahead of session {session:?} version {version}")]
@@ -270,6 +272,7 @@ pub enum ControlError {
 
 /// JSON-RPC error code for an unknown session.
 const CODE_UNKNOWN_SESSION: i64 = -32001;
+const CODE_SESSION_TERMINAL: i64 = -32003;
 /// JSON-RPC error code for server-side failures.
 const CODE_INTERNAL: i64 = -32000;
 /// JSON-RPC error code for an archived session (READ-MODEL §7). The
@@ -372,6 +375,10 @@ fn control_err(e: ControlError) -> (i64, String) {
         ControlError::UnknownSession { session } => (
             CODE_UNKNOWN_SESSION,
             format!("unknown session {:?}", session.0),
+        ),
+        ControlError::SessionTerminal { session } => (
+            CODE_SESSION_TERMINAL,
+            format!("session {:?} is terminal", session.0),
         ),
         ControlError::SinceAhead {
             session,
@@ -1839,5 +1846,13 @@ mod tests {
         let (code, message) = control_err(ControlError::DeferralUnavailable);
         assert_eq!(code, CODE_INVALID_PARAMS);
         assert!(message.contains("not configured"), "{message}");
+    }
+
+    #[test]
+    fn terminal_admission_maps_to_session_terminal() {
+        let session = SessionId::new();
+        let (code, message) = control_err(ControlError::SessionTerminal { session });
+        assert_eq!(code, -32003);
+        assert!(message.contains("terminal"), "{message}");
     }
 }

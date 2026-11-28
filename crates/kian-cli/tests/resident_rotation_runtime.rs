@@ -3,9 +3,10 @@
 //! A real store + a real `Engine` (a no-op test driver: the planner never
 //! drives a turn) exercise the rotation paths: the single-replica tick,
 //! a second replica catching up with another replica's rotation (and
-//! migrating the row it wrote to the frozen predecessor), and a replica
-//! repairing a rotation whose owner died between the close and the
-//! successor's bootstrap.
+//! refusing a post-close straggler under ADR-083; pre-close rows still
+//! migrate through the rotation seam), and a replica repairing a
+//! rotation whose owner died between the close and the successor's
+//! bootstrap.
 
 use std::sync::Arc;
 
@@ -17,7 +18,7 @@ use kian_core::model::{Epoch, InputRow, SessionId};
 use kian_core::seams::{LoopDriver, LoopOutcome};
 use kian_core::secrets::SecretRedactor;
 use kian_orchestrator::{DrainCtx, Engine, EngineConfig, WakeOutcome};
-use kian_store::{AppendGuard, EventStore};
+use kian_store::{AppendGuard, EventStore, InboxError};
 use kian_superagent::rearm::successor_session;
 use kian_superagent::{
     AdmitReceipt, InboxWriteError, InboxWriter, ResidentBinding, RouterInbox, RouterProfile,
@@ -286,11 +287,12 @@ async fn a_runtime_tick_retires_the_router_and_bootstraps_the_successor() {
     );
 }
 
-/// ADR-047 (a): a second replica whose binding still points at the
-/// retired session derives the live successor from the durable chain,
-/// re-points, and migrates the row it wrote to the frozen predecessor.
+/// ADR-083 (superseding ADR-048 decision 5): a second replica whose
+/// binding still points at the retired session derives the live
+/// successor and re-points; a post-close straggler is refused
+/// session_terminal instead of being accepted onto the frozen stream.
 #[tokio::test]
-async fn a_second_replica_catches_up_and_migrates_its_straggler() {
+async fn a_second_replica_catches_up_and_refuses_a_post_close_straggler() {
     let (sqlite, store) = temp_store().await;
     let _ = sqlite;
     let live = SessionId(Uuid::new_v4());
@@ -306,10 +308,11 @@ async fn a_second_replica_catches_up_and_migrates_its_straggler() {
         .expect("replica A rotates");
     assert_eq!(binding_a.load(), successor);
 
-    // Replica B has not ticked yet: its stale binding admits to the now
-    // frozen predecessor (the multi-replica lost-work window).
+    // Replica B has not ticked yet: its stale binding would admit to the
+    // now frozen predecessor. The terminal gate refuses that new row
+    // before it can become accepted-but-unconsumable work (W5).
     let straggler = Uuid::new_v4();
-    store
+    let error = store
         .admit(InputRow {
             id: straggler,
             session: live,
@@ -319,7 +322,19 @@ async fn a_second_replica_catches_up_and_migrates_its_straggler() {
             idempotency_key: Some("stale:write".into()),
         })
         .await
-        .expect("straggler");
+        .expect_err("a frozen predecessor refuses a new row");
+    assert!(
+        matches!(error, InboxError::SessionTerminal { session } if session == live),
+        "typed terminal refusal: {error:?}"
+    );
+    assert!(
+        store
+            .input_rows(live)
+            .await
+            .expect("predecessor inbox")
+            .is_empty(),
+        "the refused row is not durable on the frozen predecessor"
+    );
 
     assert!(
         planner_b
@@ -330,21 +345,15 @@ async fn a_second_replica_catches_up_and_migrates_its_straggler() {
         "a catch-up is not a rotation"
     );
     assert_eq!(binding_b.load(), successor, "replica B re-points");
-    // The successor's drain is already live (replica A bootstrapped it), so it
-    // may consume the migrated row before this read: migration is proven by the
-    // row existing on the successor with its rotation key, not by it still
-    // being eligible (asserting eligibility made this test race the drain).
-    let rows = store.input_rows(successor).await.expect("successor inbox");
-    let migrated = rows
-        .iter()
-        .find(|row| row.payload.get("content") == Some(&json!("written by a stale replica")))
-        .expect("the straggler is migrated to the successor");
-    assert_eq!(
-        migrated.idempotency_key,
-        Some(format!("rotate:{}:{}", live.0, straggler))
+    assert!(
+        store
+            .input_rows(successor)
+            .await
+            .expect("successor inbox")
+            .iter()
+            .all(|row| row.payload.get("content") != Some(&json!("written by a stale replica"))),
+        "the refused straggler was never migrated"
     );
-    // The original row deliberately stays on the frozen predecessor as the
-    // audit record (ADR-048); only the migrated copy runs on the successor.
 }
 
 /// ADR-047 (b): a rotation whose owner died between the close and the

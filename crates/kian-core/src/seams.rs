@@ -252,6 +252,10 @@ pub const EPISODE_BUDGET_STOP_REASON_PREFIX: &str = "episode iteration budget ex
 /// claim an idle session. In-process contract only, not an event or wire
 /// value.
 pub const ROTATION_STOP_REASON: &str = "resident rotation requested";
+/// Terminal-cancel stop reason emitted by a conductor after it has committed
+/// the authoritative cancelled verdict. The engine maps this reason to a
+/// terminal `cancelled` end even when an interrupt flag is also set.
+pub const TERMINAL_CANCEL_STOP_REASON: &str = "terminal cancel requested";
 
 /// Seam (DESIGN §6.2): the agent loop as control flow inside a drain.
 /// Built-in: the async ReAct loop (kian-loop). The context type is

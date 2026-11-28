@@ -65,6 +65,7 @@
 //! status nobody observed. The `interrupted` status value remains
 //! reserved for callers that can observe it.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
@@ -660,6 +661,7 @@ pub type PortFor<Ctx> = Arc<dyn Fn(&Ctx) -> Arc<dyn StreamPort> + Send + Sync>;
 pub struct SpawnedWorker {
     pub thread: Thread,
     pub worker_session: SessionId,
+    pub exec_worker: Option<String>,
     /// `{"role":"user","content":<delegation wrapper>}` — the exact
     /// message the worker consumes (identical bytes go into both
     /// streams' `thread/started` events).
@@ -687,6 +689,23 @@ pub enum SpawnError {
         outstanding: usize,
         max: usize,
     },
+    /// Another live session holds the bound worker.
+    #[error(
+        "worker spawn: worker `{worker}` is busy — worker session {owner_session:?} \
+         (thread {owner_thread}) owns its live binding"
+    )]
+    BindingConflict {
+        worker: String,
+        owner_session: SessionId,
+        owner_thread: Uuid,
+    },
+    /// The read-only binding view could not decide, so the spawn failed closed.
+    #[error("worker spawn: worker `{worker}` binding admission failed: {error}")]
+    BindingAdmission {
+        worker: String,
+        #[source]
+        error: WorkerStreamsError,
+    },
 }
 
 /// The optional eager-creation seam for a spawned worker session (HARNESS-BRIDGE §4.7).
@@ -704,6 +723,27 @@ pub trait SpawnSessionWriter: Send + Sync {
         session: SessionId,
         assignee: Option<&str>,
     ) -> BoxFuture<'static, Result<(), InboxWriteError>>;
+}
+
+/// The bundle-owned read-only authority over live worker bindings.
+///
+/// Assembly implements this over the committed store view. A port error
+/// refuses the spawn; `Ok(Some(owner))` names the session that already holds
+/// the worker.
+pub trait BindingAdmissionPort: Send + Sync {
+    /// Returns the current owner for `worker_id` at `now_ms`, using `ttl_ms`
+    /// as the never-started reservation lease. `candidate_thread` and
+    /// `candidate_session` name the caller's own not-yet-live reservation;
+    /// the implementation must exclude it, or every spawn would observe its
+    /// own dispatch record and refuse itself.
+    fn check_binding(
+        &self,
+        worker_id: &str,
+        candidate_thread: Uuid,
+        candidate_session: SessionId,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> BoxFuture<'static, Result<Option<BusyOwner>, WorkerStreamsError>>;
 }
 
 /// Mints a `Thread` and creates the worker session by admitting its
@@ -727,6 +767,10 @@ pub struct WorkerSpawner {
     bootstrap: std::sync::OnceLock<Option<Arc<dyn crate::bootstrap::SessionBootstrap>>>,
     /// HARNESS-BRIDGE §4.7: the eager-creation seam (absent = the historical lazy creation).
     session_creation: Option<Arc<dyn SpawnSessionWriter>>,
+    binding_admission: std::sync::OnceLock<Arc<dyn BindingAdmissionPort>>,
+    worker_queue_timeouts: std::sync::OnceLock<BTreeMap<String, u64>>,
+    worker_queue_timeout_default: std::sync::OnceLock<u64>,
+    binding_admission_locks: Arc<std::sync::Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl WorkerSpawner {
@@ -743,6 +787,10 @@ impl WorkerSpawner {
             inbox,
             bootstrap: std::sync::OnceLock::new(),
             session_creation: None,
+            binding_admission: std::sync::OnceLock::new(),
+            worker_queue_timeouts: std::sync::OnceLock::new(),
+            worker_queue_timeout_default: std::sync::OnceLock::new(),
+            binding_admission_locks: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -758,6 +806,48 @@ impl WorkerSpawner {
     pub fn with_session_creation(mut self, port: Arc<dyn SpawnSessionWriter>) -> Self {
         self.session_creation = Some(port);
         self
+    }
+
+    /// Installs the read-only binding authority and the per-worker
+    /// never-started reservation bounds. The first install wins.
+    #[must_use]
+    pub fn with_binding_admission(
+        self,
+        port: Arc<dyn BindingAdmissionPort>,
+        queue_timeouts: BTreeMap<String, u64>,
+    ) -> Self {
+        let _ = self.worker_queue_timeouts.set(queue_timeouts);
+        let _ = self.binding_admission.set(port);
+        self
+    }
+
+    /// Installs the read-only binding authority and the per-worker
+    /// never-started reservation bounds when the spawner already lives
+    /// behind an `Arc`. The first install wins.
+    pub fn install_binding_admission(
+        &self,
+        port: Arc<dyn BindingAdmissionPort>,
+        queue_timeouts: BTreeMap<String, u64>,
+    ) {
+        self.install_binding_admission_with_default(
+            port,
+            queue_timeouts,
+            crate::router::DEFAULT_WORKER_QUEUE_TIMEOUT_MS,
+        );
+    }
+
+    /// Installs the binding authority with the queue bound used for workers
+    /// absent from `queue_timeouts` (dynamic `workers:` members share one
+    /// `workers.queue_timeout_ms`). The first install wins.
+    pub fn install_binding_admission_with_default(
+        &self,
+        port: Arc<dyn BindingAdmissionPort>,
+        queue_timeouts: BTreeMap<String, u64>,
+        default_timeout_ms: u64,
+    ) {
+        let _ = self.worker_queue_timeouts.set(queue_timeouts);
+        let _ = self.worker_queue_timeout_default.set(default_timeout_ms);
+        let _ = self.binding_admission.set(port);
     }
 
     /// The worker template's id — the mandate scope key (
@@ -941,6 +1031,7 @@ impl WorkerSpawner {
         SpawnedWorker {
             thread,
             worker_session,
+            exec_worker: request.exec_worker.clone(),
             task_message,
         }
     }
@@ -950,6 +1041,59 @@ impl WorkerSpawner {
     /// double-admits), then wake. Durable row first, wake strictly
     /// after (invariant 1).
     pub async fn admit(&self, spawned: &SpawnedWorker) -> Result<(), SpawnError> {
+        let Some(worker) = spawned.exec_worker.as_deref() else {
+            return self.admit_unbound(spawned).await;
+        };
+        let lock = {
+            let mut locks = self
+                .binding_admission_locks
+                .lock()
+                .expect("binding admission lock map");
+            Arc::clone(
+                locks
+                    .entry(worker.to_string())
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+        let _admission = lock.lock_owned().await;
+        if let Some(port) = self.binding_admission.get() {
+            let ttl_ms = self
+                .worker_queue_timeouts
+                .get()
+                .and_then(|timeouts| timeouts.get(worker))
+                .copied()
+                .or_else(|| self.worker_queue_timeout_default.get().copied())
+                .unwrap_or(crate::router::DEFAULT_WORKER_QUEUE_TIMEOUT_MS);
+            match port
+                .check_binding(
+                    worker,
+                    spawned.thread.id,
+                    spawned.worker_session,
+                    wall_now_ms(),
+                    ttl_ms,
+                )
+                .await
+            {
+                Ok(Some(owner)) => {
+                    return Err(SpawnError::BindingConflict {
+                        worker: worker.to_string(),
+                        owner_session: owner.worker_session,
+                        owner_thread: owner.thread_id,
+                    });
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    return Err(SpawnError::BindingAdmission {
+                        worker: worker.to_string(),
+                        error,
+                    });
+                }
+            }
+        }
+        self.admit_unbound(spawned).await
+    }
+
+    async fn admit_unbound(&self, spawned: &SpawnedWorker) -> Result<(), SpawnError> {
         // Eager creation (HARNESS-BRIDGE §4.7): the first event can then carry the bridge marker
         // the first drain could not derive. Absent the port, the lazy path is unchanged.
         if let Some(port) = &self.session_creation {
@@ -1002,6 +1146,13 @@ impl WorkerSpawner {
         })
         .await
     }
+}
+
+fn wall_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// The struct-carrying spawn request (spec D3): `task`, the optional
@@ -1517,8 +1668,8 @@ pub fn bound_workers(
 /// The liveness of one worker stream — status-aware, over the frozen
 /// vocabulary (I3): `completed`/`cancelled` release the worker;
 /// `failed`/`interrupted` are resumable and still hold it; a stream
-/// with neither `session/created` nor `input/admitted` never started
-/// (a lineage-only reservation — D10's crash window).
+/// without an accepted `input/admitted` child never started. Eager
+/// `session/created` and lineage alone are reservations, not liveness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadLiveness {
     /// Started and not terminally released — the worker is held.
@@ -1526,9 +1677,8 @@ pub enum ThreadLiveness {
     /// `thread/completed{completed}` or `session/ended{completed |
     /// cancelled}`: the worker is free.
     Released,
-    /// No `session/created` and no `input/admitted` — the reservation
-    /// never became a session; released only after the queue timeout
-    /// from the lineage `ts`.
+    /// No accepted `input/admitted` child — the reservation never became
+    /// live; released only after the queue timeout from the lineage `ts`.
     NeverStarted,
 }
 
@@ -1538,12 +1688,9 @@ pub enum ThreadLiveness {
 /// what the final terminal says.
 #[must_use]
 pub fn thread_liveness(worker_events: &[Event]) -> ThreadLiveness {
-    let started = worker_events.iter().any(|ev| {
-        matches!(
-            ev.kind,
-            EventKind::SessionCreated | EventKind::InputAdmitted
-        )
-    });
+    let started = worker_events
+        .iter()
+        .any(|ev| ev.kind == EventKind::InputAdmitted);
     if !started {
         return ThreadLiveness::NeverStarted;
     }
@@ -1611,11 +1758,29 @@ pub async fn busy_owner(
     now_ms: u64,
     ttl_ms: u64,
 ) -> Result<Option<BusyOwner>, WorkerStreamsError> {
+    busy_owner_excluding(router_events, port, exec_worker, now_ms, ttl_ms, None).await
+}
+
+/// The same decision, excluding the caller's own not-yet-live reservation.
+/// A spawn admits after it commits its dispatch record, so the store-wide
+/// view already contains that record; passing the candidate here keeps the
+/// spawn from observing itself as the owner.
+pub async fn busy_owner_excluding(
+    router_events: &[Event],
+    port: &dyn WorkerStreamsPort,
+    exec_worker: &str,
+    now_ms: u64,
+    ttl_ms: u64,
+    exclude: Option<(Uuid, SessionId)>,
+) -> Result<Option<BusyOwner>, WorkerStreamsError> {
     let candidates = bound_workers(router_events);
     let Some(candidates) = candidates.get(exec_worker) else {
         return Ok(None);
     };
     for candidate in candidates {
+        if exclude == Some((candidate.thread_id, candidate.worker_session)) {
+            continue;
+        }
         let events = port.read_stream(candidate.worker_session).await?;
         match thread_liveness(&events) {
             ThreadLiveness::Released => continue,

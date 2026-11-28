@@ -5,21 +5,28 @@
 //! committed events, disposable, and rebuildable after a restart (J1). The
 //! same function backs `kian job status`, the alert text and the tests.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use kian_core::events::{EndReason, Event, EventKind};
 use kian_core::model::SessionId;
+use serde::Serialize;
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::job::outcome::{
-    ArtifactFact, AttemptFact, AttemptOutcome, RunFacts, RunOutcome, StepFacts, readiness,
-    run_outcome,
+    ArtifactFact, AttemptFact, AttemptOutcome, EffectSignals, Retry, RunFacts, RunOutcome,
+    StepFacts, retry_decision, run_outcome,
 };
 use crate::job::plan::{JobPlan, StepAction};
 
 /// The additive `job` key of the run's first `input/admitted` row (§5.2).
 pub const JOB_KEY: &str = "job";
+
+/// The v1 plan source written on newly admitted runs.
+pub const PLAN_SOURCE_CONFIG: &str = "config";
+
+/// The v1 plan author written on newly admitted runs.
+pub const PLAN_AUTHOR_OPERATOR: &str = "operator";
 
 /// The tool name the conductor uses to record a produced artifact (§12.3).
 pub const ARTIFACT_TOOL: &str = "job.artifact";
@@ -70,6 +77,27 @@ pub enum MarkerError {
         /// The digest recomputed from the plan it carries.
         computed: String,
     },
+    /// A second job-marked input tried to replace the run's frozen plan.
+    Duplicate {
+        /// The sequence of the first job-marked input.
+        first_seq: u64,
+        /// The sequence of the second job-marked input.
+        second_seq: u64,
+    },
+    /// The job marker is not on the run's first admitted input.
+    NotOnFirstInput {
+        /// The sequence of the first admitted input.
+        origin_seq: u64,
+        /// The sequence of the job-marked input.
+        marker_seq: u64,
+    },
+    /// A provenance value outside the v1 admission surface.
+    InvalidProvenance {
+        /// The field name.
+        field: &'static str,
+        /// The refused value.
+        value: String,
+    },
 }
 
 impl std::fmt::Display for MarkerError {
@@ -80,29 +108,155 @@ impl std::fmt::Display for MarkerError {
                 f,
                 "the job marker declares {declared} but its plan hashes to {computed}"
             ),
+            Self::Duplicate {
+                first_seq,
+                second_seq,
+            } => write!(
+                f,
+                "the run has a second job marker at seq {second_seq} (first at seq {first_seq})"
+            ),
+            Self::NotOnFirstInput {
+                origin_seq,
+                marker_seq,
+            } => write!(
+                f,
+                "the job marker is at seq {marker_seq}, but the run's first input is seq {origin_seq}"
+            ),
+            Self::InvalidProvenance { field, value } => write!(
+                f,
+                "job.{field} value {value:?} is not admitted in v1 (config/operator only)"
+            ),
         }
     }
 }
 
 impl std::error::Error for MarkerError {}
 
-/// The run's marker, if this stream carries one.
-///
-/// Scanned in reverse like the dream marker
-/// (`crates/kian-memory/src/driver.rs`): the newest admitted row wins and the
-/// message *text* is never consulted — the marker is a server-set key, not
-/// something a model can forge (§5.2).
-#[must_use]
-pub fn marker(events: &[Event]) -> Option<Result<JobMarker, MarkerError>> {
-    events
-        .iter()
-        .rev()
-        .filter(|event| event.kind == EventKind::InputAdmitted)
-        .find(|event| event.bytes.get(JOB_KEY).is_some())
-        .map(|event| parse_marker(event.bytes.get(JOB_KEY).unwrap_or(&Value::Null)))
+/// A validated marker and its optional audit provenance.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MarkerRecord {
+    /// The frozen marker.
+    pub marker: JobMarker,
+    /// The source exactly as present on the row; absent on legacy rows.
+    pub plan_source: Option<String>,
+    /// The author exactly as present on the row; absent on legacy rows.
+    pub plan_author: Option<String>,
 }
 
-fn parse_marker(value: &Value) -> Result<JobMarker, MarkerError> {
+/// Audit provenance as present on the first marker.
+pub type MarkerProvenance = (Option<String>, Option<String>);
+
+/// The first job-marked input plus an independently exposed duplicate.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MarkerScan {
+    /// The sequence of the run's first admitted input.
+    pub first_input_seq: Option<u64>,
+    /// The sequence of the first job-marked input.
+    pub first_seq: Option<u64>,
+    /// The first job-marked input, in stream order.
+    pub first: Option<Result<MarkerRecord, MarkerError>>,
+    /// The sequence of the second job-marked input, when one exists.
+    pub duplicate_seq: Option<u64>,
+}
+
+/// Whether any admitted row carries the raw `job` key.
+///
+/// This deliberately does not parse: a malformed marker still belongs to the
+/// conductor, which records `invalid_job_input` instead of falling through to
+/// another driver.
+#[must_use]
+pub fn has_job_marker(events: &[Event]) -> bool {
+    events
+        .iter()
+        .any(|event| event.kind == EventKind::InputAdmitted && event.bytes.get(JOB_KEY).is_some())
+}
+
+/// Scan run inputs in stream order.
+///
+/// The first job-marked row is the plan authority. A second job-marked row is
+/// exposed separately so the conductor can settle the run invalid rather than
+/// silently choosing either row. Message text is never consulted.
+#[must_use]
+pub fn scan_marker(events: &[Event]) -> MarkerScan {
+    let mut first_input_seq = None;
+    let mut first = None;
+    let mut duplicate_seq = None;
+    for event in events
+        .iter()
+        .filter(|event| event.kind == EventKind::InputAdmitted)
+    {
+        first_input_seq.get_or_insert(event.seq);
+        let Some(value) = event.bytes.get(JOB_KEY) else {
+            continue;
+        };
+        if first.is_none() {
+            first = Some((event.seq, parse_marker_record(value)));
+        } else {
+            duplicate_seq = Some(event.seq);
+            break;
+        }
+    }
+    MarkerScan {
+        first_input_seq,
+        first_seq: first.as_ref().map(|(seq, _)| *seq),
+        first: first.map(|(_, marker)| marker),
+        duplicate_seq,
+    }
+}
+
+/// The run's first marker, if this stream carries one.
+///
+/// A duplicate is an error, not a "newest wins" choice. The parser preserves
+/// absent provenance for status; callers that need the default use
+/// [`JobMarker::effective_plan_source`] or
+/// [`JobMarker::effective_plan_author`].
+#[must_use]
+pub fn marker(events: &[Event]) -> Option<Result<JobMarker, MarkerError>> {
+    let scan = scan_marker(events);
+    match (scan.first, scan.duplicate_seq) {
+        (None, _) => None,
+        (Some(_), Some(second_seq)) => Some(Err(MarkerError::Duplicate {
+            first_seq: scan.first_seq.unwrap_or(0),
+            second_seq,
+        })),
+        (Some(record), None) => {
+            if let (Some(origin_seq), Some(marker_seq)) = (scan.first_input_seq, scan.first_seq)
+                && origin_seq != marker_seq
+            {
+                return Some(Err(MarkerError::NotOnFirstInput {
+                    origin_seq,
+                    marker_seq,
+                }));
+            }
+            Some(record.map(|record| record.marker))
+        }
+    }
+}
+
+/// Parses and validates one frozen job marker.
+pub fn parse_marker(value: &Value) -> Result<JobMarker, MarkerError> {
+    parse_marker_record(value).map(|record| record.marker)
+}
+
+fn parse_marker_record(value: &Value) -> Result<MarkerRecord, MarkerError> {
+    let plan_source = optional_text_field(value, "plan_source")?;
+    if let Some(source) = plan_source.as_deref()
+        && source != PLAN_SOURCE_CONFIG
+    {
+        return Err(MarkerError::InvalidProvenance {
+            field: "plan_source",
+            value: source.to_string(),
+        });
+    }
+    let plan_author = optional_text_field(value, "plan_author")?;
+    if let Some(author) = plan_author.as_deref()
+        && author != PLAN_AUTHOR_OPERATOR
+    {
+        return Err(MarkerError::InvalidProvenance {
+            field: "plan_author",
+            value: author.to_string(),
+        });
+    }
     let plan_value = value
         .get("plan")
         .ok_or_else(|| MarkerError::Malformed("job.plan is present".into()))?;
@@ -115,15 +269,55 @@ fn parse_marker(value: &Value) -> Result<JobMarker, MarkerError> {
         return Err(MarkerError::DigestMismatch { declared, computed });
     }
 
-    Ok(JobMarker {
-        run_id: text_field(value, "run_id")?,
-        job_id: text_field(value, "job_id")?,
-        slot: text_field(value, "slot")?,
-        trigger: text_field(value, "trigger")?,
-        plan_digest: declared,
-        plan,
-        selfdev: value.get("selfdev").cloned(),
+    Ok(MarkerRecord {
+        marker: JobMarker {
+            run_id: text_field(value, "run_id")?,
+            job_id: text_field(value, "job_id")?,
+            slot: text_field(value, "slot")?,
+            trigger: text_field(value, "trigger")?,
+            plan_digest: declared,
+            plan,
+            selfdev: value.get("selfdev").cloned(),
+        },
+        plan_source,
+        plan_author,
     })
+}
+
+impl MarkerRecord {
+    /// The effective source, with the legacy default.
+    #[must_use]
+    pub fn effective_plan_source(&self) -> &str {
+        self.plan_source.as_deref().unwrap_or(PLAN_SOURCE_CONFIG)
+    }
+
+    /// The effective author, with the legacy default.
+    #[must_use]
+    pub fn effective_plan_author(&self) -> &str {
+        self.plan_author.as_deref().unwrap_or(PLAN_AUTHOR_OPERATOR)
+    }
+}
+
+impl JobMarker {
+    /// Whether two markers name the same frozen run and plan bytes.
+    #[must_use]
+    pub fn same_frozen_identity(&self, other: &Self) -> bool {
+        self.run_id == other.run_id
+            && self.job_id == other.job_id
+            && self.slot == other.slot
+            && self.trigger == other.trigger
+            && self.plan_digest == other.plan_digest
+            && self.plan == other.plan
+            && self.selfdev == other.selfdev
+    }
+}
+
+/// The first marker's provenance, preserving omission.
+#[must_use]
+pub fn provenance(events: &[Event]) -> Option<Result<MarkerProvenance, MarkerError>> {
+    scan_marker(events)
+        .first
+        .map(|record| record.map(|record| (record.plan_source, record.plan_author)))
 }
 
 fn text_field(value: &Value, key: &str) -> Result<String, MarkerError> {
@@ -132,6 +326,14 @@ fn text_field(value: &Value, key: &str) -> Result<String, MarkerError> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| MarkerError::Malformed(format!("job.{key} is a string")))
+}
+
+fn optional_text_field(value: &Value, key: &str) -> Result<Option<String>, MarkerError> {
+    match value.get(key) {
+        None => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text.clone())),
+        Some(_) => Err(MarkerError::Malformed(format!("job.{key} is a string"))),
+    }
 }
 
 /// The frozen marker a trigger writes into a run's first input row (§5.2).
@@ -161,6 +363,14 @@ pub fn marker_payload_with_selfdev(
     map.insert("job_id".into(), Value::String(job_id.to_string()));
     map.insert("slot".into(), Value::String(slot.to_string()));
     map.insert("trigger".into(), Value::String(trigger.to_string()));
+    map.insert(
+        "plan_source".into(),
+        Value::String(PLAN_SOURCE_CONFIG.to_string()),
+    );
+    map.insert(
+        "plan_author".into(),
+        Value::String(PLAN_AUTHOR_OPERATOR.to_string()),
+    );
     map.insert("plan_digest".into(), Value::String(plan.digest()));
     map.insert("plan".into(), plan.frozen_json());
     if let Some(selfdev) = selfdev {
@@ -182,6 +392,10 @@ pub struct DispatchRecord {
     pub thread_id: Uuid,
     /// The child session.
     pub child: SessionId,
+    /// The frozen step digest named by the dispatch record.
+    pub step_digest: Option<String>,
+    /// The exact task message committed with the reservation.
+    pub task: Value,
     /// When the record was written.
     pub at_ms: u64,
 }
@@ -232,6 +446,11 @@ pub fn dispatches(events: &[Event]) -> Vec<DispatchRecord> {
             worker,
             thread_id,
             child,
+            step_digest: job
+                .get("step_digest")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            task: event.bytes.get("task").cloned().unwrap_or(Value::Null),
             at_ms: event.ts,
         });
     }
@@ -253,6 +472,25 @@ pub struct VerdictRecord {
     /// crash derives the same facts without re-deciding anything (J12).
     pub outcome: Option<AttemptOutcome>,
     /// When it was written.
+    pub at_ms: u64,
+}
+
+/// One first-wins step verdict as the status projection reads it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StepVerdictRecord {
+    /// The step the verdict belongs to.
+    pub step: String,
+    /// The gate carried by the verdict.
+    pub gate: String,
+    /// The raw check results, preserved exactly as committed.
+    pub checks: Option<Value>,
+    /// The 1-based attempt named by the verdict.
+    pub attempt: u32,
+    /// The exact step outcome carried by A3.
+    pub outcome: Option<AttemptOutcome>,
+    /// Whether the declared evidence held.
+    pub passed: bool,
+    /// When the verdict committed.
     pub at_ms: u64,
 }
 
@@ -289,6 +527,66 @@ pub fn verdicts(events: &[Event]) -> Vec<VerdictRecord> {
             passed,
             ordinal: *ordinal,
             outcome,
+            at_ms: event.ts,
+        });
+    }
+    out
+}
+
+/// Every step verdict in stream order, with the first verdict at each
+/// `(step, attempt)` key retained and later rows ignored.
+#[must_use]
+pub fn step_verdicts(events: &[Event]) -> Vec<StepVerdictRecord> {
+    let mut seen: BTreeSet<(String, u32)> = BTreeSet::new();
+    let mut ordinals: BTreeMap<String, u32> = BTreeMap::new();
+    let mut out = Vec::new();
+    for event in events {
+        if event.kind != EventKind::EvidenceVerdict {
+            continue;
+        }
+        let Some(gate) = event.bytes.get("gate").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(step) = gate.strip_prefix("step:") else {
+            continue;
+        };
+        let ordinal = ordinals.entry(step.to_string()).or_insert(0);
+        *ordinal += 1;
+        let attempt = event
+            .bytes
+            .get(JOB_KEY)
+            .and_then(|job| job.get("attempt"))
+            .and_then(Value::as_u64)
+            .map(|attempt| attempt as u32)
+            .or_else(|| {
+                event
+                    .bytes
+                    .get("attempt")
+                    .and_then(Value::as_u64)
+                    .map(|attempt| attempt.saturating_add(1) as u32)
+            })
+            .unwrap_or(*ordinal);
+        if !seen.insert((step.to_string(), attempt)) {
+            continue;
+        }
+        let passed = event
+            .bytes
+            .get("passed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let outcome = event
+            .bytes
+            .get(JOB_KEY)
+            .and_then(|job| job.get("outcome"))
+            .and_then(Value::as_str)
+            .and_then(AttemptOutcome::parse);
+        out.push(StepVerdictRecord {
+            step: step.to_string(),
+            gate: gate.to_string(),
+            checks: event.bytes.get("checks").cloned(),
+            attempt,
+            outcome,
+            passed,
             at_ms: event.ts,
         });
     }
@@ -356,12 +654,11 @@ pub struct RunVerdict {
 
 /// The run's verdict, if the conductor has settled it (§11.1).
 ///
-/// The last one wins. A crash between the settle write and the end write is
+/// The first one wins. A crash between the settle write and the end write is
 /// healed by re-reading this: the conductor never writes a second verdict for
 /// an outcome it already committed (J12, §17 W8).
 #[must_use]
 pub fn run_verdict(events: &[Event]) -> Option<RunVerdict> {
-    let mut found = None;
     for event in events {
         if event.kind != EventKind::EvidenceVerdict {
             continue;
@@ -379,13 +676,13 @@ pub fn run_verdict(events: &[Event]) -> Option<RunVerdict> {
         else {
             continue;
         };
-        found = Some(RunVerdict {
+        return Some(RunVerdict {
             outcome,
             payload: event.bytes.clone(),
             at_ms: event.ts,
         });
     }
-    found
+    None
 }
 
 /// The payload of one step verdict (§11.1): the loop's verdict shape plus the
@@ -393,12 +690,14 @@ pub fn run_verdict(events: &[Event]) -> Option<RunVerdict> {
 /// settled attempt; a re-drive reads it back instead of re-deciding (J12).
 #[must_use]
 pub fn step_verdict_payload(
+    run: &str,
     step: &str,
     verdict: &kian_loop::evidence::GateVerdict,
     outcome: AttemptOutcome,
 ) -> Value {
     let mut payload = kian_loop::evidence::verdict_payload(&step_gate_name(step), verdict);
     payload[JOB_KEY] = serde_json::json!({
+        "run": run,
         "step": step,
         "attempt": verdict.attempt + 1,
         "outcome": outcome.as_str(),
@@ -411,6 +710,7 @@ pub fn step_verdict_payload(
 /// object — never two records that can disagree.
 #[must_use]
 pub fn run_verdict_payload(
+    run: Option<&str>,
     outcome: RunOutcome,
     plan_digest: &str,
     steps: &[(String, AttemptOutcome)],
@@ -438,6 +738,9 @@ pub fn run_verdict_payload(
             }))
             .collect::<Vec<_>>(),
     });
+    if let Some(run) = run {
+        job["run"] = Value::String(run.to_string());
+    }
     if let Some(step) = failed_step {
         job["failed_step"] = Value::String(step.to_string());
     }
@@ -453,52 +756,115 @@ pub fn run_verdict_payload(
     })
 }
 
-/// The run's terminal outcome, if the run has ended (§5.5).
+/// The run's outcome as visible to a reader (§5.5, §15.1).
 #[must_use]
 pub fn ended(events: &[Event]) -> Option<RunOutcome> {
-    // The conductor's own verdict is the job-level truth (§11.1): it is
-    // written before the end and survives the engine owning the end write
-    // (constraint 4 — a driver never writes `session/ended`).
     if let Some(verdict) = run_verdict(events) {
         return Some(verdict.outcome);
     }
-    let mut final_outcome = None;
-    for event in events {
-        let EventKind::SessionEnded { reason } = &event.kind else {
-            continue;
-        };
-        let declared = event
-            .bytes
-            .get(JOB_KEY)
-            .and_then(|job| job.get("outcome"))
-            .and_then(Value::as_str);
-        final_outcome = Some(match declared {
-            Some("succeeded") => RunOutcome::Succeeded,
-            Some("unverified") => RunOutcome::Unverified,
-            Some("cancelled") => RunOutcome::Cancelled,
-            Some(_) => RunOutcome::Failed,
-            None => match reason {
-                EndReason::Cancelled => RunOutcome::Cancelled,
-                EndReason::Completed => RunOutcome::Succeeded,
-                _ => RunOutcome::Failed,
-            },
-        });
+    let terminal = events.iter().rev().find_map(|event| match event.kind {
+        EventKind::SessionEnded { reason } => Some(reason),
+        _ => None,
+    });
+    if terminal.is_some_and(|reason| {
+        matches!(
+            reason,
+            EndReason::Completed | EndReason::Cancelled | EndReason::Rotated
+        )
+    }) {
+        return Some(RunOutcome::Failed);
     }
-    final_outcome
+    None
 }
 
 /// Whether the run's drain observed a cancellation (§5.4).
 #[must_use]
 pub fn cancelled(events: &[Event]) -> bool {
-    events.iter().any(|event| {
-        event.kind == EventKind::ControlInterrupt
-            || matches!(
-                &event.kind,
-                EventKind::SessionEnded {
-                    reason: EndReason::Cancelled
-                }
-            )
-    })
+    events
+        .iter()
+        .any(|event| event.kind == EventKind::ControlInterrupt)
+}
+
+/// The transient reason shown after a cancel row was consumed and before
+/// the run's verdict commits the final cancellation.
+pub const CANCELLATION_PENDING_REASON: &str = "cancellation_pending";
+
+/// The persisted state an operator surface reports for one run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunStatus {
+    Pending,
+    Running,
+    Interrupted,
+    Succeeded,
+    Unverified,
+    Failed,
+    Cancelled,
+}
+
+impl RunStatus {
+    /// The spelling an operator sees.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Interrupted => "interrupted",
+            Self::Succeeded => "succeeded",
+            Self::Unverified => "unverified",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    fn from_outcome(outcome: RunOutcome) -> Self {
+        match outcome {
+            RunOutcome::Succeeded => Self::Succeeded,
+            RunOutcome::Unverified => Self::Unverified,
+            RunOutcome::Failed => Self::Failed,
+            RunOutcome::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+/// Whether a view used the optional runtime observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusBasis {
+    Runtime,
+    StreamOnly,
+}
+
+impl StatusBasis {
+    /// The spelling an operator sees.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Runtime => "runtime",
+            Self::StreamOnly => "stream_only",
+        }
+    }
+}
+
+/// One observed runtime attempt. This is an observability hint, never an
+/// execution or settlement authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeAttempt {
+    pub step: String,
+    pub attempt: u32,
+}
+
+/// Read-only process observations a status reader may blend into the pure
+/// stream fold. No field is persisted and no execution path consumes it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunRuntimeFacts {
+    /// Whether this process currently observes the run's drain as live.
+    pub live_drain: bool,
+    /// The attempt currently observed in flight, when known.
+    pub in_flight: Option<RuntimeAttempt>,
+    /// Per-step all-busy deferral deadlines from the live catalog/binding
+    /// observation. Absent means the bound is unknown and must stay omitted.
+    pub all_busy_next_due_ms: BTreeMap<String, u64>,
 }
 
 /// A step's state as an operator sees it (§15.1).
@@ -512,6 +878,8 @@ pub enum StepState {
     Dispatched,
     /// The step finished and its outcome is final.
     Settled,
+    /// The step will not be attempted in this run.
+    Skipped,
 }
 
 impl StepState {
@@ -523,6 +891,7 @@ impl StepState {
             Self::Ready => "ready",
             Self::Dispatched => "dispatched",
             Self::Settled => "settled",
+            Self::Skipped => "skipped",
         }
     }
 }
@@ -534,12 +903,17 @@ pub struct AttemptView {
     pub attempt: u32,
     /// Where it ran; `None` when the record does not name a worker.
     pub worker: Option<String>,
-    /// When the dispatch record was written.
-    pub started_ms: u64,
+    /// The dispatch or delivery intent time, absent when the attempt
+    /// settled before either record was written.
+    pub started_ms: Option<u64>,
     /// When its verdict landed.
     pub ended_ms: Option<u64>,
     /// How it ended; `None` while it is still in flight.
     pub outcome: Option<AttemptOutcome>,
+    /// The committing verdict's gate.
+    pub gate: Option<String>,
+    /// The committing verdict's checks, preserved exactly.
+    pub checks: Option<Value>,
 }
 
 /// One step as an operator sees it (§15.1).
@@ -553,6 +927,12 @@ pub struct StepView {
     pub state: StepState,
     /// Its attempts, oldest first.
     pub attempts: Vec<AttemptView>,
+    /// Retry backoff or a runtime-observed all-busy deadline.
+    pub next_due_ms: Option<u64>,
+    /// The latest settled attempt's gate.
+    pub gate: Option<String>,
+    /// The latest settled attempt's checks.
+    pub checks: Option<Value>,
 }
 
 /// One run as an operator sees it (§15.1).
@@ -566,10 +946,20 @@ pub struct RunView {
     pub slot: String,
     /// The trigger that admitted it.
     pub trigger: String,
+    /// Audit provenance from A1; absent on legacy rows.
+    pub plan_source: Option<String>,
+    /// Audit provenance from A1; absent on legacy rows.
+    pub plan_author: Option<String>,
     /// `sha256:…` of the frozen plan.
     pub plan_digest: String,
     /// The run's outcome; `None` while it is still running.
     pub outcome: Option<RunOutcome>,
+    /// The operator status derived before any guessed liveness.
+    pub status: RunStatus,
+    /// Whether runtime observation was blended into the fold.
+    pub status_basis: StatusBasis,
+    /// The verdict reason, terminal fallback, or transient cancel note.
+    pub reason: Option<String>,
     /// The first event's timestamp.
     pub started_ms: u64,
     /// The end's timestamp.
@@ -605,115 +995,402 @@ pub struct PublishRecord {
 /// run, and guessing would be a second source of truth.
 #[must_use]
 pub fn view(events: &[Event]) -> Option<RunView> {
-    let marker = marker(events)?.ok()?;
+    view_with_runtime(events, None)
+}
+
+/// Assemble the view of one run, optionally blending a read-only runtime
+/// observation for liveness and all-busy deadlines. Runtime facts never
+/// override a committed verdict and are never persisted.
+#[must_use]
+pub fn view_with_runtime(events: &[Event], runtime: Option<&RunRuntimeFacts>) -> Option<RunView> {
+    let marker = scan_marker(events).first?.ok()?.marker;
+    let (plan_source, plan_author) = match provenance(events) {
+        Some(Ok(provenance)) => provenance,
+        _ => (None, None),
+    };
     let plan = &marker.plan;
     let dispatch_log = dispatches(events);
-    let verdict_log = verdicts(events);
-    let artifact_log = artifacts(events, plan);
-    let recorded_outcome = ended(events);
+    let verdict_log = step_verdicts(events);
+    let delivery_log = delivery_intents_with_time(events);
+    let committed_verdict = run_verdict(events);
+    let run_step_outcomes = committed_verdict
+        .as_ref()
+        .map(verdict_step_outcomes)
+        .unwrap_or_default();
 
-    let mut facts: Vec<StepFacts> = plan
-        .steps
-        .iter()
-        .map(|step| StepFacts::pending(step.id.clone()))
-        .collect();
+    let mut attempts: BTreeMap<(String, u32), AttemptView> = BTreeMap::new();
     for dispatch in &dispatch_log {
-        if let Some(facts) = facts.iter_mut().find(|facts| facts.step == dispatch.step) {
-            facts.in_flight = Some(dispatch.attempt);
-        }
+        attempts.insert(
+            (dispatch.step.clone(), dispatch.attempt),
+            AttemptView {
+                attempt: dispatch.attempt,
+                worker: Some(dispatch.worker.clone()),
+                started_ms: Some(dispatch.at_ms),
+                ended_ms: None,
+                outcome: None,
+                gate: None,
+                checks: None,
+            },
+        );
+    }
+    for intent in &delivery_log {
+        attempts
+            .entry((intent.step.clone(), intent.attempt))
+            .or_insert_with(|| AttemptView {
+                attempt: intent.attempt,
+                worker: None,
+                started_ms: Some(intent.at_ms),
+                ended_ms: None,
+                outcome: None,
+                gate: None,
+                checks: None,
+            });
     }
     for verdict in &verdict_log {
-        let Some(facts) = facts.iter_mut().find(|facts| facts.step == verdict.step) else {
-            continue;
-        };
-        if facts.in_flight == Some(verdict.ordinal) {
-            facts.in_flight = None;
-        }
-        facts.settled.push(AttemptFact {
-            attempt: verdict.ordinal,
-            outcome: if verdict.passed {
+        let entry = attempts
+            .entry((verdict.step.clone(), verdict.attempt))
+            .or_insert_with(|| AttemptView {
+                attempt: verdict.attempt,
+                worker: None,
+                started_ms: None,
+                ended_ms: None,
+                outcome: None,
+                gate: None,
+                checks: None,
+            });
+        if entry.ended_ms.is_none() {
+            entry.ended_ms = Some(verdict.at_ms);
+            entry.outcome = Some(verdict.outcome.unwrap_or(if verdict.passed {
                 AttemptOutcome::Succeeded
             } else {
                 AttemptOutcome::Failed
-            },
-            worker: dispatch_log
-                .iter()
-                .find(|dispatch| {
-                    dispatch.step == verdict.step && dispatch.attempt == verdict.ordinal
-                })
-                .map(|dispatch| dispatch.worker.clone()),
-            ended_ms: verdict.at_ms,
-        });
+            }));
+            entry.gate = Some(verdict.gate.clone());
+            entry.checks = verdict.checks.clone();
+        }
     }
-
-    let accepted = &plan.limits.accept_unverified;
-    let run_facts = RunFacts {
-        steps: &facts,
-        artifacts: &artifact_log,
-        accepted,
-        halted: false,
-        deadline_passed: false,
-    };
-    let outcome = recorded_outcome.or_else(|| cancelled(events).then_some(RunOutcome::Cancelled));
 
     let mut steps = Vec::with_capacity(plan.steps.len());
     for step in &plan.steps {
-        let known = facts.iter().find(|facts| facts.step == step.id);
-        let state = if known.is_some_and(|known| known.in_flight.is_some()) {
-            StepState::Dispatched
-        } else if known.is_some_and(StepFacts::is_settled) {
-            StepState::Settled
-        } else if outcome.is_some() {
-            StepState::Pending
-        } else if readiness(plan, &run_facts, step).is_ok() {
-            StepState::Ready
+        let step_attempts: Vec<AttemptView> = attempts
+            .range((step.id.clone(), 0)..=(step.id.clone(), u32::MAX))
+            .map(|(_, attempt)| attempt.clone())
+            .collect();
+        let in_flight = step_attempts
+            .iter()
+            .any(|attempt| attempt.ended_ms.is_none());
+        let settled = step_attempts
+            .iter()
+            .any(|attempt| attempt.ended_ms.is_some());
+        let retry_due = if in_flight {
+            None
         } else {
-            StepState::Pending
+            retry_due_ms(step, &step_attempts)
         };
-        let attempts = known
-            .map(|known| {
-                known
-                    .settled
-                    .iter()
-                    .map(|attempt| AttemptView {
-                        attempt: attempt.attempt,
-                        worker: attempt.worker.clone(),
-                        started_ms: dispatch_log
-                            .iter()
-                            .find(|dispatch| {
-                                dispatch.step == step.id && dispatch.attempt == attempt.attempt
-                            })
-                            .map_or(0, |dispatch| dispatch.at_ms),
-                        ended_ms: Some(attempt.ended_ms),
-                        outcome: Some(attempt.outcome),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let runtime_due = (!settled)
+            .then(|| runtime.and_then(|facts| facts.all_busy_next_due_ms.get(&step.id).copied()))
+            .flatten();
+        let (state, next_due_ms) = if in_flight {
+            (StepState::Dispatched, None)
+        } else if retry_due.is_some() || runtime_due.is_some() {
+            (StepState::Ready, retry_due.or(runtime_due))
+        } else if settled {
+            (StepState::Settled, None)
+        } else if committed_verdict.is_some()
+            || run_step_outcomes.get(&step.id) == Some(&AttemptOutcome::Skipped)
+            || dependency_skipped(plan, step, &attempts)
+        {
+            (StepState::Skipped, None)
+        } else {
+            (StepState::Pending, None)
+        };
+        let latest = step_attempts
+            .iter()
+            .filter(|attempt| attempt.ended_ms.is_some())
+            .max_by_key(|attempt| attempt.attempt);
+        let gate = latest.and_then(|attempt| attempt.gate.clone());
+        let checks = latest.and_then(|attempt| attempt.checks.clone());
         steps.push(StepView {
             id: step.id.clone(),
             action: step.action,
             state,
-            attempts,
+            attempts: step_attempts,
+            next_due_ms,
+            gate,
+            checks,
         });
     }
 
+    let (status, reason) =
+        derive_run_status(events, runtime, &attempts, committed_verdict.as_ref());
+    let started_ms = scan_marker(events)
+        .first_seq
+        .and_then(|seq| events.iter().find(|event| event.seq == seq))
+        .map_or_else(
+            || events.first().map_or(0, |event| event.ts),
+            |event| event.ts,
+        );
     Some(RunView {
         run_id: marker.run_id,
         job_id: marker.job_id,
         slot: marker.slot,
         trigger: marker.trigger,
+        plan_source,
+        plan_author,
         plan_digest: marker.plan_digest,
-        outcome,
-        started_ms: events.first().map_or(0, |event| event.ts),
-        ended_ms: events
-            .iter()
-            .rev()
-            .find(|event| matches!(event.kind, EventKind::SessionEnded { .. }))
-            .map(|event| event.ts),
+        outcome: committed_verdict.as_ref().map(|verdict| verdict.outcome),
+        status,
+        status_basis: if runtime.is_some() {
+            StatusBasis::Runtime
+        } else {
+            StatusBasis::StreamOnly
+        },
+        reason,
+        started_ms,
+        ended_ms: latest_end(events).map(|event| event.ts),
         steps,
         publish: publish_receipts(events),
     })
+}
+
+/// Build the pending view of an admitted run whose first input row has not
+/// been consumed into the event stream yet. The row's marker is the same
+/// frozen A1 payload, so identity and plan fields come from durable truth;
+/// no execution has been observed.
+#[must_use]
+pub fn pending_view(
+    marker: &JobMarker,
+    plan_source: Option<String>,
+    plan_author: Option<String>,
+    admitted_at: u64,
+) -> RunView {
+    RunView {
+        run_id: marker.run_id.clone(),
+        job_id: marker.job_id.clone(),
+        slot: marker.slot.clone(),
+        trigger: marker.trigger.clone(),
+        plan_source,
+        plan_author,
+        plan_digest: marker.plan_digest.clone(),
+        outcome: None,
+        status: RunStatus::Pending,
+        status_basis: StatusBasis::StreamOnly,
+        reason: None,
+        started_ms: admitted_at,
+        ended_ms: None,
+        steps: marker
+            .plan
+            .steps
+            .iter()
+            .map(|step| StepView {
+                id: step.id.clone(),
+                action: step.action,
+                state: StepState::Pending,
+                attempts: Vec::new(),
+                next_due_ms: None,
+                gate: None,
+                checks: None,
+            })
+            .collect(),
+        publish: Vec::new(),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DeliveryIntentRecord {
+    step: String,
+    attempt: u32,
+    at_ms: u64,
+}
+
+fn delivery_intents_with_time(events: &[Event]) -> Vec<DeliveryIntentRecord> {
+    let mut out = Vec::new();
+    for event in events {
+        if event.kind != EventKind::ToolCall
+            || event.bytes.get("tool").and_then(Value::as_str)
+                != Some(crate::job::conduct::DELIVER_TOOL)
+        {
+            continue;
+        }
+        let Some(call_id) = event.bytes.get("call_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(rest) = call_id.strip_prefix(crate::job::conduct::DELIVER_CALL_PREFIX) else {
+            continue;
+        };
+        let Some((step, attempt)) = rest.rsplit_once(':') else {
+            continue;
+        };
+        let Ok(attempt) = attempt.parse::<u32>() else {
+            continue;
+        };
+        out.push(DeliveryIntentRecord {
+            step: step.to_string(),
+            attempt,
+            at_ms: event.ts,
+        });
+    }
+    out
+}
+
+fn verdict_step_outcomes(verdict: &RunVerdict) -> BTreeMap<String, AttemptOutcome> {
+    let mut out = BTreeMap::new();
+    let Some(steps) = verdict
+        .payload
+        .get(JOB_KEY)
+        .and_then(|job| job.get("steps"))
+        .and_then(Value::as_array)
+    else {
+        return out;
+    };
+    for step in steps {
+        let (Some(id), Some(outcome)) = (
+            step.get("step").and_then(Value::as_str),
+            step.get("outcome")
+                .and_then(Value::as_str)
+                .and_then(AttemptOutcome::parse),
+        ) else {
+            continue;
+        };
+        out.insert(id.to_string(), outcome);
+    }
+    out
+}
+
+fn retry_due_ms(step: &crate::job::plan::StepPlan, attempts: &[AttemptView]) -> Option<u64> {
+    let facts = StepFacts {
+        step: step.id.clone(),
+        settled: attempts
+            .iter()
+            .filter_map(|attempt| {
+                Some(AttemptFact {
+                    attempt: attempt.attempt,
+                    outcome: attempt.outcome?,
+                    worker: attempt.worker.clone(),
+                    ended_ms: attempt.ended_ms?,
+                })
+            })
+            .collect(),
+        in_flight: None,
+    };
+    match retry_decision(step, &facts, EffectSignals::default(), false) {
+        Retry::Later { not_before_ms, .. } => Some(not_before_ms),
+        Retry::Stop(_) => None,
+    }
+}
+
+fn dependency_skipped(
+    plan: &JobPlan,
+    step: &crate::job::plan::StepPlan,
+    attempts: &BTreeMap<(String, u32), AttemptView>,
+) -> bool {
+    let dependencies: BTreeSet<&str> = step
+        .depends_on
+        .iter()
+        .map(String::as_str)
+        .chain(step.inputs.iter().map(|input| input.step.as_str()))
+        .collect();
+    dependencies.into_iter().any(|dependency| {
+        let outcome = attempts
+            .range((dependency.to_string(), 0)..=(dependency.to_string(), u32::MAX))
+            .filter_map(|(_, attempt)| attempt.outcome)
+            .next_back();
+        outcome.is_some_and(|outcome| {
+            !outcome.is_success(
+                plan.limits
+                    .accept_unverified
+                    .iter()
+                    .any(|id| id == dependency),
+            )
+        })
+    })
+}
+
+fn latest_end(events: &[Event]) -> Option<&Event> {
+    events
+        .iter()
+        .rev()
+        .find(|event| matches!(event.kind, EventKind::SessionEnded { .. }))
+}
+
+fn has_unended_drain(events: &[Event]) -> bool {
+    let open_seq = events
+        .iter()
+        .rev()
+        .find(|event| event.kind == EventKind::DrainClaimed)
+        .map(|event| event.seq);
+    let end_seq = latest_end(events).map(|event| event.seq);
+    open_seq.is_some_and(|opened| end_seq.is_none_or(|end| opened > end))
+}
+
+fn derive_run_status(
+    events: &[Event],
+    runtime: Option<&RunRuntimeFacts>,
+    attempts: &BTreeMap<(String, u32), AttemptView>,
+    verdict: Option<&RunVerdict>,
+) -> (RunStatus, Option<String>) {
+    if let Some(verdict) = verdict {
+        return (
+            RunStatus::from_outcome(verdict.outcome),
+            verdict
+                .payload
+                .get(JOB_KEY)
+                .and_then(|job| job.get("reason"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        );
+    }
+    if let Some(end) = latest_end(events).filter(|end| {
+        !has_unended_drain(events)
+            || events.iter().any(|event| {
+                matches!(
+                    event.kind,
+                    EventKind::SessionEnded {
+                        reason: EndReason::Completed | EndReason::Cancelled | EndReason::Rotated
+                    }
+                ) && event.seq >= end.seq
+            })
+    }) {
+        let reason = match end.kind {
+            EventKind::SessionEnded {
+                reason: EndReason::Completed | EndReason::Cancelled | EndReason::Rotated,
+            } => RunStatus::Failed,
+            EventKind::SessionEnded {
+                reason:
+                    EndReason::Interrupted
+                    | EndReason::Failed
+                    | EndReason::AwaitingInput
+                    | EndReason::AwaitingBudget,
+            } => RunStatus::Interrupted,
+            _ => RunStatus::Pending,
+        };
+        let note = (reason == RunStatus::Failed)
+            .then(|| crate::job::conduct::ENDED_WITHOUT_OUTCOME_REASON.to_string());
+        return (reason, note);
+    }
+    if cancelled(events) {
+        return (
+            RunStatus::Running,
+            Some(CANCELLATION_PENDING_REASON.to_string()),
+        );
+    }
+    let has_live_attempt = attempts.values().any(|attempt| attempt.ended_ms.is_none());
+    if let Some(runtime) = runtime {
+        let live = runtime.live_drain || runtime.in_flight.is_some();
+        return (
+            if live {
+                RunStatus::Running
+            } else {
+                RunStatus::Pending
+            },
+            None,
+        );
+    }
+    if has_live_attempt || has_unended_drain(events) {
+        (RunStatus::Running, None)
+    } else {
+        (RunStatus::Pending, None)
+    }
 }
 
 /// Every successful publish receipt on the run stream (§9.4). A receipt with
@@ -814,8 +1491,14 @@ pub fn render(view: &RunView) -> String {
         "job      {}   plan {}\n",
         view.job_id, view.plan_digest
     ));
-    let status = view.outcome.map_or("running", RunOutcome::as_str);
-    out.push_str(&format!("status   {status}\n"));
+    out.push_str(&format!(
+        "status   {} ({})\n",
+        view.status.as_str(),
+        view.status_basis.as_str()
+    ));
+    if let Some(reason) = &view.reason {
+        out.push_str(&format!("reason   {reason}\n"));
+    }
     for publish in &view.publish {
         let gate = publish
             .gate_exit_code
@@ -842,14 +1525,18 @@ pub fn render(view: &RunView) -> String {
         let outcome = last
             .and_then(|attempt| attempt.outcome)
             .map_or("-", AttemptOutcome::as_str);
+        let due = step
+            .next_due_ms
+            .map_or_else(String::new, |due| format!("  next_due_ms={due}"));
         out.push_str(&format!(
-            "  {:<10} {:<8} {:<12} {} attempt(s)  {}  {}\n",
+            "  {:<10} {:<8} {:<12} {} attempt(s)  {}  {}{}\n",
             step.id,
             action_str(step.action),
             step.state.as_str(),
             step.attempts.len(),
             worker,
             outcome,
+            due,
         ));
     }
     out
@@ -954,6 +1641,75 @@ mod tests {
         )
     }
 
+    fn step_verdict(
+        seq: u64,
+        ts: u64,
+        step: &str,
+        attempt: u32,
+        outcome: AttemptOutcome,
+        checks: Value,
+    ) -> Event {
+        event(
+            seq,
+            ts,
+            EventKind::EvidenceVerdict,
+            json!({
+                "gate": format!("step:{step}"),
+                "passed": outcome.is_success(true),
+                "checks": checks,
+                "attempt": attempt.saturating_sub(1),
+                "job": {
+                    "run": "digest@slot",
+                    "step": step,
+                    "attempt": attempt,
+                    "outcome": outcome.as_str(),
+                },
+            }),
+        )
+    }
+
+    fn run_verdict(
+        seq: u64,
+        ts: u64,
+        plan: &JobPlan,
+        outcome: RunOutcome,
+        steps: &[(&str, AttemptOutcome)],
+        reason: Option<&str>,
+    ) -> Event {
+        let mut job = json!({
+            "outcome": outcome.as_str(),
+            "plan_digest": plan.digest(),
+            "steps": steps.iter().map(|(step, outcome)| json!({
+                "step": step,
+                "outcome": outcome.as_str(),
+            })).collect::<Vec<Value>>(),
+        });
+        if let Some(reason) = reason {
+            job["reason"] = json!(reason);
+        }
+        event(
+            seq,
+            ts,
+            EventKind::EvidenceVerdict,
+            json!({
+                "gate": RUN_GATE_NAME,
+                "passed": outcome == RunOutcome::Succeeded,
+                "checks": [],
+                "attempt": 0,
+                "job": job,
+            }),
+        )
+    }
+
+    fn claimed(seq: u64, ts: u64) -> Event {
+        event(
+            seq,
+            ts,
+            EventKind::DrainClaimed,
+            json!({"holder": "test", "epoch": 1}),
+        )
+    }
+
     fn artifact(seq: u64, ts: u64, step: &str, bytes: u64) -> Event {
         event(
             seq,
@@ -990,6 +1746,146 @@ mod tests {
         assert_eq!(marker.run_id, crate::job::plan::run_id("digest", "slot"));
         assert_eq!(marker.plan_digest, plan.digest());
         assert_eq!(marker.plan, plan);
+        let record = scan_marker(&events)
+            .first
+            .expect("the first marker")
+            .expect("valid marker");
+        assert_eq!(record.plan_source.as_deref(), Some(PLAN_SOURCE_CONFIG));
+        assert_eq!(record.plan_author.as_deref(), Some(PLAN_AUTHOR_OPERATOR));
+        assert_eq!(record.effective_plan_source(), PLAN_SOURCE_CONFIG);
+        assert_eq!(record.effective_plan_author(), PLAN_AUTHOR_OPERATOR);
+    }
+
+    #[test]
+    fn the_first_job_marked_input_is_authority_and_a_second_is_exposed() {
+        let first_plan = plan();
+        let mut second_plan = plan();
+        second_plan.steps[0].prompt = Some("a later plan".to_string());
+        let events = vec![
+            admitted(1, 10, &first_plan),
+            event(
+                2,
+                20,
+                EventKind::InputAdmitted,
+                json!({
+                    "role": "user",
+                    "content": "replace the plan",
+                    "job": marker_payload("digest", "slot", "cron", &second_plan),
+                }),
+            ),
+        ];
+        let scan = scan_marker(&events);
+        let first = scan
+            .first
+            .expect("the first marker")
+            .expect("valid first marker");
+        assert_eq!(first.marker.plan, first_plan);
+        assert_eq!(scan.duplicate_seq, Some(2));
+        assert!(matches!(
+            marker(&events),
+            Some(Err(MarkerError::Duplicate {
+                first_seq: 1,
+                second_seq: 2
+            }))
+        ));
+    }
+
+    #[test]
+    fn malformed_job_key_still_classifies_as_job_marked() {
+        let events = vec![event(
+            1,
+            10,
+            EventKind::InputAdmitted,
+            json!({"role": "user", "content": "x", "job": "not-an-object"}),
+        )];
+        assert!(has_job_marker(&events));
+        assert!(matches!(
+            marker(&events),
+            Some(Err(MarkerError::Malformed(_)))
+        ));
+    }
+
+    #[test]
+    fn a_job_marker_after_the_first_input_is_not_authority() {
+        let plan = plan();
+        let mut late = admitted(2, 20, &plan);
+        late.bytes["content"] = json!("run later");
+        let events = vec![
+            event(
+                1,
+                10,
+                EventKind::InputAdmitted,
+                json!({"role": "user", "content": "plain first"}),
+            ),
+            late,
+        ];
+        let scan = scan_marker(&events);
+        assert_eq!(scan.first_input_seq, Some(1));
+        assert_eq!(scan.first_seq, Some(2));
+        assert!(matches!(
+            marker(&events),
+            Some(Err(MarkerError::NotOnFirstInput {
+                origin_seq: 1,
+                marker_seq: 2
+            }))
+        ));
+    }
+
+    #[test]
+    fn legacy_provenance_remains_absent_but_has_v1_effective_values() {
+        let plan = plan();
+        let mut payload = marker_payload("digest", "slot", "cron", &plan);
+        payload
+            .as_object_mut()
+            .expect("object")
+            .remove("plan_source");
+        payload
+            .as_object_mut()
+            .expect("object")
+            .remove("plan_author");
+        let events = vec![event(
+            1,
+            10,
+            EventKind::InputAdmitted,
+            json!({"role": "user", "content": "x", "job": payload}),
+        )];
+        let record = scan_marker(&events)
+            .first
+            .expect("legacy marker")
+            .expect("valid legacy marker");
+        assert_eq!(record.plan_source, None);
+        assert_eq!(record.plan_author, None);
+        assert_eq!(record.effective_plan_source(), PLAN_SOURCE_CONFIG);
+        assert_eq!(record.effective_plan_author(), PLAN_AUTHOR_OPERATOR);
+    }
+
+    #[test]
+    fn v1_refuses_other_provenance_values() {
+        let plan = plan();
+        for (field, value) in [
+            ("plan_source", "inline"),
+            ("plan_source", "router"),
+            ("plan_source", "unknown"),
+            ("plan_author", "router-session"),
+            ("plan_author", "external-planner"),
+        ] {
+            let mut payload = marker_payload("digest", "slot", "cron", &plan);
+            payload[field] = json!(value);
+            let events = vec![event(
+                1,
+                10,
+                EventKind::InputAdmitted,
+                json!({"role": "user", "content": "x", "job": payload}),
+            )];
+            assert!(
+                matches!(
+                    marker(&events),
+                    Some(Err(MarkerError::InvalidProvenance { field: refused, .. }))
+                        if refused == field
+                ),
+                "{field}={value:?}"
+            );
+        }
     }
 
     #[test]
@@ -1111,13 +2007,18 @@ mod tests {
         let mut events = vec![admitted(1, 10, &plan)];
 
         let seen = view(&events).expect("a run view");
-        assert_eq!(seen.steps[0].state, StepState::Ready);
+        assert_eq!(seen.status, RunStatus::Pending);
+        assert_eq!(seen.status_basis, StatusBasis::StreamOnly);
+        assert_eq!(seen.steps[0].state, StepState::Pending);
         assert_eq!(seen.steps[1].state, StepState::Pending);
         assert!(seen.outcome.is_none());
 
         events.push(dispatched(2, 20, "fetch", 1, "vultr"));
         let seen = view(&events).expect("a run view");
+        assert_eq!(seen.status, RunStatus::Running);
         assert_eq!(seen.steps[0].state, StepState::Dispatched);
+        assert_eq!(seen.steps[0].attempts[0].started_ms, Some(20));
+        assert_eq!(seen.steps[0].attempts[0].ended_ms, None);
 
         events.push(artifact(3, 30, "fetch", 10));
         events.push(verdict(4, 40, "fetch", true));
@@ -1128,13 +2029,263 @@ mod tests {
             Some(AttemptOutcome::Succeeded)
         );
         assert_eq!(seen.steps[0].attempts[0].worker.as_deref(), Some("vultr"));
-        assert_eq!(seen.steps[1].state, StepState::Ready);
+        assert_eq!(seen.steps[1].state, StepState::Pending);
     }
 
     #[test]
     fn view_is_none_for_a_plain_session() {
         let events = vec![event(1, 10, EventKind::SessionCreated, json!({}))];
         assert!(view(&events).is_none());
+    }
+
+    #[test]
+    fn a_duplicate_marker_still_renders_the_invalid_run() {
+        let plan = plan();
+        let mut second_plan = plan.clone();
+        second_plan.steps[0].prompt = Some("a later plan".to_string());
+        let events = vec![
+            admitted(1, 10, &plan),
+            event(
+                2,
+                20,
+                EventKind::InputAdmitted,
+                json!({
+                    "role": "user",
+                    "content": "replace the plan",
+                    "job": marker_payload("digest", "slot", "cron", &second_plan),
+                }),
+            ),
+            run_verdict(
+                3,
+                30,
+                &plan,
+                RunOutcome::Failed,
+                &[],
+                Some("invalid_job_input"),
+            ),
+        ];
+        let seen = view(&events).expect("the first marker is still the run identity");
+        assert_eq!(seen.outcome, Some(RunOutcome::Failed));
+        assert_eq!(seen.status, RunStatus::Failed);
+        assert_eq!(seen.reason.as_deref(), Some("invalid_job_input"));
+    }
+
+    #[test]
+    fn status_follows_the_first_committed_run_verdict_reason() {
+        let plan = plan();
+        let events = vec![
+            admitted(1, 10, &plan),
+            claimed(2, 20),
+            run_verdict(
+                3,
+                30,
+                &plan,
+                RunOutcome::Failed,
+                &[
+                    ("fetch", AttemptOutcome::Succeeded),
+                    ("send", AttemptOutcome::TimedOut),
+                ],
+                Some("step_timed_out"),
+            ),
+            run_verdict(4, 40, &plan, RunOutcome::Succeeded, &[], None),
+            event(
+                5,
+                50,
+                EventKind::SessionEnded {
+                    reason: EndReason::Completed,
+                },
+                json!({}),
+            ),
+        ];
+        let seen = view(&events).expect("a run view");
+        assert_eq!(seen.status, RunStatus::Failed);
+        assert_eq!(seen.outcome, Some(RunOutcome::Failed));
+        assert_eq!(seen.reason.as_deref(), Some("step_timed_out"));
+        assert_eq!(seen.steps[0].attempts.first().map(|a| a.started_ms), None);
+    }
+
+    #[test]
+    fn terminal_and_resumable_ends_follow_the_status_priority() {
+        let plan = plan();
+        let terminal = vec![
+            admitted(1, 10, &plan),
+            claimed(2, 20),
+            event(
+                3,
+                30,
+                EventKind::SessionEnded {
+                    reason: EndReason::Completed,
+                },
+                json!({}),
+            ),
+        ];
+        let seen = view(&terminal).expect("terminal view");
+        assert_eq!(seen.status, RunStatus::Failed);
+        assert_eq!(seen.outcome, None, "an end never invents a run verdict");
+        assert_eq!(seen.reason.as_deref(), Some("ended_without_outcome"));
+
+        let interrupted = vec![
+            admitted(1, 10, &plan),
+            claimed(2, 20),
+            event(
+                3,
+                30,
+                EventKind::SessionEnded {
+                    reason: EndReason::Interrupted,
+                },
+                json!({}),
+            ),
+        ];
+        let seen = view(&interrupted).expect("interrupted view");
+        assert_eq!(seen.status, RunStatus::Interrupted);
+        assert_eq!(seen.reason, None);
+    }
+
+    #[test]
+    fn a_consumed_cancel_is_running_until_the_verdict() {
+        let plan = plan();
+        let events = vec![
+            admitted(1, 10, &plan),
+            claimed(2, 20),
+            event(
+                3,
+                30,
+                EventKind::ControlInterrupt,
+                json!({"action": "interrupt", "reason": "test"}),
+            ),
+        ];
+        let seen = view(&events).expect("a run view");
+        assert_eq!(seen.status, RunStatus::Running);
+        assert_eq!(seen.reason.as_deref(), Some(CANCELLATION_PENDING_REASON));
+    }
+
+    #[test]
+    fn runtime_liveness_refines_an_unended_residency_without_guessing_from_age() {
+        let plan = plan();
+        let events = vec![admitted(1, 10, &plan), claimed(2, 20)];
+        let stream_only = view(&events).expect("stream-only view");
+        assert_eq!(stream_only.status, RunStatus::Running);
+        assert_eq!(stream_only.status_basis, StatusBasis::StreamOnly);
+
+        let dead = RunRuntimeFacts::default();
+        let observed = view_with_runtime(&events, Some(&dead)).expect("runtime view");
+        assert_eq!(observed.status, RunStatus::Pending);
+        assert_eq!(observed.status_basis, StatusBasis::Runtime);
+
+        let live = RunRuntimeFacts {
+            live_drain: true,
+            ..RunRuntimeFacts::default()
+        };
+        let observed = view_with_runtime(&events, Some(&live)).expect("live view");
+        assert_eq!(observed.status, RunStatus::Running);
+    }
+
+    #[test]
+    fn dependency_skip_and_retry_backoff_are_stream_derived() {
+        let mut plan = plan();
+        plan.steps[0].retries = 1;
+        let events = vec![
+            admitted(1, 10, &plan),
+            claimed(2, 20),
+            step_verdict(
+                3,
+                30,
+                "fetch",
+                1,
+                AttemptOutcome::Failed,
+                json!([{"check": "final_message_present", "passed": false}]),
+            ),
+        ];
+        let seen = view(&events).expect("retry view");
+        assert_eq!(seen.steps[0].state, StepState::Ready);
+        assert_eq!(seen.steps[0].next_due_ms, Some(2_030));
+        assert_eq!(seen.steps[1].state, StepState::Skipped);
+        assert_eq!(seen.steps[0].gate.as_deref(), Some("step:fetch"));
+        assert_eq!(
+            seen.steps[0]
+                .checks
+                .as_ref()
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+
+        let committed = view(&[
+            admitted(1, 10, &plan),
+            claimed(2, 20),
+            run_verdict(
+                3,
+                30,
+                &plan,
+                RunOutcome::Failed,
+                &[
+                    ("fetch", AttemptOutcome::Succeeded),
+                    ("send", AttemptOutcome::Skipped),
+                ],
+                Some("dependency_failed"),
+            ),
+        ])
+        .expect("committed view");
+        assert_eq!(committed.steps[1].state, StepState::Skipped);
+        assert!(committed.steps[1].attempts.is_empty());
+    }
+
+    #[test]
+    fn step_verdicts_are_first_wins_and_keep_exact_outcomes_and_checks() {
+        let plan = plan();
+        let checks = json!([{"check": "final_message_present", "passed": true}]);
+        let events = vec![
+            admitted(1, 10, &plan),
+            claimed(2, 20),
+            step_verdict(
+                3,
+                30,
+                "fetch",
+                1,
+                AttemptOutcome::InvalidOutput,
+                checks.clone(),
+            ),
+            step_verdict(4, 40, "fetch", 1, AttemptOutcome::Succeeded, json!([])),
+        ];
+        let seen = view(&events).expect("a run view");
+        assert_eq!(
+            seen.steps[0].attempts[0].outcome,
+            Some(AttemptOutcome::InvalidOutput)
+        );
+        assert_eq!(seen.steps[0].attempts[0].checks.as_ref(), Some(&checks));
+        assert_eq!(seen.steps[0].attempts.len(), 1);
+    }
+
+    #[test]
+    fn delivery_intent_is_an_in_flight_attempt_and_runtime_can_supply_all_busy_due() {
+        let plan = plan();
+        let delivery = event(
+            3,
+            30,
+            EventKind::ToolCall,
+            json!({
+                "tool": crate::job::conduct::DELIVER_TOOL,
+                "call_id": "job:deliver:send:1",
+                "args": {"channel": "imessage", "target": {"handle": "+1"}, "content": {"text": "hi"}},
+            }),
+        );
+        let events = vec![admitted(1, 10, &plan), claimed(2, 20), delivery];
+        let seen = view(&events).expect("delivery view");
+        assert_eq!(seen.steps[1].state, StepState::Dispatched);
+        assert_eq!(seen.steps[1].attempts[0].started_ms, Some(30));
+        assert_eq!(seen.steps[1].attempts[0].ended_ms, None);
+
+        let mut all_busy = BTreeMap::new();
+        all_busy.insert("fetch".to_string(), 9_999);
+        let runtime = RunRuntimeFacts {
+            live_drain: true,
+            all_busy_next_due_ms: all_busy,
+            ..RunRuntimeFacts::default()
+        };
+        let waiting =
+            view_with_runtime(&[admitted(1, 10, &plan)], Some(&runtime)).expect("all-busy view");
+        assert_eq!(waiting.steps[0].state, StepState::Ready);
+        assert_eq!(waiting.steps[0].next_due_ms, Some(9_999));
     }
 
     #[test]
@@ -1148,7 +2299,7 @@ mod tests {
         ];
         let text = render(&view(&events).expect("a run view"));
         assert!(text.contains("run      digest@slot"));
-        assert!(text.contains("status   running"));
+        assert!(text.contains("status   pending (stream_only)"));
         assert!(text.contains("fetch"));
         assert!(text.contains("vultr"));
         assert!(text.contains("agent"));
@@ -1160,17 +2311,33 @@ mod tests {
     }
 
     #[test]
-    fn ended_reads_the_conductor_outcome() {
+    fn run_verdict_is_truth_and_the_end_payload_is_ignored() {
         let plan = plan();
         let events = vec![
             admitted(1, 10, &plan),
+            event(
+                4,
+                40,
+                EventKind::EvidenceVerdict,
+                json!({
+                    "gate": "run",
+                    "passed": false,
+                    "checks": [],
+                    "attempt": 0,
+                    "job": {
+                        "outcome": "unverified",
+                        "plan_digest": plan.digest(),
+                        "steps": []
+                    }
+                }),
+            ),
             event(
                 5,
                 50,
                 EventKind::SessionEnded {
                     reason: EndReason::Completed,
                 },
-                json!({"job": {"outcome": "unverified", "plan_digest": plan.digest()}}),
+                json!({"job": {"outcome": "succeeded"}}),
             ),
         ];
         assert_eq!(ended(&events), Some(RunOutcome::Unverified));
@@ -1181,12 +2348,41 @@ mod tests {
     }
 
     #[test]
-    fn ended_falls_back_to_the_end_reason() {
+    fn the_first_committed_run_verdict_wins() {
+        let plan = plan();
+        let verdict = |seq, outcome: &str, passed| {
+            event(
+                seq,
+                50 + seq,
+                EventKind::EvidenceVerdict,
+                json!({
+                    "gate": "run",
+                    "passed": passed,
+                    "checks": [],
+                    "attempt": 0,
+                    "job": {
+                        "outcome": outcome,
+                        "plan_digest": plan.digest(),
+                        "steps": []
+                    }
+                }),
+            )
+        };
+        let events = vec![
+            admitted(1, 10, &plan),
+            verdict(2, "failed", false),
+            verdict(3, "succeeded", true),
+        ];
+        assert_eq!(ended(&events), Some(RunOutcome::Failed));
+    }
+
+    #[test]
+    fn a_terminal_end_without_a_run_verdict_is_failed() {
         let events = vec![event(
             5,
             50,
             EventKind::SessionEnded {
-                reason: EndReason::Failed,
+                reason: EndReason::Completed,
             },
             json!({}),
         )];
@@ -1218,5 +2414,38 @@ mod tests {
 
         events.push(verdict(5, 50, "send", true));
         assert_eq!(derived_outcome(&plan, &events), RunOutcome::Succeeded);
+    }
+
+    #[test]
+    fn a3_verdict_payloads_carry_the_run_identity() {
+        let step = step_verdict_payload(
+            "build@manual:01J0000000000000000000000",
+            "fetch",
+            &kian_loop::evidence::GateVerdict {
+                passed: true,
+                checks: Vec::new(),
+                attempt: 2,
+            },
+            AttemptOutcome::Succeeded,
+        );
+        assert_eq!(
+            step[JOB_KEY]["run"],
+            json!("build@manual:01J0000000000000000000000")
+        );
+        assert_eq!(step[JOB_KEY]["attempt"], json!(3));
+
+        let run = run_verdict_payload(
+            Some("build@manual:01J0000000000000000000000"),
+            RunOutcome::Failed,
+            "sha256:abc",
+            &[("fetch".to_string(), AttemptOutcome::Failed)],
+            Some("fetch"),
+            Some("step_failed"),
+        );
+        assert_eq!(
+            run[JOB_KEY]["run"],
+            json!("build@manual:01J0000000000000000000000")
+        );
+        assert_eq!(run[JOB_KEY]["reason"], json!("step_failed"));
     }
 }

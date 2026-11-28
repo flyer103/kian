@@ -367,25 +367,25 @@ async fn kian_workers(config: &Path) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).expect("board parses")
 }
 
-async fn wait_cli_state(config: &Path, id: &str, want: &str, deadline_ms: u64) {
+async fn wait_registry_state(db: &Path, id: &str, want: &str, deadline_ms: u64) {
     let start = now_ms();
     loop {
-        let board = kian_workers(config).await;
-        let state = board["workers"]
-            .as_array()
-            .and_then(|rows| {
-                rows.iter()
-                    .find(|row| row["id"].as_str() == Some(id))
-                    .and_then(|row| row["state"].as_str())
-                    .map(str::to_string)
-            })
+        let exec = kian_exec::ExecStore::open_read_only(db)
+            .await
+            .expect("exec store");
+        let rows = exec.endpoints().await.expect("registry rows");
+        exec.close().await;
+        let state = rows
+            .iter()
+            .find(|row| row.endpoint_id == id)
+            .map(|row| row.state.clone())
             .unwrap_or_else(|| "<absent>".into());
         if state == want {
             return;
         }
         assert!(
             now_ms() - start < deadline_ms,
-            "worker {id} never reached {want} (last: {state})"
+            "worker {id} never reached {want} (last registry state: {state})"
         );
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
@@ -396,11 +396,17 @@ async fn wait_cli_state(config: &Path, id: &str, want: &str, deadline_ms: u64) {
 /// online; the wrong token is typed-refused over the real wire; the
 /// real register-mode kiand with a wrong token exits non-zero with an
 /// actionable error; the serve stderr carries no token material.
+///
+/// Membership is observed from the durable registry rows the serve
+/// maintains, not from `kian workers`: that board is a registry-only
+/// projection and never presents a cached heartbeat as online
+/// (WORKER-MODEL W1), so every row it shows is offline by design.
 #[tokio::test]
 async fn qa_runtime_membership_over_real_processes() {
     let dir = temp_dir("qa-l2-membership");
     let listen_port = free_port();
     let config = qa_config(&dir, free_port(), listen_port, 8_000);
+    let db = dir.join("kian.sqlite");
 
     // serve with stderr captured to a file (the I9 scan reads it).
     let stderr_path = dir.join("serve.stderr.log");
@@ -453,24 +459,24 @@ async fn qa_runtime_membership_over_real_processes() {
     let worker = QaRawWorker::dial(addr, "qa-raw-1", QA_TOKEN, kian_exec::PROTOCOL_VERSION)
         .await
         .expect("correct token registers");
-    wait_cli_state(&config, "qa-raw-1", "online", 5_000).await;
+    wait_registry_state(&db, "qa-raw-1", "online", 5_000).await;
 
     // Wrong token against the live listener (typed, terminal).
     let refused =
         QaRawWorker::dial(addr, "qa-raw-2", "wrong-again", kian_exec::PROTOCOL_VERSION).await;
     assert!(refused.is_none(), "wrong token refused");
-    wait_cli_state(&config, "qa-raw-1", "online", 5_000).await;
+    wait_registry_state(&db, "qa-raw-1", "online", 5_000).await;
 
     // BYE: graceful leave → offline on the board (no restart).
     worker.bye().await;
-    wait_cli_state(&config, "qa-raw-1", "offline", 8_000).await;
+    wait_registry_state(&db, "qa-raw-1", "offline", 8_000).await;
 
     // RE-REGISTER the same id: online again (same id binding shape).
     let mut worker = QaRawWorker::dial(addr, "qa-raw-1", QA_TOKEN, kian_exec::PROTOCOL_VERSION)
         .await
         .expect("re-register accepted");
     worker.heartbeat("qa-raw-1").await;
-    wait_cli_state(&config, "qa-raw-1", "online", 5_000).await;
+    wait_registry_state(&db, "qa-raw-1", "online", 5_000).await;
     drop(worker);
 
     // The REAL register-mode kiand with a WRONG token: exits non-zero,

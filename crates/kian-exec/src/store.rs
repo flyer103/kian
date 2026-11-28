@@ -294,6 +294,16 @@ pub struct QueuedCommand {
     pub updated_at: i64,
 }
 
+/// One orphaned pending row converged by the queue's startup/sweep pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingAbandonment {
+    pub command_id: Uuid,
+    pub endpoint_id: String,
+    pub tool_call_ref: Option<String>,
+    pub created_at: i64,
+    pub dispatch_attempts: u32,
+}
+
 /// One `endpoint_registry` row (the watchdog reads this projection).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EndpointRegistryRow {
@@ -812,9 +822,9 @@ impl ExecStore {
         Ok(affected == 1)
     }
 
-    /// `pending|inflight → abandoned` (queue timeout). Returns false when
-    /// the row already settled — including when the real result won the
-    /// race against the timer (the caller re-reads and prefers it).
+    /// `pending → abandoned` (queue timeout). Returns false when
+    /// the row is not pending — an inflight execution is never abandoned by
+    /// a caller's wait expiry, and a settled row freezes.
     pub async fn mark_abandoned(&self, command_id: Uuid) -> Result<bool, QueueStoreError> {
         let affected = match self {
             Self::Sqlite(pool) => crate::sqlite::mark_abandoned(pool, command_id, now_ms()).await?,
@@ -823,6 +833,39 @@ impl ExecStore {
             }
         };
         Ok(affected == 1)
+    }
+
+    /// Converges aged `pending` rows whose caller disappeared. The guarded
+    /// sweep only abandons rows that were never dispatched, have exceeded
+    /// the deployment's dispatch wait, and have no live row lease.
+    pub async fn abandon_aged_pending(
+        &self,
+        older_than_ms: i64,
+        now_ms: i64,
+    ) -> Result<Vec<PendingAbandonment>, QueueStoreError> {
+        let rows = match self {
+            Self::Sqlite(pool) => {
+                crate::sqlite::abandon_aged_pending(pool, older_than_ms, now_ms).await?
+            }
+            Self::Postgres(pool) => {
+                crate::postgres::abandon_aged_pending(pool, older_than_ms, now_ms).await?
+            }
+        };
+        rows.into_iter()
+            .map(
+                |(command_id, endpoint_id, tool_call_ref, created_at, dispatch_attempts)| {
+                    Ok(PendingAbandonment {
+                        command_id: Uuid::parse_str(&command_id).map_err(|e| {
+                            QueueStoreError::Corrupt(format!("bad command id: {e}"))
+                        })?,
+                        endpoint_id,
+                        tool_call_ref,
+                        created_at,
+                        dispatch_attempts: u32::try_from(dispatch_attempts).unwrap_or(u32::MAX),
+                    })
+                },
+            )
+            .collect()
     }
 
     /// Rows this endpoint should (re-)drive: `pending` never sent, and
@@ -843,7 +886,8 @@ impl ExecStore {
     /// (`pending`/`inflight` — terminal rows freeze), unclaimed, expired or
     /// already this holder's, **and** the bound admits it: a `pending` row's
     /// first dispatch always lands, while an `inflight` row is re-drivable
-    /// only while `dispatch_attempts < max_dispatches` (ADR-033). Returns
+    /// only while `dispatch_attempts < max_dispatches` (ADR-033). The
+    /// attempt itself commits later, after the frame is written. Returns
     /// `false` when a fresh lease is held by another replica *or* the
     /// re-drive bound is exhausted; [`ExecStore::abandon_exhausted`] tells
     /// the two apart.
@@ -884,6 +928,27 @@ impl ExecStore {
             }
         }
         .map_err(QueueStoreError::from)
+    }
+
+    /// Commits one dispatch attempt after its frame was written. The lease
+    /// guard makes the commit idempotent-by-owner: a crash before this write
+    /// leaves the attempt unspent, while a frame that reached the transport
+    /// but not the row is conservatively re-driven at least once.
+    pub async fn commit_dispatch_attempt(
+        &self,
+        command_id: Uuid,
+        holder: &str,
+    ) -> Result<bool, QueueStoreError> {
+        let now = now_ms();
+        let affected = match self {
+            Self::Sqlite(pool) => {
+                crate::sqlite::commit_dispatch_attempt(pool, command_id, holder, now).await?
+            }
+            Self::Postgres(pool) => {
+                crate::postgres::commit_dispatch_attempt(pool, command_id, holder, now).await?
+            }
+        };
+        Ok(affected == 1)
     }
 
     /// Converges an `inflight` row whose re-drive bound is spent (ADR-033):

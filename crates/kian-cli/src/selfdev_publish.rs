@@ -1,5 +1,6 @@
-//! The publish port (SELF-EVOLUTION-MODEL §9.4): the conductor's one
-//! repository write, behind a port so the bundle never spawns git itself.
+//! The frozen publish port (SELF-EVOLUTION-MODEL §9.4): replay only. The
+//! conductor's one repository write, behind a port so the bundle never spawns
+//! git itself; a new plan cannot declare the retired publish action (ADR-084).
 //!
 //! Every git spawn goes through cron_worktree::git_command(), which scrubs the
 //! inherited GIT_* environment: a nested git otherwise writes to the caller's
