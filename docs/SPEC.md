@@ -1053,7 +1053,7 @@ The run's outcome rides one additive `evidence/verdict` with gate `run`, because
 driver — owns the session end.
 
 
-### Self-evolution (S1 landed, S2a landed, S2b specified)
+### Self-evolution (S1 landed, S2a landed, S2b landed)
 
 Scope: a committed failure becomes a reviewable proposal. A self-dev run is an ordinary job run
 whose subject is a verified evidence pack, and no run merges, deploys or holds a credential while
@@ -1067,7 +1067,7 @@ key on the admitted row. The normative contract is
 |-------|----------|--------|
 | S1 propose | `kian job run --pack <dir>` verifies the pack before admitting, the `job.selfdev` key, the `patch_paths_allowed` surface check, the `consecutive_failures` breaker, the proposal delivered as artifacts on the run | landed |
 | S2a publish-local | the conductor's `publish` step: one derived worktree and branch at the frozen base, the patch artifact applied and committed with the audit trailers, the configured scoped gates re-run inside the worktree — no credential | landed |
-| S2b publish-remote | one non-forced push of that branch and one pull request whose body carries the audit chain, with the credential read from the environment at publish time | specified, not implemented |
+| S2b publish-remote | one non-forced push of that branch and one pull request whose body carries the audit chain, with the credential read from the environment at publish time | landed |
 | S3 land | merge, tag, deploy, rollback — the owner's action | not designed |
 
 A symptom is packaged by `kian self evidence` (§3.1). A proposal's `succeeded` means "a reviewable
@@ -1081,7 +1081,7 @@ An agent step produces its artifact from the child's own stream: the final answe
 produces no artifact, and the step fails its artifact check instead of passing it.
 
 Publishing is a conductor action, not a general command: the `publish` step's sequence is fixed
-(worktree, apply, commit, gates, and in S2b one non-forced push and one pull request), every step
+(worktree, apply, commit, gates, one non-forced push and one pull request), every step
 leaves a receipt on the run stream, and a plan can ask for a publish but never for an arbitrary
 command ([design/JOB-MODEL.md](../design/JOB-MODEL.md) §13.5,
 [design/SELF-EVOLUTION-MODEL.md](../design/SELF-EVOLUTION-MODEL.md) §9.4).
@@ -1093,6 +1093,13 @@ configuration has no `selfdev.publish` section sees the step fail honestly with
 configuration — a plan cannot choose the evidence that judges its own proposal. A worktree already
 on disk, or an intent whose receipt was never written, settles the attempt `needs_operator`: the
 worktree stays as the evidence and the attempt is never retried.
+
+S2b carries that receipt to the code host: one non-forced push of `selfdev/<run_session>` and one
+pull request whose body carries the audit chain, with the credential read from
+`selfdev.publish.token_env` at publish time and exported only into those two child processes. A
+push that landed while its pull request failed settles `needs_operator` with the branch on the
+remote, and `kian job status <run>` renders `pushed` and the pull request URL alongside the
+commit.
 
 ### Deferred (unchanged)
 | Item | Reason |

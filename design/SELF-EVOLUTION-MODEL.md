@@ -352,16 +352,17 @@ worker act at all: it is the conductor's, bounded by §9.4 and one push-scoped c
 | Phase | A run may | A run may not |
 |---|---|---|
 | **S1 propose** (this contract) | read committed streams; read the pack; produce artifacts in a worker's scratch space; notify the owner | write a repository; push; open a pull request; hold a credential; deploy |
-| **S2a publish-local** (specified, not implemented) | create one derived worktree and branch; apply the patch artifact; commit with the audit trailers; re-run the configured scoped gates as a step | push; open a pull request; hold any credential; write `main`; merge; edit another run's branch |
-| **S2b publish-remote** (specified, not implemented) | push that branch once (never forced); open one pull request whose body carries the audit chain | force-push; write `main`; merge; edit another run's branch; read the credential from anything but the configured environment variable |
+| **S2a publish-local** (landed) | create one derived worktree and branch; apply the patch artifact; commit with the audit trailers; re-run the configured scoped gates as a step | push; open a pull request; hold any credential; write `main`; merge; edit another run's branch |
+| **S2b publish-remote** (landed) | push that branch once (never forced); open one pull request whose body carries the audit chain | force-push; write `main`; merge; edit another run's branch; read the credential from anything but the configured environment variable |
 | **S3 land** (not designed) | — | — |
 
 **S2's enabling amendment** is a conductor-owned `publish` step action (JOB-MODEL §7.2 and §13.5),
 not a general-purpose `exec`: the sequence — worktree, apply, commit, gates, push, pull request —
 is fixed, and every step leaves a receipt on the run stream (§9.4). S2a needs no credential at all;
 S2b adds the one-push credential, read from the environment at publish time and never carried in an
-argument or an event. ADR-071 records why the `exec` route was rejected. S2a does not exist until
-JOB-MODEL carries the action; S2b does not exist until the credential path lands.
+argument or an event. ADR-071 records why the `exec` route was rejected. The two phases are one
+fixed sequence behind one port: S2a is the five local steps and S2b adds the push and the pull
+request, with the credential the only thing that distinguishes them.
 
 **S3 is deliberately absent.** Landing — merge, tag, deploy, rollback — is the owner's action and
 needs its own ADR once S2 has produced real proposals. A self-dev run that could land would make the
@@ -488,11 +489,14 @@ Three properties fall out of the sequence rather than out of a lock:
   behind: a retry would find the path occupied and could never succeed. An operator who wants another
   attempt removes the path — an explicit act, not a retry.
 
-S2b extends steps 4–9 with `push` and `pull_request`: `git push <remote> HEAD:refs/heads/<branch>`
-(no `--force`, so an existing branch refuses), then `gh pr create --base <base> --head <branch>
---body-file <body>` whose body carries the audit chain (§11). The credential is read from
-`selfdev.publish.token_env` at publish time, exported only into those child processes, and never
-written to an argument or an event; its absence fails the step with `credential <name> is not set`.
+Steps 4–9 extend with `push` and `pull_request`: `git push <remote> HEAD:refs/heads/<branch>`
+(no `--force`, so an existing branch refuses), then `gh pr create --base <base> --head <branch>`,
+whose body carries the audit chain (§11). The credential is read from `selfdev.publish.token_env`
+at publish time, exported only into those two child processes — every other child runs with the
+variable removed — and never written to an argument or an event; its absence fails the step with
+`credential <name> is not set` before the worktree exists. A push that landed while its pull
+request failed is `Partial`: the attempt settles `needs_operator`, the branch stays on the remote,
+and no receipt is written.
 
 ### 9.5 The gate command
 
@@ -582,10 +586,10 @@ patch sha256 ──────────┘              │
 | A13 | check `patch_paths_allowed{artifact, allow, deny}` | a job-owned check in `verify` | the plan | the conductor's evaluator |
 | A14 | limit `consecutive_failures` | `u32`, default 3, at most 10 | the plan's `limits` | the manual trigger |
 | A15 | step action `publish` and its field `publish {base?, gates?, push?, pull_request?}` | a frozen plan shape; the field serializes only when present, so an existing plan's digest does not move | the plan | the conductor (dispatch), validation |
-| A16 | run-stream pair `tool/call` / `tool/result` with `tool: "job.publish"` | args `{step, attempt, from, base_commit, branch, worktree}`; result `{branch, worktree, commit, gate {command, exit_code, digest, output_tail}}`, plus `push` / `pull_request` in S2b | the conductor | the `publish_ok` check, the status projection |
+| A16 | run-stream pair `tool/call` / `tool/result` with `tool: "job.publish"` | args `{step, attempt, from, base_commit, branch, worktree}`; result `{branch, worktree, commit, gate {command, exit_code, digest, output_tail}, push {remote, ref}, pull_request {base, head, url?}}` — the last two only when the plan asked for them | the conductor | the `publish_ok` check, the status projection |
 | A17 | check `publish_ok` | a job-owned check in `verify` | the plan | the conductor's evaluator |
 | A18 | config `selfdev.publish` | `{repo, base, remote, gate, target_dir, author {name, email}, token_env}`; absent means the step fails honestly | the operator | the publish port |
-| A19 | S2b remote fields | `push`, `pull_request` and the credential's environment variable name; no new route and no new verb | the plan, the config | the publish port |
+| A19 | the remote half of the receipt | `push {remote, ref}`, `pull_request {base, head, url?}` and the credential's environment variable name; no new route and no new verb | the plan, the config | the publish port |
 
 Not added, explicitly: no event kind, no table, no HTTP route, no JSON-RPC method, no SSE frame, no
 new crate in the narrow waist, and no change to a job verdict's shared shape. The publish pair uses
@@ -662,10 +666,16 @@ Acceptance, by level:
 
 ### S2b — publish-remote
 
-Acceptance is deferred until the credential path exists: with a local bare remote and a stub `gh`,
-one non-forced push creates the branch, a second attempt on the same branch refuses, the pull
-request body carries the audit chain, and no other step can read the credential. Until then S2b is a
-declaration in §7 and the `push` / `pull_request` fields are inert.
+Acceptance, by level:
+
+* **L1** — `publish_ok` refuses a receipt that carries no push, names a foreign ref or a foreign
+  head; a missing credential fails the step before the worktree exists.
+* **L2** — against a temporary repository with a local bare remote and a stub `gh`: one non-forced
+  push creates the branch, a second attempt on the same branch refuses, the pull request body
+  carries the audit chain, and only the push and the pull request child processes see the
+  credential.
+* **L3** — one real publish against the operator's remote and an authenticated `gh`; the local
+  acceptance uses a bare remote and a stub.
 
 ### S3 — land
 
@@ -686,8 +696,9 @@ an enforcement point:
   (§6.2) — a deployment that grants such a tool has weakened SE4 in configuration;
 * a failed publish leaves its worktree and branch behind, because the run never deletes a directory
   it did not create in the current attempt (§9.4): the operator's cleanup is the price of the rule;
-* S2a produces a commit that was never pushed. It is reviewable from the local checkout — the branch
-  and the worktree are the proposal — but nothing outside this machine has seen it until S2b.
+* a push that landed while its pull request failed leaves the branch on the remote: the attempt
+  settles `needs_operator` (§12), because the run never force-pushes or reuses a branch, and the
+  operator either opens the pull request by hand or deletes the branch.
 
 Open questions, each with the fact that would answer it:
 

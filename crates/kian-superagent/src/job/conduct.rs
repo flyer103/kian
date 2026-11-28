@@ -236,6 +236,27 @@ pub struct GateReceipt {
     pub output_tail: String,
 }
 
+/// One push's receipt (§9.4 step 8, A16): the remote and the ref it now
+/// holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushReceipt {
+    /// The configured remote name.
+    pub remote: String,
+    /// The ref the push created: refs/heads/<branch>.
+    pub reference: String,
+}
+
+/// One pull request's receipt (§9.4 step 8, A16).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestReceipt {
+    /// The branch the pull request targets.
+    pub base: String,
+    /// The branch it comes from.
+    pub head: String,
+    /// The URL the tool printed, when it printed one.
+    pub url: Option<String>,
+}
+
 /// The receipt of one publish (§9.4 step 9, A16).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishReceipt {
@@ -247,6 +268,10 @@ pub struct PublishReceipt {
     pub worktree: String,
     /// The gate run, when `publish.gates` is true.
     pub gate: Option<GateReceipt>,
+    /// The push of the branch, when `publish.push` is true.
+    pub push: Option<PushReceipt>,
+    /// The pull request, when `publish.pull_request` is true.
+    pub pull_request: Option<PullRequestReceipt>,
 }
 
 /// Why a publish produced no receipt (§9.4).
@@ -263,6 +288,10 @@ pub enum PublishError {
     /// The sequence started and its end is unknown (a gate that outlived its
     /// bound): an operator has to look.
     Unknown(String),
+    /// A write landed and its intended end did not: the branch is on the
+    /// remote but the pull request failed, so only an operator can finish it
+    /// (§12).
+    Partial(String),
     /// The sequence failed; the detail says how far it got.
     Failed(String),
 }
@@ -276,6 +305,7 @@ impl PublishError {
             Self::Unavailable(detail)
             | Self::Occupied(detail)
             | Self::Unknown(detail)
+            | Self::Partial(detail)
             | Self::Failed(detail) => detail.clone(),
         }
     }
@@ -284,7 +314,9 @@ impl PublishError {
     #[must_use]
     pub fn outcome(&self) -> AttemptOutcome {
         match self {
-            Self::Occupied(_) | Self::Unknown(_) => AttemptOutcome::NeedsOperator,
+            Self::Occupied(_) | Self::Unknown(_) | Self::Partial(_) => {
+                AttemptOutcome::NeedsOperator
+            }
             Self::NotConfigured | Self::Unavailable(_) | Self::Failed(_) => AttemptOutcome::Failed,
         }
     }
@@ -1829,7 +1861,13 @@ async fn execute_publish(
     let result = match deps.publish.publish(request).await {
         Ok(receipt) => {
             let receipt = receipt_json(&receipt);
-            let verdict = publish_receipt_ok(&receipt, &branch, publish.gates);
+            let verdict = publish_receipt_ok(
+                &receipt,
+                &branch,
+                publish.gates,
+                publish.push,
+                publish.pull_request,
+            );
             let ok = verdict.is_ok();
             let mut result = json!({ "call_id": call_id, "ok": ok, "result": receipt });
             if let Err(detail) = verdict {
@@ -1841,7 +1879,10 @@ async fn execute_publish(
             "call_id": call_id,
             "ok": false,
             "error": err.detail(),
-            "needs_operator": matches!(err, PublishError::Occupied(_) | PublishError::Unknown(_)),
+            "needs_operator": matches!(
+                err,
+                PublishError::Occupied(_) | PublishError::Unknown(_) | PublishError::Partial(_)
+            ),
         }),
     };
     if let Err(err) = port.emit(EventKind::ToolResult, result.clone()).await {
@@ -1879,8 +1920,11 @@ async fn settle_publish(
     result: &Value,
     branch: &str,
 ) -> Tick {
-    let gates = step.publish().is_none_or(|publish| publish.gates);
-    let mut checks = vec![check_publish_ok(result, branch, gates)];
+    let publish = step.publish();
+    let gates = publish.is_none_or(|publish| publish.gates);
+    let push = publish.is_some_and(|publish| publish.push);
+    let pull_request = publish.is_some_and(|publish| publish.pull_request);
+    let mut checks = vec![check_publish_ok(result, branch, gates, push, pull_request)];
     for check in &step.verify {
         if matches!(check, JobCheck::PublishOk) {
             continue;
@@ -1913,10 +1957,17 @@ async fn settle_publish(
     settle_step(port, step, attempt, gate, outcome).await
 }
 
-/// Judge one publish receipt (§9.4): a full commit, the derived branch, and a
-/// gate that exited zero when the plan asked for one.
+/// Judge one publish receipt (§9.4): a full commit, the derived branch, a gate
+/// that exited zero when the plan asked for one, and, when the plan asked for
+/// them, the push of that branch and one pull request from it.
 #[must_use]
-pub fn check_publish_ok(result: &Value, branch: &str, gates: bool) -> CheckOutcome {
+pub fn check_publish_ok(
+    result: &Value,
+    branch: &str,
+    gates: bool,
+    push: bool,
+    pull_request: bool,
+) -> CheckOutcome {
     let fail = |detail: String| CheckOutcome {
         name: PUBLISH_CHECK.to_string(),
         passed: false,
@@ -1959,6 +2010,39 @@ pub fn check_publish_ok(result: &Value, branch: &str, gates: bool) -> CheckOutco
             return fail(format!("the gate exited {code}, not 0"));
         }
     }
+    if push {
+        let Some(pushed) = receipt.get("push") else {
+            return fail(
+                "the receipt carries no push: the branch never left this machine".to_string(),
+            );
+        };
+        let expected = format!("refs/heads/{branch}");
+        let reference = pushed
+            .get("ref")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if reference != expected {
+            return fail(format!(
+                "the receipt names ref {reference:?}, not the pushed {expected:?}"
+            ));
+        }
+    }
+    if pull_request {
+        let Some(request) = receipt.get("pull_request") else {
+            return fail(
+                "the receipt carries no pull request: none was opened for the branch".to_string(),
+            );
+        };
+        let head = request
+            .get("head")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if head != branch {
+            return fail(format!(
+                "the pull request names head {head:?}, not the pushed {branch:?}"
+            ));
+        }
+    }
     CheckOutcome {
         name: PUBLISH_CHECK.to_string(),
         passed: true,
@@ -1966,9 +2050,15 @@ pub fn check_publish_ok(result: &Value, branch: &str, gates: bool) -> CheckOutco
     }
 }
 
-fn publish_receipt_ok(receipt: &Value, branch: &str, gates: bool) -> Result<(), String> {
+fn publish_receipt_ok(
+    receipt: &Value,
+    branch: &str,
+    gates: bool,
+    push: bool,
+    pull_request: bool,
+) -> Result<(), String> {
     let wrapped = json!({ "ok": true, "result": receipt });
-    let outcome = check_publish_ok(&wrapped, branch, gates);
+    let outcome = check_publish_ok(&wrapped, branch, gates, push, pull_request);
     if outcome.passed {
         Ok(())
     } else {
@@ -1995,6 +2085,16 @@ fn receipt_json(receipt: &PublishReceipt) -> Value {
             "digest": &gate.digest,
             "output_tail": &gate.output_tail,
         });
+    }
+    if let Some(push) = &receipt.push {
+        value["push"] = json!({"remote": &push.remote, "ref": &push.reference});
+    }
+    if let Some(request) = &receipt.pull_request {
+        let mut pr = json!({"base": &request.base, "head": &request.head});
+        if let Some(url) = &request.url {
+            pr["url"] = Value::String(url.clone());
+        }
+        value["pull_request"] = pr;
     }
     value
 }

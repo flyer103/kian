@@ -17,7 +17,9 @@ use futures::future::BoxFuture;
 use kian_core::model::SessionId;
 use kian_superagent::job::conduct::{
     GateReceipt, PublishError, PublishPort, PublishReceipt, PublishRequest, PublishTargets,
+    PullRequestReceipt, PushReceipt,
 };
+use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 
 use crate::config::SelfdevPublishSection;
@@ -31,21 +33,27 @@ pub(crate) const OUTPUT_TAIL_BYTES: usize = 4096;
 /// The git-backed publish port.
 pub(crate) struct GitPublishPort {
     repo: PathBuf,
+    remote: String,
     gate: String,
     target_dir: Option<PathBuf>,
     author: Option<(String, String)>,
+    token_env: Option<String>,
+    gh: PathBuf,
 }
 
 impl GitPublishPort {
     pub(crate) fn from_config(publish: &SelfdevPublishSection) -> Self {
         Self {
             repo: PathBuf::from(&publish.repo),
+            remote: publish.remote.clone(),
             gate: publish.gate.clone(),
             target_dir: publish.target_dir.as_ref().map(PathBuf::from),
             author: publish
                 .author
                 .as_ref()
                 .map(|author| (author.name.clone(), author.email.clone())),
+            token_env: publish.token_env.clone(),
+            gh: PathBuf::from("gh"),
         }
     }
 }
@@ -67,10 +75,24 @@ impl PublishPort for GitPublishPort {
         request: PublishRequest,
     ) -> BoxFuture<'static, Result<PublishReceipt, PublishError>> {
         let repo = self.repo.clone();
+        let remote = self.remote.clone();
         let gate = self.gate.clone();
         let target_dir = self.target_dir.clone();
         let author = self.author.clone();
+        let token_env = self.token_env.clone();
+        let gh = self.gh.clone();
         Box::pin(async move {
+            let credential = match &token_env {
+                Some(name) if request.push => match std::env::var(name) {
+                    Ok(value) => Some((name.clone(), value)),
+                    Err(_) => {
+                        return Err(PublishError::Failed(format!(
+                            "credential {name} is not set"
+                        )));
+                    }
+                },
+                _ => None,
+            };
             let worktree = PathBuf::from(&request.worktree);
             if worktree.exists() {
                 return Err(PublishError::Occupied(format!(
@@ -86,31 +108,47 @@ impl PublishPort for GitPublishPort {
                     parent.display()
                 )));
             }
-            run_publish(
-                &repo,
-                &worktree,
-                &gate,
-                target_dir.as_deref(),
-                author.as_ref(),
-                request,
-            )
-            .await
+            let context = PublishContext {
+                repo: &repo,
+                remote: &remote,
+                gate: &gate,
+                target_dir: target_dir.as_deref(),
+                author: author.as_ref(),
+                credential: credential.as_ref(),
+                strip: token_env.as_deref(),
+                gh: &gh,
+            };
+            run_publish(&context, request).await
         })
     }
 }
 
+/// Everything a publish sequence reads from configuration, plus the credential
+/// resolved for this attempt: only the push and the pull request see it, every
+/// other child has the variable removed (§9.4).
+struct PublishContext<'a> {
+    repo: &'a Path,
+    remote: &'a str,
+    gate: &'a str,
+    target_dir: Option<&'a Path>,
+    author: Option<&'a (String, String)>,
+    credential: Option<&'a (String, String)>,
+    strip: Option<&'a str>,
+    gh: &'a Path,
+}
+
 /// Steps 6–8 of §9.4 in order: the worktree on the frozen base, the applied
-/// patch, the commit, then the gate. A failure names how far it got.
+/// patch, the commit, the gate, then the one push and the one pull request. A
+/// failure names how far it got.
 async fn run_publish(
-    repo: &Path,
-    worktree: &Path,
-    gate: &str,
-    target_dir: Option<&Path>,
-    author: Option<&(String, String)>,
+    context: &PublishContext<'_>,
     request: PublishRequest,
 ) -> Result<PublishReceipt, PublishError> {
+    let worktree_path = PathBuf::from(&request.worktree);
+    let worktree = worktree_path.as_path();
+    let strip = context.strip;
     git_ok(
-        repo,
+        context.repo,
         &[
             "worktree",
             "add",
@@ -119,17 +157,18 @@ async fn run_publish(
             &request.worktree,
             &request.base_commit,
         ],
+        strip,
     )
     .await
     .map_err(|err| PublishError::Failed(format!("git worktree add failed: {err}")))?;
-    apply_patch(worktree, &request.patch)
+    apply_patch(worktree, &request.patch, strip)
         .await
         .map_err(|err| PublishError::Failed(format!("the patch does not apply: {err}")))?;
-    let commit = commit_patch(worktree, &request, author)
+    let commit = commit_patch(worktree, &request, context.author, strip)
         .await
         .map_err(|err| PublishError::Failed(format!("the commit failed: {err}")))?;
     let gate_receipt = if request.gates {
-        match run_gate(worktree, gate, target_dir).await {
+        match run_gate(worktree, context.gate, context.target_dir, strip).await {
             Ok(receipt) => Some(receipt),
             Err(err) => {
                 return Err(match err {
@@ -144,15 +183,221 @@ async fn run_publish(
     } else {
         None
     };
+    let gate_ok = gate_receipt
+        .as_ref()
+        .is_none_or(|receipt| receipt.exit_code == 0);
+    let push = if request.push && gate_ok {
+        Some(
+            push_branch(
+                worktree,
+                context.remote,
+                &request.branch,
+                context.credential,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let pull_request = if request.pull_request && push.is_some() {
+        Some(open_pull_request(worktree, context, &request, &commit).await?)
+    } else {
+        None
+    };
     Ok(PublishReceipt {
         commit,
         branch: request.branch,
         worktree: request.worktree,
         gate: gate_receipt,
+        push,
+        pull_request,
     })
 }
 
-async fn apply_patch(worktree: &Path, patch: &str) -> Result<(), String> {
+/// Push the branch once, never forced (§9.4): an existing branch refuses the
+/// push, which is exactly the rule.
+async fn push_branch(
+    worktree: &Path,
+    remote: &str,
+    branch: &str,
+    credential: Option<&(String, String)>,
+) -> Result<PushReceipt, PublishError> {
+    let reference = format!("refs/heads/{branch}");
+    let target = format!("HEAD:{reference}");
+    let mut command = tokio::process::Command::from(crate::cron_worktree::git_command());
+    command
+        .arg("-C")
+        .arg(worktree)
+        .args(["push", remote, target.as_str()])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some((name, value)) = credential {
+        command.env(name, value);
+    }
+    let output = command
+        .output()
+        .await
+        .map_err(|err| PublishError::Failed(format!("cannot run git push: {err}")))?;
+    if !output.status.success() {
+        return Err(PublishError::Failed(format!(
+            "the push was refused: {}",
+            tail_text(&output.stderr)
+        )));
+    }
+    Ok(PushReceipt {
+        remote: remote.to_string(),
+        reference,
+    })
+}
+
+/// Open one pull request from the pushed branch (§9.4). The push already
+/// landed, so any failure here is partial: an operator has to finish or undo
+/// it (§12).
+async fn open_pull_request(
+    worktree: &Path,
+    context: &PublishContext<'_>,
+    request: &PublishRequest,
+    commit: &str,
+) -> Result<PullRequestReceipt, PublishError> {
+    let partial = |detail: String| {
+        PublishError::Partial(format!(
+            "the branch {} is on {} at {commit}, but {detail}",
+            request.branch, context.remote
+        ))
+    };
+    let mut command = tokio::process::Command::new(context.gh);
+    command
+        .current_dir(worktree)
+        .args([
+            "pr",
+            "create",
+            "--base",
+            &request.base,
+            "--head",
+            &request.branch,
+            "--body-file",
+            "-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if let Some((name, value)) = context.credential {
+        command.env(name, value);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|err| partial(format!("the pull request tool could not start: {err}")))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| partial("the pull request tool opened no stdin".to_string()))?;
+    let body = pull_request_body(request);
+    stdin
+        .write_all(body.as_bytes())
+        .await
+        .map_err(|err| partial(format!("the pull request body could not be written: {err}")))?;
+    drop(stdin);
+    let waited = tokio::time::timeout(
+        Duration::from_millis(GATE_TIMEOUT_MS),
+        child.wait_with_output(),
+    )
+    .await;
+    let output = match waited {
+        Ok(Ok(output)) => output,
+        Ok(Err(err)) => {
+            return Err(partial(format!(
+                "the pull request output could not be read: {err}"
+            )));
+        }
+        Err(_) => {
+            return Err(partial(format!(
+                "the pull request did not finish within {GATE_TIMEOUT_MS} ms"
+            )));
+        }
+    };
+    if !output.status.success() {
+        return Err(partial(format!(
+            "the pull request failed: {}",
+            tail_text(&output.stderr)
+        )));
+    }
+    let url = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .rev()
+        .find(|line| line.trim().starts_with("http"))
+        .map(|line| line.trim().to_string());
+    Ok(PullRequestReceipt {
+        base: request.base.clone(),
+        head: request.branch.clone(),
+        url,
+    })
+}
+
+/// The body carries the audit chain (§11): the run, its plan digest, the
+/// artifact and the pack, then the trailers the commit already holds.
+fn pull_request_body(request: &PublishRequest) -> String {
+    let field = |key: &str| {
+        request
+            .from
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let bytes = request
+        .from
+        .get("bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let trailer = |key: &str| {
+        request
+            .trailers
+            .iter()
+            .find(|(name, _)| name == key)
+            .map_or_else(String::new, |(_, value)| value.clone())
+    };
+    let mut body = format!(
+        "The proposal from {} ({}).
+
+- artifact: {} from step {}, {} bytes
+- base commit: {}
+- branch: {}
+
+The commit carries the audit chain:
+
+",
+        trailer("Kian-Run"),
+        trailer("Kian-Plan-Digest"),
+        field("name"),
+        field("step"),
+        bytes,
+        request.base_commit,
+        request.branch,
+    );
+    for (key, value) in &request.trailers {
+        body.push_str(&format!(
+            "- {key}: {value}
+"
+        ));
+    }
+    body.push_str(
+        "
+This is a proposal for review; the runtime does not merge it.
+",
+    );
+    body
+}
+
+fn strip_credential(command: &mut tokio::process::Command, strip: Option<&str>) {
+    if let Some(name) = strip {
+        command.env_remove(name);
+    }
+}
+
+async fn apply_patch(worktree: &Path, patch: &str, strip: Option<&str>) -> Result<(), String> {
     let mut command = tokio::process::Command::from(crate::cron_worktree::git_command());
     command
         .arg("-C")
@@ -162,6 +407,7 @@ async fn apply_patch(worktree: &Path, patch: &str) -> Result<(), String> {
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+    strip_credential(&mut command, strip);
     let mut child = command
         .spawn()
         .map_err(|err| format!("cannot run git apply: {err}"))?;
@@ -189,6 +435,7 @@ async fn commit_patch(
     worktree: &Path,
     request: &PublishRequest,
     author: Option<&(String, String)>,
+    strip: Option<&str>,
 ) -> Result<String, String> {
     let trailers = request
         .trailers
@@ -211,6 +458,7 @@ async fn commit_patch(
         .arg(&trailers)
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null());
+    strip_credential(&mut command, strip);
     let output = command
         .output()
         .await
@@ -218,7 +466,7 @@ async fn commit_patch(
     if !output.status.success() {
         return Err(tail_text(&output.stderr));
     }
-    let head = git_output(worktree, &["rev-parse", "HEAD"]).await?;
+    let head = git_output(worktree, &["rev-parse", "HEAD"], strip).await?;
     if !head.status.success() {
         return Err(tail_text(&head.stderr));
     }
@@ -229,6 +477,7 @@ async fn run_gate(
     worktree: &Path,
     gate: &str,
     target_dir: Option<&Path>,
+    strip: Option<&str>,
 ) -> Result<GateReceipt, PublishError> {
     let mut command = tokio::process::Command::new("sh");
     command
@@ -243,6 +492,7 @@ async fn run_gate(
     if let Some(dir) = target_dir {
         command.env("CARGO_TARGET_DIR", dir);
     }
+    strip_credential(&mut command, strip);
     let child = command
         .spawn()
         .map_err(|err| PublishError::Unknown(format!("the gate could not start: {err}")))?;
@@ -274,8 +524,8 @@ async fn run_gate(
     })
 }
 
-async fn git_ok(dir: &Path, args: &[&str]) -> Result<(), String> {
-    let output = git_output(dir, args).await?;
+async fn git_ok(dir: &Path, args: &[&str], strip: Option<&str>) -> Result<(), String> {
+    let output = git_output(dir, args, strip).await?;
     if output.status.success() {
         Ok(())
     } else {
@@ -287,7 +537,11 @@ async fn git_ok(dir: &Path, args: &[&str]) -> Result<(), String> {
     }
 }
 
-async fn git_output(dir: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+async fn git_output(
+    dir: &Path,
+    args: &[&str],
+    strip: Option<&str>,
+) -> Result<std::process::Output, String> {
     let mut command = tokio::process::Command::from(crate::cron_worktree::git_command());
     command
         .arg("-C")
@@ -297,6 +551,7 @@ async fn git_output(dir: &Path, args: &[&str]) -> Result<std::process::Output, S
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    strip_credential(&mut command, strip);
     command
         .output()
         .await
@@ -345,12 +600,59 @@ mod tests {
     }
 
     fn port(repo: &Path, gate: &str) -> GitPublishPort {
+        port_with(repo, gate, "origin", None, PathBuf::from("gh"))
+    }
+
+    fn port_with(
+        repo: &Path,
+        gate: &str,
+        remote: &str,
+        token_env: Option<&str>,
+        gh: PathBuf,
+    ) -> GitPublishPort {
         GitPublishPort {
             repo: repo.to_path_buf(),
+            remote: remote.to_string(),
             gate: gate.to_string(),
             target_dir: None,
             author: Some(("Kian Test".to_string(), "test@kian.dev".to_string())),
+            token_env: token_env.map(str::to_string),
+            gh,
         }
+    }
+
+    fn temp_remote(name: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "kian-publish-remote-{name}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&base).expect("the bare remote");
+        git(&base, &["init", "-q", "--bare"]);
+        base
+    }
+
+    fn stub_gh(dir: &Path) -> PathBuf {
+        let script = format!(
+            "#!/bin/sh
+set -eu
+printf '%s\n' \"$@\" > {}
+cat > {}
+env > {}
+echo https://example.test/pr/1
+",
+            dir.join("args.txt").display(),
+            dir.join("body.txt").display(),
+            dir.join("gh-env.txt").display(),
+        );
+        let path = dir.join("gh");
+        std::fs::write(&path, script).expect("the stub");
+        let status = std::process::Command::new("chmod")
+            .arg("+x")
+            .arg(&path)
+            .status()
+            .expect("chmod runs");
+        assert!(status.success(), "the stub is executable");
+        path
     }
 
     const DIFF: &str = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n";
@@ -489,5 +791,258 @@ mod tests {
             .await
             .expect("the sequence finished");
         assert!(receipt.gate.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_pushed_branch_arrives_on_the_remote_once() {
+        let repo = temp_repo("push");
+        let remote = temp_remote("push");
+        let run = SessionId(uuid::Uuid::new_v4());
+        let port = port_with(
+            &repo,
+            "sh gate.sh",
+            &remote.display().to_string(),
+            None,
+            PathBuf::from("gh"),
+        );
+        let targets = port.derive(run).expect("paths");
+        let mut request = request(run, &repo, &targets.worktree, DIFF, true);
+        request.push = true;
+        let receipt = port.publish(request).await.expect("the publish succeeds");
+
+        let pushed = receipt.push.expect("a push receipt");
+        assert_eq!(pushed.remote, remote.display().to_string());
+        assert_eq!(pushed.reference, format!("refs/heads/{}", receipt.branch));
+        assert_eq!(
+            git(&remote, &["rev-parse", &pushed.reference]),
+            receipt.commit,
+            "the remote branch is the published commit"
+        );
+        assert!(receipt.pull_request.is_none(), "no pull request was asked");
+    }
+
+    #[tokio::test]
+    async fn a_second_publish_on_the_same_branch_is_refused() {
+        let repo = temp_repo("refuse");
+        let remote = temp_remote("refuse");
+        let run = SessionId(uuid::Uuid::new_v4());
+        let remote_path = remote.display().to_string();
+        let port = port_with(&repo, "sh gate.sh", &remote_path, None, PathBuf::from("gh"));
+        let targets = port.derive(run).expect("paths");
+        let mut first_request = request(run, &repo, &targets.worktree, DIFF, true);
+        first_request.push = true;
+        let first = port
+            .publish(first_request)
+            .await
+            .expect("the first push succeeds");
+        let reference = first.push.expect("a push receipt").reference;
+
+        let second_worktree = format!("{}-second", targets.worktree);
+        let mut second_request = request(run, &repo, &second_worktree, DIFF, true);
+        second_request.push = true;
+        let error = port
+            .publish(second_request)
+            .await
+            .expect_err("the existing branch refuses the attempt");
+        match error {
+            PublishError::Failed(detail) => {
+                assert!(detail.contains("already exists"), "{detail}");
+            }
+            other => panic!("an existing branch refuses the attempt: {other:?}"),
+        }
+        assert_eq!(
+            git(&remote, &["rev-parse", &reference]),
+            first.commit,
+            "the refusal left the remote branch where it was"
+        );
+        assert!(
+            !PathBuf::from(&second_worktree).exists(),
+            "the branch check fails before a second worktree is written"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_diverged_branch_is_never_force_pushed() {
+        let repo = temp_repo("diverge");
+        let remote = temp_remote("diverge");
+        let run = SessionId(uuid::Uuid::new_v4());
+        let remote_path = remote.display().to_string();
+        let port = port_with(&repo, "sh gate.sh", &remote_path, None, PathBuf::from("gh"));
+        let targets = port.derive(run).expect("paths");
+        let mut first_request = request(run, &repo, &targets.worktree, DIFF, true);
+        first_request.push = true;
+        let first = port
+            .publish(first_request)
+            .await
+            .expect("the first push succeeds");
+        let reference = first
+            .push
+            .as_ref()
+            .expect("a push receipt")
+            .reference
+            .clone();
+        let worktree = PathBuf::from(&targets.worktree);
+        std::fs::write(worktree.join("src/later.rs"), "// a later edit\n").expect("the edit");
+        git(&worktree, &["add", "src/later.rs"]);
+        git(&worktree, &["commit", "--amend", "--no-edit"]);
+
+        let error = push_branch(&worktree, &remote_path, &first.branch, None)
+            .await
+            .expect_err("a rewritten history is refused");
+        match error {
+            PublishError::Failed(detail) => {
+                assert!(detail.contains("push was refused"), "{detail}");
+            }
+            other => panic!("a refused push is a failure: {other:?}"),
+        }
+        assert_eq!(
+            git(&remote, &["rev-parse", &reference]),
+            first.commit,
+            "the push never rewrites the remote branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pull_request_body_carries_the_audit_chain() {
+        let repo = temp_repo("pr");
+        let remote = temp_remote("pr");
+        let audit = repo.join("audit");
+        std::fs::create_dir_all(&audit).expect("the audit dir");
+        let gh = stub_gh(&audit);
+        let run = SessionId(uuid::Uuid::new_v4());
+        let port = port_with(&repo, "sh gate.sh", &remote.display().to_string(), None, gh);
+        let targets = port.derive(run).expect("paths");
+        let mut request = request(run, &repo, &targets.worktree, DIFF, true);
+        request.push = true;
+        request.pull_request = true;
+        request.trailers = vec![
+            ("Kian-Run".to_string(), "self-dev@manual:T1".to_string()),
+            ("Kian-Plan-Digest".to_string(), "sha256:aa".to_string()),
+            ("Kian-Patch-Sha256".to_string(), "sha256:bb".to_string()),
+            ("Kian-Pack".to_string(), "sha256:cc".to_string()),
+        ];
+        let receipt = port.publish(request).await.expect("the publish succeeds");
+
+        let pull_request = receipt.pull_request.expect("a pull request receipt");
+        assert_eq!(pull_request.base, "main");
+        assert_eq!(pull_request.head, receipt.branch);
+        assert_eq!(
+            pull_request.url.as_deref(),
+            Some("https://example.test/pr/1")
+        );
+        let body = std::fs::read_to_string(audit.join("body.txt")).expect("the body");
+        for line in [
+            "Kian-Run: self-dev@manual:T1",
+            "Kian-Plan-Digest: sha256:aa",
+            "Kian-Patch-Sha256: sha256:bb",
+            "Kian-Pack: sha256:cc",
+        ] {
+            assert!(body.contains(line), "{body}");
+        }
+        assert!(body.contains("does not merge it"), "{body}");
+        let args = std::fs::read_to_string(audit.join("args.txt")).expect("the args");
+        let args: Vec<&str> = args.lines().collect();
+        assert!(args.contains(&"pr") && args.contains(&"create"), "{args:?}");
+        assert!(args.contains(&"--base"), "{args:?}");
+        assert!(args.contains(&"main"), "{args:?}");
+        assert!(args.contains(&"--head"), "{args:?}");
+        assert!(args.contains(&receipt.branch.as_str()), "{args:?}");
+    }
+
+    #[tokio::test]
+    async fn only_the_push_and_the_pull_request_see_the_credential() {
+        let repo = temp_repo("credential");
+        let remote = temp_remote("credential");
+        let audit = repo.join("audit");
+        std::fs::create_dir_all(&audit).expect("the audit dir");
+        let gh = stub_gh(&audit);
+        let gate_env = audit.join("gate-env.txt");
+        let gate = format!("env > {}", gate_env.display());
+        let name = format!("KIAN_TEST_TOKEN_{}", uuid::Uuid::new_v4().simple());
+        // SAFETY: the name is unique to this test and no other test reads it.
+        unsafe { std::env::set_var(&name, "s3cret") };
+        let run = SessionId(uuid::Uuid::new_v4());
+        let port = port_with(&repo, &gate, &remote.display().to_string(), Some(&name), gh);
+        let targets = port.derive(run).expect("paths");
+        let mut first_request = request(run, &repo, &targets.worktree, DIFF, true);
+        first_request.push = true;
+        first_request.pull_request = true;
+        let receipt = port
+            .publish(first_request)
+            .await
+            .expect("the publish succeeds");
+        // SAFETY: same unique name.
+        unsafe { std::env::remove_var(&name) };
+
+        assert!(receipt.push.is_some());
+        let gate_env = std::fs::read_to_string(&gate_env).expect("the gate env");
+        assert!(
+            !gate_env.contains("s3cret"),
+            "the gate must not see the credential"
+        );
+        let gh_env = std::fs::read_to_string(audit.join("gh-env.txt")).expect("the gh env");
+        assert!(
+            gh_env.contains("s3cret"),
+            "the pull request tool is one of the two children that see it"
+        );
+
+        let second = SessionId(uuid::Uuid::new_v4());
+        let second_gate_env = audit.join("gates-only-env.txt");
+        let second_gate = format!("env > {}", second_gate_env.display());
+        // SAFETY: same unique name, no concurrent reader.
+        unsafe { std::env::set_var(&name, "s3cret") };
+        let port = port_with(
+            &repo,
+            &second_gate,
+            &remote.display().to_string(),
+            Some(&name),
+            audit.join("gh"),
+        );
+        let targets = port.derive(second).expect("paths");
+        let second_request = request(second, &repo, &targets.worktree, DIFF, true);
+        port.publish(second_request)
+            .await
+            .expect("the publish succeeds");
+        // SAFETY: same unique name.
+        unsafe { std::env::remove_var(&name) };
+        let env = std::fs::read_to_string(&second_gate_env).expect("the gate env");
+        assert!(
+            !env.contains("s3cret"),
+            "a gates-only publish strips the variable too"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_credential_fails_before_the_worktree() {
+        let repo = temp_repo("nocredential");
+        let name = format!("KIAN_MISSING_{}", uuid::Uuid::new_v4().simple());
+        let run = SessionId(uuid::Uuid::new_v4());
+        let port = port_with(
+            &repo,
+            "sh gate.sh",
+            "origin",
+            Some(&name),
+            PathBuf::from("gh"),
+        );
+        let targets = port.derive(run).expect("paths");
+        let mut request = request(run, &repo, &targets.worktree, DIFF, true);
+        request.push = true;
+        let error = port
+            .publish(request)
+            .await
+            .expect_err("the credential is absent");
+        match error {
+            PublishError::Failed(detail) => {
+                assert!(
+                    detail.contains(&format!("credential {name} is not set")),
+                    "{detail}"
+                );
+            }
+            other => panic!("a missing credential is a failure: {other:?}"),
+        }
+        assert!(
+            !PathBuf::from(&targets.worktree).exists(),
+            "nothing is written before the credential is known"
+        );
     }
 }

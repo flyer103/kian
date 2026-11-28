@@ -8,6 +8,17 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Self-evolution S2b: the branch is pushed once and reviewed as a pull request
+  (`design/SELF-EVOLUTION-MODEL.md` §9.4, §16, ADR-071).** A `publish` step with `push: true`
+  pushes `selfdev/<run_session>` to `selfdev.publish.remote` once and never forces it, so an
+  existing branch refuses the second push, and `pull_request: true` opens one pull request against
+  `selfdev.publish.base` whose body carries the artifact, the frozen base commit and the `Kian-*`
+  audit trailers. The receipt gains `push {remote, ref}` and `pull_request {base, head, url}`, which
+  `publish_ok` checks against the plan and `kian job status <run>` renders. The token named by
+  `selfdev.publish.token_env` is read at publish time and exported only into the push and
+  `gh pr create` children; a missing variable fails the step before any worktree exists, and a push
+  that landed while the pull request failed settles `needs_operator` with the branch left on the
+  remote.
 - **Self-evolution S2a: the publish step lands (`design/SELF-EVOLUTION-MODEL.md` §9.4–§9.5,
   `design/JOB-MODEL.md` §7.2, §13.5, ADR-071).** A plan's `publish` step now derives
   `selfdev/<run_session>` and its worktree from the frozen `job.selfdev.base_commit`, re-reads
@@ -48,9 +59,8 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
   commit with audit trailers, run the configured gate, and record one
   `job:publish:<step>:<attempt>` receipt — so a plan never names a program. The authority splits
   where the credential appears: S2a publish-local holds none, S2b adds one non-forced push and one
-  pull request with the token read from `selfdev.publish.token_env` at push time. Specification
-  only in that change: the action, the `publish_ok` check, the receipt and the gate configuration
-  land with S2a below; S2b remains specified.
+  pull request with the token read from `selfdev.publish.token_env` at push time. S2a landed the
+  local half; S2b followed with the push and the pull request (below).
 - **Job artifacts: a step's artifact is its child's final message
   (`design/JOB-MODEL.md` §12.1).** The conductor derives the ref, `bytes` and `sha256` from the
   producer's last `assistant/message` that carries text and no tool calls, then records the
