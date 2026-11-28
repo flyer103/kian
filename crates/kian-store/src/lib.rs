@@ -57,4 +57,4 @@ pub use cron::{CronError, CronFiringRow, CronScheduleRow, FiringState, ScheduleU
 pub use event_store::{AppendGuard, EventStore, Head, StoreError};
 pub use inbox::{AdmitOutcome, InboxError, SessionInbox};
 pub use snapshots::{SnapshotCandidate, SnapshotRow};
-pub use views::{StoreKey, ViewRow, ViewState, view_rows_digest};
+pub use views::{StoreKey, VIEW_SCHEMA_VERSION, ViewRow, ViewState, view_rows_digest};
