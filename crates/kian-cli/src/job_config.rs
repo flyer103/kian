@@ -340,6 +340,7 @@ pub fn alert_plan(alert: &ResolvedAlert, facts: &AlertFacts<'_>) -> JobPlan {
             text: Some(alert_content(facts)),
             from_artifact: None,
         }),
+        publish: None,
     };
     let plan = JobPlan {
         id: alert.job_id(),

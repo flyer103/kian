@@ -182,6 +182,13 @@ pub struct ServeConfig {
     /// speech_synthesize beside the local tools.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media: Option<MediaConfig>,
+    /// The selfdev: section (SELF-EVOLUTION-MODEL §13 A18). None (the section
+    /// absent) is self-dev publish off: a plan that declares a publish step is
+    /// still admitted, and its attempt fails with "publish is not configured"
+    /// (§14 V32). Present means the conductor may write one derived worktree,
+    /// one commit and one gate run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selfdev: Option<SelfdevSection>,
 }
 
 fn default_plugins() -> Vec<String> {
@@ -3960,6 +3967,129 @@ pub const KNOWN_PLUGINS: [&str; 5] = [
     "remote-exec",
 ];
 
+/// The selfdev: section (SELF-EVOLUTION-MODEL §13 A18).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelfdevSection {
+    /// The publish configuration. None behaves exactly like an absent section:
+    /// the step fails honestly instead of writing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish: Option<SelfdevPublishSection>,
+}
+
+/// Where a publish writes and how it proves it (§13 A18, §9.4).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelfdevPublishSection {
+    /// The repository work tree the derived worktree is created from.
+    pub repo: String,
+    /// The branch a pull request targets (S2b).
+    #[serde(default = "default_publish_base")]
+    pub base: String,
+    /// The git remote a push would use (S2b). Recorded, unused in S2a.
+    #[serde(default = "default_publish_remote")]
+    pub remote: String,
+    /// The one gate command the conductor runs inside the worktree (§9.5).
+    #[serde(default = "default_publish_gate")]
+    pub gate: String,
+    /// CARGO_TARGET_DIR for the gate: a derived worktree has no warm target of
+    /// its own, so pointing at one is the difference between a minute and a
+    /// cold build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_dir: Option<String>,
+    /// The commit author, when the operator's git identity must not be used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<PublishAuthorSection>,
+    /// The environment variable holding the push credential (S2b). Never read
+    /// in S2a, never written to an event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_env: Option<String>,
+}
+
+/// The commit author of a publish (§13 A18).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishAuthorSection {
+    /// The git user.name of the commit.
+    pub name: String,
+    /// The git user.email of the commit.
+    pub email: String,
+}
+
+fn default_publish_base() -> String {
+    kian_superagent::job::plan::DEFAULT_PUBLISH_BASE.to_string()
+}
+
+fn default_publish_remote() -> String {
+    "origin".to_string()
+}
+
+fn default_publish_gate() -> String {
+    "./scripts/selfcheck.sh".to_string()
+}
+
+impl SelfdevSection {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(publish) = &self.publish {
+            publish.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl SelfdevPublishSection {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.repo.trim().is_empty() {
+            return Err(invalid(
+                "invalid publish config: selfdev.publish.repo names the work tree a publish is created from",
+            ));
+        }
+        if !std::path::Path::new(&self.repo).join(".git").exists() {
+            return Err(invalid(format!(
+                "invalid publish config: selfdev.publish.repo {} is not a git work tree",
+                self.repo
+            )));
+        }
+        if self.gate.trim().is_empty() {
+            return Err(invalid(
+                "invalid publish config: selfdev.publish.gate names the command the conductor runs",
+            ));
+        }
+        if self.base.trim().is_empty() || self.base.chars().any(char::is_whitespace) {
+            return Err(invalid(
+                "invalid publish target: selfdev.publish.base is a branch name without whitespace",
+            ));
+        }
+        if self.remote.trim().is_empty() {
+            return Err(invalid(
+                "invalid publish config: selfdev.publish.remote names a git remote",
+            ));
+        }
+        if let Some(author) = &self.author
+            && (author.name.trim().is_empty() || author.email.trim().is_empty())
+        {
+            return Err(invalid(
+                "invalid publish config: selfdev.publish.author needs a name and an email",
+            ));
+        }
+        if let Some(target_dir) = &self.target_dir
+            && target_dir.trim().is_empty()
+        {
+            return Err(invalid(
+                "invalid publish config: selfdev.publish.target_dir must not be blank",
+            ));
+        }
+        if let Some(token_env) = &self.token_env
+            && token_env.trim().is_empty()
+        {
+            return Err(invalid(
+                "invalid publish config: selfdev.publish.token_env names an environment variable",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl ServeConfig {
     /// Loads and validates the config file. Fail-closed: any structural,
     /// reference or semantic problem is an error, never a default.
@@ -4558,6 +4688,13 @@ impl ServeConfig {
         // serve-startup check (the assembly reads the env once).
         if let Some(workers) = &self.workers {
             workers.validate()?;
+        }
+
+        // The selfdev: section (SELF-EVOLUTION-MODEL §13 A18, §14 V32):
+        // present means a publish may write, so its repository must resolve to
+        // a git work tree and its gate must name a command.
+        if let Some(selfdev) = &self.selfdev {
+            selfdev.validate()?;
         }
 
         // The `artifacts:` section (ADR-056): a positive inline bound, a

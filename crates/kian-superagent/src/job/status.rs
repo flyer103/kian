@@ -576,6 +576,27 @@ pub struct RunView {
     pub ended_ms: Option<u64>,
     /// Per-step progress, in plan order.
     pub steps: Vec<StepView>,
+    /// Every publish receipt the run recorded (§9.4 step 9).
+    pub publish: Vec<PublishRecord>,
+}
+
+/// One publish receipt the run recorded (§9.4 step 9, A16).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishRecord {
+    /// The step that published.
+    pub step: String,
+    /// The attempt ordinal, read back from the call id.
+    pub attempt: u32,
+    /// The branch the commit landed on.
+    pub branch: String,
+    /// The full commit.
+    pub commit: String,
+    /// The gate's exit code, when one ran.
+    pub gate_exit_code: Option<i64>,
+    /// Whether the branch was pushed to its remote.
+    pub pushed: bool,
+    /// The pull request's URL, when one was opened.
+    pub pull_request: Option<String>,
 }
 
 /// Assemble the view of one run from its own stream (§15.1).
@@ -691,7 +712,61 @@ pub fn view(events: &[Event]) -> Option<RunView> {
             .find(|event| matches!(event.kind, EventKind::SessionEnded { .. }))
             .map(|event| event.ts),
         steps,
+        publish: publish_receipts(events),
     })
+}
+
+/// Every successful publish receipt on the run stream (§9.4). A receipt with
+/// `ok: false` published nothing a reader can follow, so it is not one.
+#[must_use]
+pub fn publish_receipts(events: &[Event]) -> Vec<PublishRecord> {
+    let mut out = Vec::new();
+    for event in events {
+        if event.kind != EventKind::ToolResult {
+            continue;
+        }
+        if event.bytes.get("ok").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+        let Some(call_id) = event.bytes.get("call_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(rest) = call_id.strip_prefix(crate::job::conduct::PUBLISH_CALL_PREFIX) else {
+            continue;
+        };
+        let Some((step, attempt)) = rest.rsplit_once(':') else {
+            continue;
+        };
+        let Ok(attempt) = attempt.parse::<u32>() else {
+            continue;
+        };
+        let Some(receipt) = event.bytes.get("result") else {
+            continue;
+        };
+        let (Some(branch), Some(commit)) = (
+            receipt.get("branch").and_then(Value::as_str),
+            receipt.get("commit").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        out.push(PublishRecord {
+            step: step.to_string(),
+            attempt,
+            branch: branch.to_string(),
+            commit: commit.to_string(),
+            gate_exit_code: receipt
+                .get("gate")
+                .and_then(|gate| gate.get("exit_code"))
+                .and_then(Value::as_i64),
+            pushed: receipt.get("push").is_some(),
+            pull_request: receipt
+                .get("pull_request")
+                .and_then(|request| request.get("url"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        });
+    }
+    out
 }
 
 /// The fold of a run whose end was not recorded. Tests and rendering only —
@@ -741,6 +816,23 @@ pub fn render(view: &RunView) -> String {
     ));
     let status = view.outcome.map_or("running", RunOutcome::as_str);
     out.push_str(&format!("status   {status}\n"));
+    for publish in &view.publish {
+        let gate = publish
+            .gate_exit_code
+            .map_or_else(|| "off".to_string(), |code| format!("exit {code}"));
+        let mut line = format!(
+            "publish  {} attempt {}  {}  {}  gate {}",
+            publish.step, publish.attempt, publish.branch, publish.commit, gate
+        );
+        if publish.pushed {
+            line.push_str("  pushed");
+        }
+        if let Some(url) = &publish.pull_request {
+            line.push_str(&format!("  pr {url}"));
+        }
+        line.push('\n');
+        out.push_str(&line);
+    }
     out.push_str("steps\n");
     for step in &view.steps {
         let last = step.attempts.last();
@@ -767,6 +859,7 @@ fn action_str(action: StepAction) -> &'static str {
     match action {
         StepAction::Agent => "agent",
         StepAction::Deliver => "deliver",
+        StepAction::Publish => "publish",
     }
 }
 

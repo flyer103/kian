@@ -1741,7 +1741,7 @@ provider-independent prefix-cache hit-rate proxy); the only counted invalidation
 constraint-3 violation. The same report is exposed by `kian cache-stats [--config <path>]
 [--session <uuid>] [--json]`; the live-provider run is env-gated (`KIAN_API_KEY`), excluded
 from CI, so it is recorded in the run log of whichever run performed it, never in the
-changelog. Liveness is a separate route from the derived report: `GET /healthz` answers `200`
+release notes. Liveness is a separate route from the derived report: `GET /healthz` answers `200`
 from process state alone — no store read, no projection, no token — and is what a supervisor
 probes; `/metrics` is never a liveness signal (API-CONTRACT §1.1,
 [ADR-076](decisions/ADR-076-liveness-is-a-probe.md)).
@@ -1834,7 +1834,7 @@ nothing and exits 2, and `--force` admits one run and records `circuit_overridde
 frozen value. `kian job run` returns exit 2 for every admission refusal and exit 1 only for a
 store failure.
 
- Refinement (publish, specified for S2 — not implemented): the publish step is a conductor action
+ Refinement (publish, as implemented by `kian-cli`): the publish step is a conductor action
 (JOB-MODEL §13.5, ADR-071), so it costs no worker, no capability and no model turn, and the plan
 cannot name a program. The sequence is fixed: resolve `from` (the step's single artifact input)
 and the base commit (the run's frozen `job.selfdev.base_commit`; `publish.base` names the branch a
@@ -1849,11 +1849,31 @@ run the configured gate (`selfdev.publish.gate`, default `./scripts/selfcheck.sh
 `CARGO_TARGET_DIR` honoured — the gate is configuration, so a proposal cannot choose the evidence
 that judges it); append the receipt pair `{branch, worktree, commit, gate}`. An interruption
 between the two pairs leaves an intent with no receipt, which settles the attempt `needs_operator`
-and leaves the worktree for the operator, and a retry never force-pushes or adopts a branch. S2b
-extends the same receipt with one `git push <remote> HEAD:refs/heads/<branch>` (never forced) and
-one `gh pr create --base <base> --head <branch>`, with the token read from the environment named
-by `selfdev.publish.token_env` and never written to an event. The action, the receipt and the gate
-configuration are specified in the contracts; S2a lands them.
+and leaves the worktree for the operator, and a retry never force-pushes or adopts a branch. The
+same receipt carries the remote half: `push {remote, ref}` after one
+`git push <remote> HEAD:refs/heads/<branch>` (never forced, so an existing branch refuses) and
+`pull_request {base, head, url?}` after one `gh pr create --base <base> --head <branch>`, whose
+body on stdin carries the audit chain. The token is read from the environment named by
+`selfdev.publish.token_env` at publish time, exported only into those two child processes — every
+other child runs with the variable removed — and never written to an argument or an event; a
+missing variable fails the step with `credential <name> is not set` before the worktree exists. A
+push that landed while its pull request failed is `Partial`: the attempt settles `needs_operator`,
+the branch stays on the remote, and no receipt is written. The repository work sits behind a
+`PublishPort` the bundle never implements (`kian-cli` does, in
+`crates/kian-cli/src/selfdev_publish.rs`), so every spawn goes through
+`cron_worktree::git_command()` and the inherited `GIT_*` environment cannot redirect a write into
+the caller's checkout; a gate that outlives its bound settles `needs_operator` with the commit in
+the detail rather than failing as if nothing was written.
+
+ Refinement (landing, specified): S3 adds no merge command. The owner merges the reviewed pull
+request with a merge commit, and `kian self verify <run> [--merged]` recomputes the audit chain
+from the run streams and the local repository: the frozen plan digest, the artifact bytes through
+its producer ref, the publish receipt, the commit's parent and diff, its `Kian-*` trailers and the
+branch, plus the merge's place in the base branch. It opens the store read-only, spawns git only
+through `cron_worktree::git_command()`, never fetches and writes no event, row or ref; a broken
+link exits 2 as `audit chain broken at <link>`. A squash or rebase merge is reported unmerged
+because the artifact commit is unreachable (ADR-075). The verifier is specified with the contract
+and lands with its implementation.
 
  Refinement (operational commands, as implemented by `kian-cli`): the SPEC §3.2 set lands as six
 commands with two access modes. Read-only commands (`kian session inspect <id>`, `kian session

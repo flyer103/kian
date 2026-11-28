@@ -289,8 +289,9 @@ Default CI needs none of these — every gated suite **skips with a log line, ne
 
 Secrets and URLs are env-only, never config values — the WeChat bot token is the one documented
 exception: it is issued by a QR scan and kept in a `0600` file
-([ADR-018](design/decisions/ADR-018-wechat-ilink-channel.md)). Executed live records live in
-[CHANGELOG.md](CHANGELOG.md).
+([ADR-018](design/decisions/ADR-018-wechat-ilink-channel.md)). Executed live records live in the
+runbooks ([postgres](docs/runbook-postgres.md), [dsh](docs/runbook-dsh.md),
+[harness](docs/runbook-harness.md), [iMessage](docs/runbook-imessage.md)).
 
 ## License
 

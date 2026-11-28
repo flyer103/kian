@@ -1037,6 +1037,10 @@ impl Server {
                     .intake
                     .to_runtime(&sa.channels.keys().cloned().collect())
                     .map_err(ServeError::Config)?,
+                selfdev_publish: config
+                    .selfdev
+                    .as_ref()
+                    .and_then(|selfdev| selfdev.publish.clone()),
                 max_iterations: config.drain.max_iterations,
                 policy: Arc::clone(&policy),
                 rules,

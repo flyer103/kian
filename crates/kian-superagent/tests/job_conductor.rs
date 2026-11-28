@@ -29,9 +29,11 @@ use kian_superagent::directory::{
 };
 use kian_superagent::job::alert::AlertSpec;
 use kian_superagent::job::conduct::{
-    AlertPort, Clock, DeliverPort, JOB_FAILED_REASON, JOB_FINISHED_STOP_REASON, JobDeps,
-    JobLoopDriver, RunPort,
+    AlertPort, Clock, DeliverPort, GateReceipt, JOB_FAILED_REASON, JOB_FINISHED_STOP_REASON,
+    JobDeps, JobLoopDriver, PublishError, PublishPort, PublishReceipt, PublishRequest,
+    PublishTargets, PullRequestReceipt, PushReceipt, RunPort, check_publish_ok,
 };
+use kian_superagent::job::outcome::AttemptOutcome;
 use kian_superagent::job::plan::{self, JobPlan};
 use kian_superagent::job::status;
 use kian_superagent::worker::{WorkerStreamsError, WorkerStreamsPort};
@@ -110,6 +112,8 @@ struct World {
     alerts: Mutex<Vec<(SessionId, Value, String)>>,
     alert_keys: Mutex<BTreeSet<String>>,
     deliver_error: Mutex<Option<ChannelError>>,
+    publish_behavior: Mutex<PublishBehavior>,
+    publish_requests: Mutex<Vec<PublishRequest>>,
     clock: Mutex<u64>,
 }
 
@@ -124,6 +128,8 @@ impl World {
             alerts: Mutex::new(Vec::new()),
             alert_keys: Mutex::new(BTreeSet::new()),
             deliver_error: Mutex::new(None),
+            publish_behavior: Mutex::new(PublishBehavior::Commit),
+            publish_requests: Mutex::new(Vec::new()),
             clock: Mutex::new(1_700_000_000_000),
         })
     }
@@ -407,7 +413,8 @@ fn harness_for(
         Arc::new(FakeDeliver(Arc::clone(&world))),
         Arc::new(FakeAlerts(Arc::clone(&world))),
         Arc::new(FakeClock(Arc::clone(&world))),
-    );
+    )
+    .with_publish(Arc::new(FakePublish(Arc::clone(&world))));
     // A test tick does not need the production park cadence; the bounds are
     // still bounded (floor <= ceiling), which is what clamp_wait requires.
     deps.tick_floor_ms = 1;
@@ -520,6 +527,108 @@ fn proposal_plan() -> JobPlan {
         }]
     }))
     .expect("a valid proposal plan")
+}
+
+const PUBLISH_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+const PUBLISH_CALL: &str = "job:publish:publish:1";
+
+/// What the fake publish does: commit (the receipt), or find the derived
+/// worktree already occupied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublishBehavior {
+    Commit,
+    Occupied,
+}
+
+struct FakePublish(Arc<World>);
+
+impl PublishPort for FakePublish {
+    fn derive(&self, run: SessionId) -> Option<PublishTargets> {
+        Some(PublishTargets {
+            repo: "/tmp/kian".to_string(),
+            worktree: format!("/tmp/kian/.agents/worktrees/selfdev-{}", run.0),
+        })
+    }
+
+    fn publish(
+        &self,
+        request: PublishRequest,
+    ) -> BoxFuture<'static, Result<PublishReceipt, PublishError>> {
+        let world = Arc::clone(&self.0);
+        Box::pin(async move {
+            let behavior = *world
+                .publish_behavior
+                .lock()
+                .map_err(|error| PublishError::Failed(error.to_string()))?;
+            {
+                let mut requests = world
+                    .publish_requests
+                    .lock()
+                    .map_err(|error| PublishError::Failed(error.to_string()))?;
+                requests.push(request.clone());
+            }
+            match behavior {
+                PublishBehavior::Commit => {
+                    let push = request.push.then(|| PushReceipt {
+                        remote: "origin".to_string(),
+                        reference: format!("refs/heads/{}", request.branch),
+                    });
+                    let pull_request = request.pull_request.then(|| PullRequestReceipt {
+                        base: request.base.clone(),
+                        head: request.branch.clone(),
+                        url: Some("https://example.test/pr/1".to_string()),
+                    });
+                    Ok(PublishReceipt {
+                        commit: PUBLISH_COMMIT.to_string(),
+                        branch: request.branch,
+                        worktree: request.worktree,
+                        gate: request.gates.then(|| GateReceipt {
+                            command: "./scripts/selfcheck.sh".to_string(),
+                            exit_code: 0,
+                            digest: "sha256:00".to_string(),
+                            output_tail: String::new(),
+                        }),
+                        push,
+                        pull_request,
+                    })
+                }
+                PublishBehavior::Occupied => Err(PublishError::Occupied(format!(
+                    "the worktree {} already exists",
+                    request.worktree
+                ))),
+            }
+        })
+    }
+}
+
+fn publish_plan() -> JobPlan {
+    serde_json::from_value(json!({
+        "id": JOB,
+        "steps": [{
+            "id": "patch",
+            "prompt": "propose a patch",
+            "requires": ["repo.kian"],
+            "produces": {"name": "patch", "max_bytes": 4096},
+            "verify": [
+                {"check": "artifact_within_cap", "name": "patch"},
+                {
+                    "check": "patch_paths_allowed",
+                    "artifact": "patch",
+                    "allow": ["crates/**"],
+                    "deny": ["design/decisions/**"]
+                }
+            ]
+        }, {
+            "id": "publish",
+            "action": "publish",
+            "depends_on": ["patch"],
+            "inputs": [{"step": "patch", "name": "patch"}],
+            "publish": {"base": "main", "gates": true, "push": true, "pull_request": true},
+            "effect": "write",
+            "verify": [{"check": "publish_ok"}]
+        }]
+    }))
+    .expect("a valid publish plan")
 }
 
 /// The child's committed stream for a proposal: one final answer, no tool round.
@@ -1323,4 +1432,321 @@ async fn a_settled_step_harvests_its_artifact_from_the_final_message() {
     assert_eq!(artifacts.len(), 1, "{artifacts:#?}");
     assert_eq!(artifacts[0].name, "patch");
     assert!(artifacts[0].within_cap);
+}
+
+#[tokio::test]
+async fn a_publish_step_commits_the_artifact_and_settles_from_its_receipt() {
+    let harness = harness_for(publish_plan(), vec![online(WORKER, &["repo.kian"])], None);
+    let mut stream = harness.driver.drive(context(&harness));
+    assert!(matches!(
+        next_outcome(&mut stream).await,
+        LoopOutcome::TurnDone
+    ));
+    let child = dispatched_child(&harness);
+    harness
+        .world
+        .children
+        .lock()
+        .expect("the children")
+        .insert(child, proposal_child(child));
+    assert!(matches!(
+        next_outcome(&mut stream).await,
+        LoopOutcome::TurnDone
+    ));
+    assert!(matches!(
+        next_outcome(&mut stream).await,
+        LoopOutcome::TurnDone
+    ));
+    let finished = next_outcome(&mut stream).await;
+    assert!(
+        matches!(finished, LoopOutcome::Stopped { .. }),
+        "the run finished: {finished:?}"
+    );
+
+    let events = harness.world.run_events();
+    let branch = format!("selfdev/{}", harness.run.0);
+    let intent = events
+        .iter()
+        .find(|event| {
+            event.kind == EventKind::ToolCall
+                && event.bytes.get("tool").and_then(Value::as_str) == Some("job.publish")
+        })
+        .expect("a publish intent");
+    assert_eq!(intent.bytes["call_id"], json!(PUBLISH_CALL));
+    assert_eq!(intent.bytes["args"]["step"], json!("publish"));
+    assert_eq!(intent.bytes["args"]["attempt"], json!(1));
+    assert_eq!(intent.bytes["args"]["branch"], json!(branch));
+    assert_eq!(intent.bytes["args"]["base_commit"], json!("0".repeat(40)));
+    assert_eq!(
+        intent.bytes["args"]["worktree"],
+        json!(format!(
+            "/tmp/kian/.agents/worktrees/selfdev-{}",
+            harness.run.0
+        ))
+    );
+    assert_eq!(
+        intent.bytes["args"]["from"]["sha256"],
+        json!(plan::digest_text(PATCH))
+    );
+
+    let receipt = events
+        .iter()
+        .find(|event| {
+            event.kind == EventKind::ToolResult
+                && event.bytes.get("call_id").and_then(Value::as_str) == Some(PUBLISH_CALL)
+        })
+        .expect("a publish receipt");
+    assert_eq!(receipt.bytes["ok"], json!(true));
+    assert_eq!(receipt.bytes["result"]["commit"], json!(PUBLISH_COMMIT));
+    assert_eq!(receipt.bytes["result"]["gate"]["exit_code"], json!(0));
+    assert_eq!(
+        receipt.bytes["result"]["push"]["ref"],
+        json!(format!("refs/heads/{branch}"))
+    );
+    assert_eq!(
+        receipt.bytes["result"]["pull_request"]["head"],
+        json!(branch)
+    );
+    assert_eq!(
+        receipt.bytes["result"]["pull_request"]["url"],
+        json!("https://example.test/pr/1")
+    );
+
+    let requests = harness
+        .world
+        .publish_requests
+        .lock()
+        .expect("the publish requests")
+        .clone();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].patch, PATCH);
+    assert!(requests[0].push, "the plan asked for the push");
+    assert!(
+        requests[0].pull_request,
+        "the plan asked for the pull request"
+    );
+    assert_eq!(
+        requests[0]
+            .trailers
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "Kian-Run",
+            "Kian-Plan-Digest",
+            "Kian-Patch-Sha256",
+            "Kian-Pack"
+        ]
+    );
+
+    let verdict = status::verdicts(&events)
+        .into_iter()
+        .find(|verdict| verdict.step == "publish")
+        .expect("a publish verdict");
+    assert!(verdict.passed);
+    assert_eq!(verdict.outcome, Some(AttemptOutcome::Succeeded));
+    assert_eq!(status::publish_receipts(&events).len(), 1);
+    let view = status::view(&events).expect("the run's view");
+    let rendered = status::render(&view);
+    assert!(rendered.contains("pushed"), "{rendered}");
+    assert!(
+        rendered.contains("pr https://example.test/pr/1"),
+        "{rendered}"
+    );
+}
+
+#[tokio::test]
+async fn a_publish_intent_without_a_receipt_waits_for_an_operator() {
+    let harness = harness_for(publish_plan(), vec![online(WORKER, &["repo.kian"])], None);
+    let mut stream = harness.driver.drive(context(&harness));
+    assert!(matches!(
+        next_outcome(&mut stream).await,
+        LoopOutcome::TurnDone
+    ));
+    let child = dispatched_child(&harness);
+    harness
+        .world
+        .children
+        .lock()
+        .expect("the children")
+        .insert(child, proposal_child(child));
+    assert!(matches!(
+        next_outcome(&mut stream).await,
+        LoopOutcome::TurnDone
+    ));
+    assert!(matches!(
+        next_outcome(&mut stream).await,
+        LoopOutcome::TurnDone
+    ));
+    {
+        let mut log = harness.world.run.lock().expect("the run log");
+        log.retain(|event| {
+            let publish_result = event.kind == EventKind::ToolResult
+                && event.bytes.get("call_id").and_then(Value::as_str) == Some(PUBLISH_CALL);
+            let publish_verdict = event.kind == EventKind::EvidenceVerdict
+                && event.bytes.get("gate").and_then(Value::as_str) == Some("step:publish");
+            !publish_result && !publish_verdict
+        });
+    }
+    let mut restarted = harness.new_driver().drive(context(&harness));
+    assert!(matches!(
+        next_outcome(&mut restarted).await,
+        LoopOutcome::TurnDone
+    ));
+    let events = harness.world.run_events();
+    let verdict = status::verdicts(&events)
+        .into_iter()
+        .find(|verdict| verdict.step == "publish")
+        .expect("a re-derived publish verdict");
+    assert_eq!(verdict.outcome, Some(AttemptOutcome::NeedsOperator));
+    assert!(!verdict.passed);
+}
+
+#[tokio::test]
+async fn an_occupied_worktree_needs_an_operator_and_is_never_retried() {
+    let harness = harness_for(publish_plan(), vec![online(WORKER, &["repo.kian"])], None);
+    *harness
+        .world
+        .publish_behavior
+        .lock()
+        .expect("the publish behavior") = PublishBehavior::Occupied;
+    let mut stream = harness.driver.drive(context(&harness));
+    assert!(matches!(
+        next_outcome(&mut stream).await,
+        LoopOutcome::TurnDone
+    ));
+    let child = dispatched_child(&harness);
+    harness
+        .world
+        .children
+        .lock()
+        .expect("the children")
+        .insert(child, proposal_child(child));
+    assert!(matches!(
+        next_outcome(&mut stream).await,
+        LoopOutcome::TurnDone
+    ));
+    assert!(matches!(
+        next_outcome(&mut stream).await,
+        LoopOutcome::TurnDone
+    ));
+    let finished = next_outcome(&mut stream).await;
+    assert!(
+        matches!(finished, LoopOutcome::SoftFailed { .. }),
+        "a needs_operator step fails the run: {finished:?}"
+    );
+    let events = harness.world.run_events();
+    let verdict = status::verdicts(&events)
+        .into_iter()
+        .find(|verdict| verdict.step == "publish")
+        .expect("a publish verdict");
+    assert_eq!(verdict.outcome, Some(AttemptOutcome::NeedsOperator));
+    assert_eq!(
+        harness
+            .world
+            .publish_requests
+            .lock()
+            .expect("the publish requests")
+            .len(),
+        1,
+        "a publish is never retried"
+    );
+}
+
+#[test]
+fn publish_ok_judges_the_receipt_not_the_intent() {
+    let branch = "selfdev/abc";
+    let good = json!({
+        "ok": true,
+        "result": {
+            "branch": branch,
+            "worktree": "/tmp/w",
+            "commit": PUBLISH_COMMIT,
+            "gate": {"command": "g", "exit_code": 0, "digest": "sha256:00", "output_tail": ""}
+        }
+    });
+    assert!(check_publish_ok(&good, branch, true, false, false).passed);
+
+    let short = json!({
+        "ok": true,
+        "result": {"branch": branch, "worktree": "/tmp/w", "commit": "0123",
+                   "gate": {"exit_code": 0}}
+    });
+    assert!(!check_publish_ok(&short, branch, true, false, false).passed);
+
+    let foreign = json!({
+        "ok": true,
+        "result": {"branch": "main", "worktree": "/tmp/w", "commit": PUBLISH_COMMIT,
+                   "gate": {"exit_code": 0}}
+    });
+    assert!(!check_publish_ok(&foreign, branch, true, false, false).passed);
+
+    let failed_gate = json!({
+        "ok": true,
+        "result": {"branch": branch, "worktree": "/tmp/w", "commit": PUBLISH_COMMIT,
+                   "gate": {"exit_code": 1}}
+    });
+    assert!(!check_publish_ok(&failed_gate, branch, true, false, false).passed);
+    assert!(
+        check_publish_ok(&failed_gate, branch, false, false, false).passed,
+        "a plan that runs no gate is judged without one"
+    );
+
+    let unpushed = check_publish_ok(&good, branch, true, true, false);
+    assert!(!unpushed.passed);
+    assert!(
+        unpushed
+            .detail
+            .unwrap_or_default()
+            .contains("carries no push"),
+        "a plan that asks for a push is judged by its push"
+    );
+    let unopened = check_publish_ok(&good, branch, true, false, true);
+    assert!(!unopened.passed);
+
+    let pushed = json!({
+        "ok": true,
+        "result": {
+            "branch": branch,
+            "worktree": "/tmp/w",
+            "commit": PUBLISH_COMMIT,
+            "gate": {"exit_code": 0},
+            "push": {"remote": "origin", "ref": format!("refs/heads/{branch}")},
+            "pull_request": {"base": "main", "head": branch, "url": "https://example.test/pr/1"}
+        }
+    });
+    assert!(check_publish_ok(&pushed, branch, true, true, true).passed);
+    let foreign_ref = json!({
+        "ok": true,
+        "result": {
+            "branch": branch,
+            "worktree": "/tmp/w",
+            "commit": PUBLISH_COMMIT,
+            "gate": {"exit_code": 0},
+            "push": {"remote": "origin", "ref": "refs/heads/main"}
+        }
+    });
+    assert!(!check_publish_ok(&foreign_ref, branch, true, true, false).passed);
+    let foreign_head = json!({
+        "ok": true,
+        "result": {
+            "branch": branch,
+            "worktree": "/tmp/w",
+            "commit": PUBLISH_COMMIT,
+            "gate": {"exit_code": 0},
+            "push": {"remote": "origin", "ref": format!("refs/heads/{branch}")},
+            "pull_request": {"base": "main", "head": "main"}
+        }
+    });
+    assert!(!check_publish_ok(&foreign_head, branch, true, true, true).passed);
+
+    let refused = json!({"ok": false, "error": "the patch does not apply: nope"});
+    let outcome = check_publish_ok(&refused, branch, true, false, false);
+    assert!(!outcome.passed);
+    assert!(
+        outcome
+            .detail
+            .unwrap_or_default()
+            .contains("does not apply")
+    );
 }

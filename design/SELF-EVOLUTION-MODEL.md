@@ -242,7 +242,7 @@ jobs:
           verify:
             - {check: artifact_within_cap, name: patch}
             - {check: patch_paths_allowed, artifact: patch,
-               allow: ["crates/**", "docs/**", "design/**", "CHANGELOG.md", "README.md",
+               allow: ["crates/**", "docs/**", "design/**", "README.md",
                        "examples/**", "site/**"],
                deny:  ["design/decisions/**", "kian.yaml", "scripts/**", ".github/**",
                        "AGENTS.md", "design/SELF-EVOLUTION-MODEL.md",
@@ -352,20 +352,26 @@ worker act at all: it is the conductor's, bounded by §9.4 and one push-scoped c
 | Phase | A run may | A run may not |
 |---|---|---|
 | **S1 propose** (this contract) | read committed streams; read the pack; produce artifacts in a worker's scratch space; notify the owner | write a repository; push; open a pull request; hold a credential; deploy |
-| **S2a publish-local** (specified, not implemented) | create one derived worktree and branch; apply the patch artifact; commit with the audit trailers; re-run the configured scoped gates as a step | push; open a pull request; hold any credential; write `main`; merge; edit another run's branch |
-| **S2b publish-remote** (specified, not implemented) | push that branch once (never forced); open one pull request whose body carries the audit chain | force-push; write `main`; merge; edit another run's branch; read the credential from anything but the configured environment variable |
-| **S3 land** (not designed) | — | — |
+| **S2a publish-local** (landed) | create one derived worktree and branch; apply the patch artifact; commit with the audit trailers; re-run the configured scoped gates as a step | push; open a pull request; hold any credential; write `main`; merge; edit another run's branch |
+| **S2b publish-remote** (landed) | push that branch once (never forced); open one pull request whose body carries the audit chain | force-push; write `main`; merge; edit another run's branch; read the credential from anything but the configured environment variable |
+| **S3 land** (specified: owner merge, verified) | nothing beyond S2b; the owner merges the reviewed pull request and the runtime verifies it | auto-merge; force-push; tag; deploy; land without review; write the merge on the run's behalf |
 
 **S2's enabling amendment** is a conductor-owned `publish` step action (JOB-MODEL §7.2 and §13.5),
 not a general-purpose `exec`: the sequence — worktree, apply, commit, gates, push, pull request —
 is fixed, and every step leaves a receipt on the run stream (§9.4). S2a needs no credential at all;
 S2b adds the one-push credential, read from the environment at publish time and never carried in an
-argument or an event. ADR-071 records why the `exec` route was rejected. S2a does not exist until
-JOB-MODEL carries the action; S2b does not exist until the credential path lands.
+argument or an event. ADR-071 records why the `exec` route was rejected. The two phases are one
+fixed sequence behind one port: S2a is the five local steps and S2b adds the push and the pull
+request, with the credential the only thing that distinguishes them.
 
-**S3 is deliberately absent.** Landing — merge, tag, deploy, rollback — is the owner's action and
-needs its own ADR once S2 has produced real proposals. A self-dev run that could land would make the
-review gate advisory, which is exactly what SE1 forbids.
+**S3 is the owner's merge, verified rather than executed.** The review gate is the pull request and
+the merge is the owner's act; S3 adds no `land` verb, no auto-merge and no new write authority
+(ADR-075). What it adds is evidence: `kian self verify <run>` recomputes every link of the audit
+chain from the run streams and the local repository, and `--merged` reports whether the merge
+happened and whether it preserved the proposal's commit. Landing stays a human decision on the pull
+request; the runtime only makes the record checkable. The merge shape is normative (§18.2): a merge
+commit, never a squash or a rebase, because only the merge commit keeps the artifact commit — and
+its trailers — in the base branch's history.
 
 ## 8. Evidence, outcomes, and the review gate
 
@@ -488,11 +494,14 @@ Three properties fall out of the sequence rather than out of a lock:
   behind: a retry would find the path occupied and could never succeed. An operator who wants another
   attempt removes the path — an explicit act, not a retry.
 
-S2b extends steps 4–9 with `push` and `pull_request`: `git push <remote> HEAD:refs/heads/<branch>`
-(no `--force`, so an existing branch refuses), then `gh pr create --base <base> --head <branch>
---body-file <body>` whose body carries the audit chain (§11). The credential is read from
-`selfdev.publish.token_env` at publish time, exported only into those child processes, and never
-written to an argument or an event; its absence fails the step with `credential <name> is not set`.
+Steps 4–9 extend with `push` and `pull_request`: `git push <remote> HEAD:refs/heads/<branch>`
+(no `--force`, so an existing branch refuses), then `gh pr create --base <base> --head <branch>`,
+whose body carries the audit chain (§11). The credential is read from `selfdev.publish.token_env`
+at publish time, exported only into those two child processes — every other child runs with the
+variable removed — and never written to an argument or an event; its absence fails the step with
+`credential <name> is not set` before the worktree exists. A push that landed while its pull
+request failed is `Partial`: the attempt settles `needs_operator`, the branch stays on the remote,
+and no receipt is written.
 
 ### 9.5 The gate command
 
@@ -504,7 +513,9 @@ applies to the evidence as well: a run that could pick its own gate could pick a
 
 The gate is the dominant cost of a publish (a cold worktree builds the workspace), which is why
 `selfdev.publish.target_dir` can point `CARGO_TARGET_DIR` at an existing build cache, and why the
-step has `retries: 0`: paying the build twice is the failure mode to avoid, not the retry.
+step has `retries: 0`: paying the build twice is the failure mode to avoid, not the retry. Point that
+directory at a cache no other working tree builds into: cargo replaces binaries in place, so two
+trees sharing one target dir each end up with artifacts built from the other's sources.
 
 ## 10. Budgets and the circuit breaker
 
@@ -551,10 +562,13 @@ patch sha256 ──────────┘              │
   carries `Kian-Run`, `Kian-Plan-Digest`, `Kian-Patch-Sha256` and `Kian-Pack` trailers, so the chain
   survives a copy of the branch; the pull request body carries the same values (S2b), so the chain
   survives outside the database.
-* The merge commit is the one link this repository does not write, which is the point of SE1.
+* The merge commit is the one link this repository does not write, which is the point of SE1: the
+  owner's merge writes it, and S3 verifies it instead of performing it (§18).
 * Reading the chain is a read: `kian job status <run>` renders the run and its publish receipt, and
-  the pack is re-verifiable with the same verifier `kian self evidence` uses. No new reader is
-  introduced.
+  the pack is re-verifiable with the same verifier `kian self evidence` uses. `kian self verify
+  <run>` recomputes the chain link by link — the frozen plan, the artifact bytes, the commit's
+  parent, diff and trailers, and with `--merged` the merge — without writing an event, a row or a
+  ref. No new reader state is introduced.
 
 ## 12. Crash windows, walked through
 
@@ -567,6 +581,7 @@ patch sha256 ──────────┘              │
 | after the publish `tool/call`, before its `tool/result` | the next tick sees an intent with no receipt and settles `needs_operator`; nothing is deleted | a started publish is never silently repeated (§9.4) |
 | after the commit, before the gates | same: `needs_operator` with the commit in the detail; the worktree and branch stay as evidence | the receipt is written once, after the gates |
 | S2b: after the push, before the pull request | `needs_operator`; the branch exists on the remote and the owner can open the pull request by hand | the push is per-branch and never forced |
+| S3: after the owner merges, before the verifier runs | nothing to recover; the merge exists in git and `kian self verify --merged` reports it | the verifier is read-only and writes no state |
 | after the step verdict, before the run verdict | the run verdict is written once before the final outcome; a re-drive sees it and does not rewrite | the last `run` verdict wins (§11.1), so a settled outcome is stable |
 | after the run verdict, before `session/ended` | the engine's end write is atomic (constraint 4); the sweep settles from the verdict | settlement never reads the bare end reason |
 | delivery fails after the proposal exists | the deliver step is `optional`; the run still ends with its verdict | the proposal is not lost (§9.3) |
@@ -580,13 +595,16 @@ patch sha256 ──────────┘              │
 | A13 | check `patch_paths_allowed{artifact, allow, deny}` | a job-owned check in `verify` | the plan | the conductor's evaluator |
 | A14 | limit `consecutive_failures` | `u32`, default 3, at most 10 | the plan's `limits` | the manual trigger |
 | A15 | step action `publish` and its field `publish {base?, gates?, push?, pull_request?}` | a frozen plan shape; the field serializes only when present, so an existing plan's digest does not move | the plan | the conductor (dispatch), validation |
-| A16 | run-stream pair `tool/call` / `tool/result` with `tool: "job.publish"` | args `{step, attempt, from, base_commit, branch, worktree}`; result `{branch, worktree, commit, gate {command, exit_code, digest, output_tail}}`, plus `push` / `pull_request` in S2b | the conductor | the `publish_ok` check, the status projection |
+| A16 | run-stream pair `tool/call` / `tool/result` with `tool: "job.publish"` | args `{step, attempt, from, base_commit, branch, worktree}`; result `{branch, worktree, commit, gate {command, exit_code, digest, output_tail}, push {remote, ref}, pull_request {base, head, url?}}` — the last two only when the plan asked for them | the conductor | the `publish_ok` check, the status projection |
 | A17 | check `publish_ok` | a job-owned check in `verify` | the plan | the conductor's evaluator |
 | A18 | config `selfdev.publish` | `{repo, base, remote, gate, target_dir, author {name, email}, token_env}`; absent means the step fails honestly | the operator | the publish port |
-| A19 | S2b remote fields | `push`, `pull_request` and the credential's environment variable name; no new route and no new verb | the plan, the config | the publish port |
+| A19 | the remote half of the receipt | `push {remote, ref}`, `pull_request {base, head, url?}` and the credential's environment variable name; no new route and no new verb | the plan, the config | the publish port |
+| A20 | verb `kian self verify <run> [--merged] [--base <branch>] [--config <path>] [--json]` | a read-only chain check: exit 0 when every link holds, exit 2 naming the broken link; no event, no row, no ref write | — | the operator |
+| A21 | the landing record | the owner's merge commit: the artifact commit is a parent, so the trailers and the pull request reference stay in history; the runtime adds no trailer and no event | the owner's merge | the verifier (`--merged`) |
 
 Not added, explicitly: no event kind, no table, no HTTP route, no JSON-RPC method, no SSE frame, no
-new crate in the narrow waist, and no change to a job verdict's shared shape. The publish pair uses
+new crate in the narrow waist, and no change to a job verdict's shared shape. The verifier (A20)
+adds no route either: it is a local read of the streams and the repository. The publish pair uses
 the existing `tool/call` / `tool/result` kinds, `evidence/verdict` stays `{gate, passed, checks[],
 attempt}` plus the job-owned `job` key, `patch_paths_allowed` and `publish_ok` are entries in
 `checks[]`, and no credential ever appears in an event.
@@ -609,6 +627,9 @@ attempt}` plus the job-owned `job` key, `patch_paths_allowed` and `publish_ok` a
 V24 is the rule that keeps the model honest: a self-dev plan without a symptom would be a general
 "improve the code" prompt with a conductor attached.
 
+S3 adds no validation rule: landing is not an admission decision, so the verifier reads a run that
+already exists (§18).
+
 ## 15. The verbs
 
 | Verb | Behaviour |
@@ -616,11 +637,13 @@ V24 is the rule that keeps the model honest: a self-dev plan without a symptom w
 | `kian job run <job> --pack <dir> [--base <commit>] [--slot <token>] [--force] [--json]` | verifies the pack, checks the breaker, admits one run, prints the run id |
 | `kian job status <run> [--json]` | unchanged; a self-dev run renders like any other run, and a settled publish step renders its branch, commit and gate |
 | `kian self evidence --session <uuid> --seq <n> --out <dir>` | unchanged; the producer of the pack |
+| `kian self verify <run> [--merged] [--base <branch>] [--config <path>] [--json]` | recomputes the audit chain of one self-dev run from its streams and the local repository; read-only, exit 0/2 (§18.3) |
 
 Parsing follows the hand-rolled shape in crates/kian-cli/src/job_cli.rs:158 (the same `next_value`
-discipline), and store access follows the existing `kian job run` path. The new flags appear in
-`USAGE` beside the existing `kian job run` line, and the `--json` output's `run_id` field is
-unchanged.
+discipline); `kian self verify` lives beside `kian self inspect` and `kian self evidence` in
+crates/kian-cli/src/main.rs, opens the store read-only and touches the repository only through
+`cron_worktree::git_command()`. The verb appears in `USAGE` beside the other `kian self` lines,
+and `kian job run`'s `--json` `run_id` field is unchanged.
 
 ## 16. Phases and acceptance
 
@@ -660,23 +683,41 @@ Acceptance, by level:
 
 ### S2b — publish-remote
 
-Acceptance is deferred until the credential path exists: with a local bare remote and a stub `gh`,
-one non-forced push creates the branch, a second attempt on the same branch refuses, the pull
-request body carries the audit chain, and no other step can read the credential. Until then S2b is a
-declaration in §7 and the `push` / `pull_request` fields are inert.
+Acceptance, by level:
 
-### S3 — land
+* **L1** — `publish_ok` refuses a receipt that carries no push, names a foreign ref or a foreign
+  head; a missing credential fails the step before the worktree exists.
+* **L2** — against a temporary repository with a local bare remote and a stub `gh`: one non-forced
+  push creates the branch, a second attempt on the same branch refuses, the pull request body
+  carries the audit chain, and only the push and the pull request child processes see the
+  credential.
+* **L3** — one real publish against the operator's remote and an authenticated `gh`; the local
+  acceptance uses a bare remote and a stub.
 
-Not designed. It requires its own ADR and the S2 numbers (proposal volume, review time, regression
-rate). This document does not pre-authorise it.
+### S3 — land (specified, not implemented)
+
+The phase has one slice: a read-only verifier. The merge stays the owner's, and no `land` verb
+exists (ADR-075). The S2 numbers still gate any write automation; they do not gate the verifier,
+which adds no authority.
+
+* **L1** — chain fixtures: a matching run verifies; a tampered artifact byte, plan digest, trailer,
+  short commit, foreign branch or non-zero gate each fails naming the link; a run with no
+  `job.selfdev` or no publish receipt fails closed; a missing `selfdev.publish.repo` fails
+  `landing is not configured`.
+* **L2** — a temporary repository and a real run stream: the chain verifies; `--merged` passes
+  after a merge commit and fails `not merged into <base>` before it; a squash merge fails
+  because the artifact commit is unreachable; a deleted local branch still verifies when the
+  commit is reachable from the base.
+* **L3** — one real proposal published by S2b, reviewed and merged by the owner, then
+  `kian self verify --merged` over this repository.
 
 ## 17. Non-goals and open questions
 
-Non-goals for S1 and S2: automatic merge; deployment; cross-repository changes; using a live provider
+Non-goals for S1–S3: automatic merge; deployment; cross-repository changes; using a live provider
 to "judge" a patch; rewriting test baselines; editing this document, the gates, the ADRs or
 `kian.yaml`; changing the event vocabulary; training across iterations.
 
-Four limits are recorded rather than deferred, because a reader must not mistake a declaration for
+Seven limits are recorded rather than deferred, because a reader must not mistake a declaration for
 an enforcement point:
 
 * the pack is verified at admission only, so a later edit of `dir` is not detected (§4.2);
@@ -684,8 +725,15 @@ an enforcement point:
   (§6.2) — a deployment that grants such a tool has weakened SE4 in configuration;
 * a failed publish leaves its worktree and branch behind, because the run never deletes a directory
   it did not create in the current attempt (§9.4): the operator's cleanup is the price of the rule;
-* S2a produces a commit that was never pushed. It is reviewable from the local checkout — the branch
-  and the worktree are the proposal — but nothing outside this machine has seen it until S2b.
+* a push that landed while its pull request failed leaves the branch on the remote: the attempt
+  settles `needs_operator` (§12), because the run never force-pushes or reuses a branch, and the
+  operator either opens the pull request by hand or deletes the branch;
+* the verifier reads local git only: it never fetches, so a commit that exists only on the remote
+  is reported missing rather than retrieved (§18.3);
+* it does not prove that a review happened, that the gate covered the change, or that the patch
+  is correct: it proves the bytes, and those are the owner's claims (§18.4);
+* the merge-commit rule is enforced only by `--merged`: a squash merge leaves the chain in the
+  pull request body, not in the base branch's history (§18.2).
 
 Open questions, each with the fact that would answer it:
 
@@ -695,6 +743,75 @@ Open questions, each with the fact that would answer it:
 | Is the plan the right home for the test-only rule? | Whether S1 review sees code patches that "fix" tests; if so, the rule becomes structural rather than a check parameter. |
 | Should iterations be allowed to accumulate into a series? | S2 data on proposals that needed a second run to be reviewable. |
 | Does the breaker need a window rather than a streak? | Whether real failures alternate with successes often enough that a streak is the wrong shape. |
+| Should the verifier run as part of `kian job status`? | Whether reviewers actually run it by hand before or after a merge, and how often a broken chain is found late. |
+| Should `--merged` query the pull request state through `gh`? | Whether the merge-commit requirement is the only fact git cannot answer locally; the verifier currently keeps its no-network rule. |
+| Is an assisted `land` verb worth its authority after all? | S2 numbers: proposal volume, review time, regression rate — the facts this phase deliberately does not have. |
+
+## 18. Landing: the owner's merge, verified
+
+### 18.1 Authority
+
+The owner merges. No run, no conductor and no kian CLI verb writes the base branch, calls
+`gh pr merge` or tags a release; S3 adds no approval mechanism and no second merge channel. The
+review gate is the pull request review (§8.2), and the merge is its outcome. A proposal is landed
+when the owner merges it; `kian self verify` reports that fact, it does not create it.
+
+### 18.2 The merge shape
+
+The owner merges with a **merge commit** (GitHub's "Create a merge commit"), so the published
+commit stays a parent of the merge and its `Kian-*` trailers and the pull request reference stay in
+the base branch's history. A squash or a rebase merge is a different proposal in history: the
+published commit becomes unreachable, its trailers disappear from the base branch, and a rebased
+copy no longer matches the artifact bytes. `--merged` therefore reports a squash or rebase as
+`not merged into <base>` even though the change is on the branch; the owner re-lands it with a
+merge commit or accepts that the record lives only in the pull request. No trailer is added to the
+merge commit: the chain is already complete on its parent.
+
+### 18.3 `kian self verify <run>`
+
+The verb takes a run id, the usual `--config`, an optional `--base <branch>` (default
+`selfdev.publish.base`) and `--merged`. It reads the run stream, the producer stream the artifact
+ref names, and the local repository configured by `selfdev.publish.repo`; it writes nothing and
+never fetches. With no `selfdev.publish.repo` it exits 2 with `landing is not configured`.
+
+It checks, in order, naming the first link that fails:
+
+1. the admitted input row carries `job.selfdev`, and each recorded digest is `sha256:` plus 64
+   lowercase hex characters;
+2. the frozen plan re-canonicalises to the marker's `plan_digest`;
+3. the `job.artifact` receipt names a producer event whose committed text still hashes to the
+   recorded `sha256` and length;
+4. the publish receipt is `ok: true`, names `selfdev/<run_session>`, carries a 40-hex commit, and
+   reports `exit_code: 0` when the plan ran a gate;
+5. that commit exists in the local object database, its first parent is the frozen
+   `base_commit`, `git diff <base_commit> <commit>` is byte-identical to the artifact, and the
+   `Kian-Run` / `Kian-Plan-Digest` / `Kian-Patch-Sha256` / `Kian-Pack` trailers match the recorded
+   values;
+6. the branch named by the receipt resolves to that commit, locally or as a remote-tracking ref;
+   a missing branch is allowed only with `--merged`, where the commit's reachability from the base
+   is the stronger fact;
+7. with `--merged`, the commit is an ancestor of the base branch.
+
+Any failure exits 2 as `audit chain broken at <link>: <detail>`; a complete chain exits 0 and
+prints one line per link. `--json` prints `{ok, run, links: [{link, ok, detail}], merged?}`. A
+commit that exists only on the remote is reported missing, not fetched: the verifier is a read,
+and a clone that has never fetched the branch cannot verify it.
+
+### 18.4 What verification does not prove
+
+It proves the bytes: that the reviewed artifact is the commit's diff, that the commit descends
+from the frozen base, that the trailers and the stream agree, and — with `--merged` — that the
+commit is in the base branch's history. It does not prove that a review happened, that the patch
+is correct, that the gate covered the change, or that the owner merged the commit they reviewed.
+Those are judgements about people and process; the contract records them as the owner's, not the
+verifier's.
+
+### 18.5 Crash and concurrency
+
+The verifier has no state to recover: it reads committed bytes and a git repository, and an
+interrupted run leaves nothing to clean up. A merge that lands during a verification only adds an
+ancestor, so a pass cannot be invalidated by a concurrent merge; a force-push of the base branch
+rewrites history and is outside this contract (§17). The merge record is durable because git is.
 
 ## Closing: what this contract asks the owner to decide
 
@@ -707,3 +824,5 @@ Open questions, each with the fact that would answer it:
 5. **The review gate is a pull request**, and a run never waits for one — §8.2.
 6. **Publishing is a conductor action, not a general `exec`.** The sequence is fixed and
    auditable, so a plan can ask for a publish and never for an arbitrary command — §9.4, ADR-071.
+7. **Landing is the owner's merge, and the runtime verifies what it did not write** — §18,
+   ADR-075.

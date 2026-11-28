@@ -488,4 +488,4 @@ change (the EVENT-MODEL discipline applied to the channel). Credential, allowlis
 cursor semantics (§5/§6/§9/§10) also start here; a change that would add a persisted cursor, a new
 event kind, a new server surface, a proactive send or media support needs an ADR, not an edit to
 this file. An upstream protocol break is recorded as a dated note in this section plus a
-CHANGELOG entry, and may park the channel honestly rather than guess.
+release note, and may park the channel honestly rather than guess.

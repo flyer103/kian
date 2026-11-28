@@ -173,7 +173,7 @@ KiandProto. This section keeps the interface sketch.
 ### 2.5 Acceptance capabilities
 
 Each capability below is proven by named tests; the executed evidence is recorded in
-[CHANGELOG.md](../CHANGELOG.md) and [overview.md](overview.md).
+[overview.md](overview.md) §5.
 
 | Capability | Demonstrates | Input | Output |
 |------------|--------------|-------|--------|
@@ -187,7 +187,7 @@ Each capability below is proven by named tests; the executed evidence is recorde
 | Multi-replica takeover | Crash recovery at multi-process scale | Two `kian serve` replicas over one postgres DB; the drain owner is `kill -9`'d mid-drain | The survivor's recovery sweep takes over the expired lease and completes: zero lost work, exactly one end write, a stale-epoch probe write from the dead replica rejected (NoSplitBrainWrite between processes) |
 
 The multi-replica takeover is demonstrated by the env-gated postgres e2e (`KIAN_PG_URL`); the proof
-is recorded in [CHANGELOG.md](../CHANGELOG.md) and [overview.md](overview.md) §5.
+is recorded in [overview.md](overview.md) §5.
 
 ## 3. Operations Interface
 
@@ -399,7 +399,7 @@ surfaces: the README's operator-surface section.
 | Durable interrupt intent | The 21st kind `control/interrupt` (drain-activity, non-context; [ADR-014](../design/decisions/ADR-014-durable-interrupt-intent.md)): `interrupt` admits a reserved control-envelope inbox row (idempotent per `(session, target_epoch)`) alongside the in-memory flag; the owning drain consumes it at a safe boundary, appends the audit event and settles `interrupted` — so the intent survives a drain crash and crosses replicas best-effort. Stale rule: a row whose target episode already settled appends `"stale": true` and ends nothing; idle/terminal sessions keep `not_draining`/`unknown_session` and admit nothing. Tests: `durable_interrupt_intent_survives_crash_and_takeover_settles_interrupted`, `repeated_interrupts_in_one_epoch_dedupe_to_one_row_and_one_event`, `stale_epoch_control_row_is_audit_only_and_does_not_end_the_session`, `control_row_racing_the_settle_flips_the_end_write_to_interrupted`, `interrupt_of_idle_or_terminal_session_admits_no_control_row`, `control_interrupt_leaves_model_context_unchanged`, `additions_only_regression_all_kind_bytes_are_frozen` (+ golden count 21) | landed |
 | Derived event id + redaction provenance | `kian_core::events::event_id` = `"evt_" + uuid5(session, "kian:event:<seq>")` (pure, never stored, never an envelope field), mirrored dependency-free in the SDK; `kian session export --with-event-ids` (opt-in, default export bytes unchanged, re-import round-trips). `SecretRedactor::redact_with_report` emits `{kind, name, count}` provenance; the report rides the additive `redactions` key on `tool/result` payloads outside `content` — what was redacted, never the values. Tests: `event_id_golden_vectors_match_rfc4122_v5`, `event_id_is_deterministic_and_distinct_per_seq_and_session`, `event_id_matches_the_core_golden_vectors`, `default_export_bytes_are_unchanged_without_the_flag`, `with_event_ids_export_adds_stable_ids_and_round_trips`, `report_counts_all_three_kinds_and_text_matches_plain_redact`, `remote_exec_result_and_row_carry_the_redaction_report`, `tool_result_payload_carries_redactions_outside_content`, `redactions_payload_key_never_enters_the_model_context` | landed |
 | Per-call tool permission provenance | `agent.permissions` (tool name → `allow\|deny`, closed vocabulary, fail-closed parse: unknown value / key ∉ `tools` / table on a judge agent refuse boot; [ADR-015](../design/decisions/ADR-015-tool-permission-provenance.md)): evaluated once per call **before** the `tool/call` append (log-before-execute holds on both arms), recorded as the additive top-level `permission: {evaluated, policy, matched}` key — allows are audited exactly like denials; a deny never invokes and appends an honest-error `tool/result` the model reacts to; absent table = payload byte-identical. Tests: `permission_is_a_closed_vocabulary_fail_closed`, `permissions_unknown_value_refuses_boot`, `permissions_key_absent_from_agent_tools_refuse_boot`, `permissions_on_judge_agents_refuse_boot`, `allow_path_invokes_tool_and_records_provenance_default_vs_configured`, `deny_path_does_not_invoke_and_emits_honest_error_result`, `absent_permissions_keep_tool_call_payload_byte_identical_to_today`, `permission_payload_key_never_enters_the_model_context` | landed |
-| Final record | This record + DESIGN/README/CHANGELOG alignment + docs-map link check | landed |
+| Final record | This record + DESIGN/README alignment + docs-map link check | landed |
 
 Out of scope (recorded, not silently dropped): the `ask` permission/confirmation plane
 (ADR-015 records the shape; blocking confirmation is a separate design decision), CMA wire
@@ -527,7 +527,7 @@ ops method; one wire bump (v1 → v2) and one additive queue migration (v3 `kind
 | Queue v3 | `exec_queue.kind TEXT NOT NULL DEFAULT 'exec'`; pre-v3 rows decode as exec and re-drive unchanged; fs rows share the queue, command-id dedupe and `queue_timeout`; no cross-worker dispatch | landed |
 | Per-drive routing + schemas | A bound worker side mounts `RemoteFsTool` (filtered by the agent's `tools:`) and the refusing side mounts the same three names with an honest refusal; schemas/result shapes are byte-identical to the local built-ins (golden parity) | landed |
 | Root + limits | `kiand --workspace-root` (default cwd, must exist); lexical `..` guard on both sides; 1 MiB read/write bounds; non-UTF-8 read is a typed `io` error surfaced as the local `{"error": …}` result; root is a guard, not a sandbox | landed |
-| Live deployment | Owner deployment (Vultr + local worker + WeChat) redeployed at v2; the L3 fs round-trip through the WeChat Router path is recorded in CHANGELOG | landed (owner L3) |
+| Live deployment | Owner deployment (Vultr + local worker + WeChat) redeployed at v2; the L3 fs round-trip through the WeChat Router path is an owner-run result | landed (owner L3) |
 | Binary/streaming/fs_edit/glob, symlink-proof sandbox | Out of scope (WORKER-MODEL §9) | deferred |
 
 ### Thinking-mode reasoning replay (ADR-022)
@@ -1058,22 +1058,23 @@ The run's outcome rides one additive `evidence/verdict` with gate `run`, because
 driver — owns the session end.
 
 
-### Self-evolution (S1 landed, S2 specified)
+### Self-evolution (S1 landed, S2a landed, S2b landed, S3 specified)
 
 Scope: a committed failure becomes a reviewable proposal. A self-dev run is an ordinary job run
 whose subject is a verified evidence pack, and no run merges, deploys or holds a credential while
 proposing. No new session state, event kind, table or daemon: the marking travels as one additive
 key on the admitted row. The normative contract is
 [design/SELF-EVOLUTION-MODEL.md](../design/SELF-EVOLUTION-MODEL.md); the decision records are
-[ADR-069](../design/decisions/ADR-069-self-evolution-is-a-proposal-pipeline.md) and
-[ADR-071](../design/decisions/ADR-071-publish-is-a-conductor-action.md).
+[ADR-069](../design/decisions/ADR-069-self-evolution-is-a-proposal-pipeline.md),
+[ADR-071](../design/decisions/ADR-071-publish-is-a-conductor-action.md) and
+[ADR-075](../design/decisions/ADR-075-landing-is-the-owners-merge-verified.md).
 
 | Phase | Contents | Status |
 |-------|----------|--------|
 | S1 propose | `kian job run --pack <dir>` verifies the pack before admitting, the `job.selfdev` key, the `patch_paths_allowed` surface check, the `consecutive_failures` breaker, the proposal delivered as artifacts on the run | landed |
-| S2a publish-local | the conductor's `publish` step: one derived worktree and branch at the frozen base, the patch artifact applied and committed with the audit trailers, the configured scoped gates re-run inside the worktree — no credential | specified, not implemented |
-| S2b publish-remote | one non-forced push of that branch and one pull request whose body carries the audit chain, with the credential read from the environment at publish time | specified, not implemented |
-| S3 land | merge, tag, deploy, rollback — the owner's action | not designed |
+| S2a publish-local | the conductor's `publish` step: one derived worktree and branch at the frozen base, the patch artifact applied and committed with the audit trailers, the configured scoped gates re-run inside the worktree — no credential | landed |
+| S2b publish-remote | one non-forced push of that branch and one pull request whose body carries the audit chain, with the credential read from the environment at publish time | landed |
+| S3 land | the owner merges the reviewed pull request; `kian self verify <run>` recomputes the audit chain (read-only) and `--merged` reports the merge | specified, not implemented |
 
 A symptom is packaged by `kian self evidence` (§3.1). A proposal's `succeeded` means "a reviewable
 patch exists inside the declared surface", never "the defect is fixed": the patch is evidence, and
@@ -1086,10 +1087,33 @@ An agent step produces its artifact from the child's own stream: the final answe
 produces no artifact, and the step fails its artifact check instead of passing it.
 
 Publishing is a conductor action, not a general command: the `publish` step's sequence is fixed
-(worktree, apply, commit, gates, and in S2b one non-forced push and one pull request), every step
+(worktree, apply, commit, gates, one non-forced push and one pull request), every step
 leaves a receipt on the run stream, and a plan can ask for a publish but never for an arbitrary
 command ([design/JOB-MODEL.md](../design/JOB-MODEL.md) §13.5,
 [design/SELF-EVOLUTION-MODEL.md](../design/SELF-EVOLUTION-MODEL.md) §9.4).
+
+S2a lands that sequence with no credential and no network write: the receipt carries the branch,
+the commit and the gate's exit code, `kian job status <run>` renders it, an operator whose
+configuration has no `selfdev.publish` section sees the step fail honestly with
+`publish is not configured` before anything is written, and the gate is the operator's
+configuration — a plan cannot choose the evidence that judges its own proposal. A worktree already
+on disk, or an intent whose receipt was never written, settles the attempt `needs_operator`: the
+worktree stays as the evidence and the attempt is never retried.
+
+S2b carries that receipt to the code host: one non-forced push of `selfdev/<run_session>` and one
+pull request whose body carries the audit chain, with the credential read from
+`selfdev.publish.token_env` at publish time and exported only into those two child processes. A
+push that landed while its pull request failed settles `needs_operator` with the branch on the
+remote, and `kian job status <run>` renders `pushed` and the pull request URL alongside the
+commit.
+
+S3 keeps the merge with the owner: no `land` verb, no auto-merge, no credential. `kian self verify
+<run>` reads the run streams and the local repository and recomputes the chain — the frozen plan,
+the artifact bytes, the commit's parent, diff and `Kian-*` trailers, the branch — and `--merged`
+reports whether the commit is in the base branch's history. It writes nothing and never fetches; a
+chain that breaks exits 2 naming the link. The landing shape is a merge commit, because a squash or
+a rebase drops the artifact commit from history
+([design/SELF-EVOLUTION-MODEL.md](../design/SELF-EVOLUTION-MODEL.md) §18).
 
 ### Deferred (unchanged)
 | Item | Reason |
