@@ -16,6 +16,7 @@ Product semantics live in [WORKER-MODEL](../design/WORKER-MODEL.md); this file i
 | `/usr/local/bin/kian-backup.sh` | the snapshot script |
 | `/etc/systemd/system/kian.service` | unit: `User=kian`, `Restart=always`, `OnFailure=kian-alert@%n` |
 | `/etc/systemd/system/kian-watch.{service,timer}` | watchdog: probes every 30 s |
+| `/etc/systemd/system/kian-archive.{service,timer}` | retention sweep: `archive run` + `archive receipts`, daily 20:00 UTC |
 | `/usr/local/bin/kian-watch.sh` | the probe (unit state, restart churn, config readability, `healthz`) |
 | `/usr/local/bin/kian-config-guard` | config ownership guard, also `ExecStartPre=+` of the unit |
 | `/usr/local/bin/kian-alert.sh` | `OnFailure` handler |
@@ -120,6 +121,30 @@ systemctl reset-failed kian && systemctl start kian   # leave a crash loop
 | workers `offline` while the service is active | worker-side tunnel (`ssh -N -L 7400:127.0.0.1:7400 vultr`) or registration refusals in `journalctl -u kian` |
 | `queue row abandoned: re-drive bound exhausted` | expected for a command whose side effect is its own ack path (ADR-033); the command may have run |
 | a delegated task failed/interrupted and `kian workers` shows it holding the worker | not permanent since ADR-035: the slot is reclaimed after `workers.release_after_ms` (default 5 min) or immediately with `kian workers release <id>`; an abnormally interrupted drain (crash/stall) now reaches an honest end first (ADR-041 — a stalled model call is bounded by `providers.<name>.idle_timeout_ms`, default 5 min). Only a `running` drain that is still making progress, or one that ended `awaiting_input` awaiting a person (CONFIRMATION-MODEL phase 2 — answer it to release), legitimately holds the slot; `kian workers release` refuses both by design |
+
+## Retention sweep
+
+Retention is opt-in per config (`retention.enabled`, `min_age_ms`, `min_bytes`): a terminal session
+older than the age bound and larger than the byte bound retires on the next pass. `kian-archive.timer`
+runs `kian-archive.service` once a day (20:00 UTC, 04:00 Asia/Shanghai), which executes two
+commands against the live store:
+
+```bash
+runuser -u kian -- /opt/kian/bin/kian archive run      --config /srv/kian/kian.yaml --db /srv/kian/kian.db --json
+runuser -u kian -- /opt/kian/bin/kian archive receipts --config /srv/kian/kian.yaml --db /srv/kian/kian.db --json
+```
+
+`archive run` writes the session's packages under `/srv/kian/archive`, deletes its online rows in the
+same transaction, and materializes its consumed `chan:` keys into `channel_receipts` — that is what
+keeps a channel replay refused after the incarnation is gone
+([ADR-082](../design/decisions/ADR-082-retention-preserves-replay-evidence.md)). `archive receipts`
+re-derives the ledger from the packages (idempotent), so a lost or partially migrated ledger is
+rebuildable.
+
+The pass writes a JSON report listing `archived`, `skipped` and `failed`; read the last one with
+`journalctl -u kian-archive -n 60 --no-pager`. A non-zero unit means the pass failed — inspect
+`failed[]` before the next tick, and run `kian archive verify <session>` on a package that looks
+suspect.
 
 ## Deploy
 
