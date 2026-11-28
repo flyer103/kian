@@ -803,7 +803,9 @@ failures, warnings}`, no token). Verified L1 against a scripted bridge mock and 
 | Shutdown | SIGINT/SIGTERM | abort the in-flight request, no half-written state (adapter has none to write) | — |
 
 No degradation path turns into a `completed` session or a silent swallow: every one is an audit line
-plus an honest error at the seam.
+plus an honest error at the seam. A paused receive loop is also a status surface: `/metrics`
+carries `superagent.channels.imessage.<name>` with `paused` and `paused_reason`, read from the live
+adapter, so an operator polling health sees the pause without grepping logs.
 
 ## 11. Non-goals (phase 2)
 

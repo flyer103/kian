@@ -428,6 +428,25 @@ async fn e2e_one_inbound_admits_exactly_once_across_replay_and_restart() {
         "the forced untrusted marker rides the admitted input"
     );
 
+    // The receive pause is an operator surface, not only an audit line.
+    let metrics: serde_json::Value = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{port}/metrics"))
+        .send()
+        .await
+        .expect("metrics")
+        .json()
+        .await
+        .expect("metrics json");
+    assert_eq!(
+        metrics["superagent"]["channels"]["imessage"]["imessage"]["paused"],
+        json!(false),
+        "a live receive loop publishes paused:false"
+    );
+    assert!(
+        metrics["superagent"]["channels"]["imessage"]["imessage"]["paused_reason"].is_null(),
+        "no pause reason while receiving"
+    );
+
     // Replay the same guid in-run: the ring absorbs it, nothing new.
     mock.push_updates(updates_with(&message));
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;

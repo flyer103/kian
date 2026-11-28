@@ -2190,6 +2190,10 @@ pub struct SuperAgentRuntime {
     /// Channel name → mock adapter (the injection surface; v1 only
     /// mock channels exist).
     pub channels: BTreeMap<String, Arc<MockChannel>>,
+    /// iMessage adapters by configured name — read by `/metrics` to
+    /// publish each channel's receive pause, which is otherwise only
+    /// an audit line.
+    pub imessage_channels: BTreeMap<String, Arc<kian_superagent::ImessageChannel>>,
     /// The worker's evidence gate (shared counters = the verdict
     /// metrics surface).
     pub worker_gate: EvidenceGateConfig,
@@ -2295,6 +2299,22 @@ impl SuperAgentRuntime {
             })
         });
 
+        // A paused receive loop is otherwise only an audit line: the
+        // adapter's own state is the surface (no event exists yet).
+        let imessage_channels = self
+            .imessage_channels
+            .iter()
+            .map(|(name, channel)| {
+                (
+                    name.clone(),
+                    serde_json::json!({
+                        "paused": channel.paused(),
+                        "paused_reason": channel.paused_reason(),
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<String, serde_json::Value>>();
+
         serde_json::json!({
             "router_session": self.router.load().0,
             "evidence_verdicts": {
@@ -2315,6 +2335,9 @@ impl SuperAgentRuntime {
             "watchdog": watchdog,
             "worker_membership": worker_membership,
             "async_bridge": self.async_metrics.as_ref().map(|m| m.snapshot()),
+            "channels": {
+                "imessage": imessage_channels,
+            },
         })
     }
 }
@@ -2862,6 +2885,7 @@ pub async fn start_services(
     Ok(SuperAgentRuntime {
         router: Arc::clone(&services.router_binding),
         channels: services.mock_channels.clone(),
+        imessage_channels: services.imessage_channels.clone(),
         worker_gate: clone_gate(&services.worker_gate),
         subscription_metrics: Arc::clone(&services.subscription_metrics),
         router_metrics: Arc::clone(&services.router_metrics),
