@@ -85,13 +85,15 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-These are the CI gates on every push ([`.github/workflows/gates.yml`](.github/workflows/gates.yml)).
+These are the CI gates ([`.github/workflows/gates.yml`](.github/workflows/gates.yml)): the workflow
+classifies the diff first, so a code change runs all four and a docs-only change runs
+`cargo fmt --all -- --check` plus `docs_map`.
 `scripts/selfcheck.sh` is the pre-push body and defaults to `scoped`: a docs-only diff runs
 `docs_map`, a crate change builds the workspace (dependents still compile) and runs that crate's
 clippy and serialized tests, and a workspace-level change — any `Cargo.toml`/`Cargo.lock`,
 `kian-core`, `kian-store`, `kian-orchestrator` — runs the full set. `KIAN_SELFCHECK=full` forces the
-full set, `quick` runs fmt + clippy only, `off` skips the hook entirely; CI is unchanged and still
-runs every gate on every push, so a local green is a prediction, not a substitute. Enable the hook
+full set, `quick` runs fmt + clippy only, `off` skips the hook entirely; CI still runs every gate
+for a code change, so a local green is a prediction, not a substitute. Enable the hook
 once per clone with `git config core.hooksPath .githooks`. A docs-only change must still keep links
 and crate mappings consistent — `cargo test -p kian-cli --test docs_map`, which the scoped hook runs.
 

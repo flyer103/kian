@@ -1,15 +1,18 @@
-# The four gates (AGENTS.md) on every push and PR.
+# The four gates (AGENTS.md): fmt, build, clippy, test.
 #
-# Split: `fmt` + `gates` are the per-push feedback loop (the same commands
-# `scripts/selfcheck.sh` runs locally, so a green local run predicts CI).
+# Cost policy: a change that compiles nothing (Markdown, docs/, design/,
+# site/) cannot break a crate, so a `scope` job classifies the diff first and
+# only a code change pays for the workspace sweep (build + clippy + the
+# serialized test suite, ~8-11 minutes). A docs-only change still runs the
+# docs map — link targets and the crate map stay checked.
+#
 # The `postgres` job is the only one that needs a live database; it runs on
-# PRs and nightly instead of on every push to main, and it no longer
-# re-runs the workspace suite (the `gates` job already does, serialized).
+# PRs and on the weekly schedule, and only when the diff can touch a backend.
 #
-# Test parallelism note: crates with process-spawning e2e suites
-# (kian-cli, kiand) run in their own job to avoid port/temp-dir
-# collisions with concurrent suite runs — the same discipline the
-# local round gates use.
+# Test parallelism note: the whole workspace suite (unit tests plus the
+# process-spawning e2e suites in kian-cli, kiand and friends) runs in this
+# one job, serialized inside each binary by `--test-threads=1` — see that
+# step for why.
 
 name: gates
 
@@ -18,8 +21,8 @@ on:
     branches: [main]
   pull_request:
   schedule:
-    # nightly postgres backend coverage (02:00 Asia/Shanghai)
-    - cron: "0 18 * * *"
+    # weekly postgres backend coverage (Mondays 02:00 Asia/Shanghai)
+    - cron: "0 18 * * 1"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -28,8 +31,52 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  # No debuginfo for CI builds. The e2e test binaries are the largest link
+  # artifacts in the workspace — one link died on a full runner disk
+  # (`ld ... signal 7 [Bus error]`) — and a panic still reports file and line.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
+  # Classifies the diff: `code=true` unless every changed path is a document.
+  # An unknown base (new branch, absent commit) falls back to the full sweep.
+  scope:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: diff
+        name: Classify the diff
+        run: |
+          set -euo pipefail
+          code=true
+          base=""
+          head=""
+          if [ "${{ github.event_name }}" = "push" ]; then
+            base="${{ github.event.before }}"
+            head="${{ github.sha }}"
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch --no-tags --quiet origin "${{ github.base_ref }}"
+            base="origin/${{ github.base_ref }}"
+            head="${{ github.sha }}"
+          fi
+          if [ -n "$base" ] && [ "$base" != "0000000000000000000000000000000000000000" ] \
+             && git cat-file -e "$base^{commit}" 2>/dev/null; then
+            changed=$(git diff --name-only "$base" "$head")
+            echo "changed files:"
+            printf '%s\n' "$changed"
+            touched=$(printf '%s\n' "$changed" | sed '/^$/d' \
+              | grep -vE '^(docs/|design/|site/)|[.]md$|^LICENSE$|^NOTICE$' || true)
+            if [ -z "$touched" ]; then
+              code=false
+            fi
+          fi
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "code=$code"
+
   fmt:
     runs-on: ubuntu-latest
     steps:
@@ -40,6 +87,7 @@ jobs:
       - run: cargo fmt --all -- --check
 
   gates:
+    needs: scope
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -60,10 +108,17 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # Build and clippy are safe to share a job; the full test suite
-      # runs alone below so failure output stays readable.
-      - run: cargo build --workspace --locked
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # A docs-only diff changes no crate: the link and crate-map gate
+      # (`cargo test -p kian-cli --test docs_map`) is the whole risk there.
+      - name: Docs map (docs-only change)
+        if: needs.scope.outputs.code != 'true'
+        run: cargo test --locked -p kian-cli --test docs_map
+      - name: Build
+        if: needs.scope.outputs.code == 'true'
+        run: cargo build --workspace --locked
+      - name: Clippy
+        if: needs.scope.outputs.code == 'true'
+        run: cargo clippy --workspace --all-targets -- -D warnings
       # One test at a time *within* a binary: the runner has two cores and a
       # handful of e2e suites pace themselves with short waits (a poll
       # interval, a driver's first cycle). Two concurrent tests on two cores
@@ -71,7 +126,9 @@ jobs:
       # consecutive runs (a 0-vs-1 frame count, a 2-vs-3 call count, an
       # Elapsed). Deterministic beats fast here; the job still sits well
       # inside its 60-minute budget.
-      - run: cargo test --workspace --locked -- --test-threads=1
+      - name: Test (workspace, serialized)
+        if: needs.scope.outputs.code == 'true'
+        run: cargo test --workspace --locked -- --test-threads=1
         env:
           NO_PROXY: 127.0.0.1,localhost
 
@@ -79,10 +136,13 @@ jobs:
   # fail — when the env is absent. This job supplies a real postgres
   # so the gated suites (kian-store, kian-exec, kian-cli postgres_serve
   # and the multi-replica e2e) actually run. PRs exercise a backend
-  # change before merge; the nightly schedule catches drift on main
+  # change before merge; the weekly schedule catches drift on main
   # without paying the database setup on every push.
   postgres:
-    if: github.event_name == 'pull_request' || github.event_name == 'schedule'
+    needs: scope
+    if: >-
+      (github.event_name == 'pull_request' || github.event_name == 'schedule')
+      && needs.scope.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     services:

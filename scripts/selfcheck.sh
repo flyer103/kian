@@ -8,7 +8,7 @@
 #   - workspace-level change    -> everything (any Cargo.toml/Cargo.lock,
 #                                  kian-core, kian-store, kian-orchestrator)
 # KIAN_SELFCHECK=full forces everything, quick runs fmt + clippy only, off
-# skips the hook. CI still runs the full gates on every push either way.
+# skips the hook. CI still runs the full gates for every code change either way.
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
