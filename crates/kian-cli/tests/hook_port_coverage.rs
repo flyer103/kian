@@ -229,6 +229,13 @@ const PRODUCER_FILES: &[ProducerFile] = &[
         admits: 2,
     },
     ProducerFile {
+        // Not a producer: the port's own default `admit_channel` delegates to
+        // `admit` (ADR-081), which is textually a `.admit(` but is the
+        // admission surface itself, not a caller bypassing it.
+        file: "kian-superagent/src/inbox.rs",
+        admits: 1,
+    },
+    ProducerFile {
         file: "kian-superagent/src/policy_version.rs",
         admits: 1,
     },

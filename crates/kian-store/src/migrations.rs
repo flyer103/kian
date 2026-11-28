@@ -172,6 +172,23 @@ const V8_CRON_FIRING_SESSION: Migration = Migration {
     up: "ALTER TABLE cron_firings ADD COLUMN session TEXT",
 };
 
+/// v9 — channel-scoped admission keys (ADR-081). New writes carry
+/// `chan:<channel>:<event_id>`; this generation makes the existing rows
+/// agree, so the first restart after the upgrade cannot re-admit a
+/// message the old key format already answered. The backfill is
+/// conservative on three fronts: it only touches rows whose payload says
+/// `channel_event` (the two marked shapes the shaping path writes —
+/// `kian.*` under the cap, `content.kian.*` over it, with
+/// `spill.channel` as the last resort), it needs a non-empty channel, and
+/// it skips a row whose new key already exists in the same session rather
+/// than failing the whole migration on the unique index. The partial
+/// index serves the cross-incarnation probe of the channel admit.
+const V9_CHANNEL_DEDUPE: Migration = Migration {
+    version: 9,
+    name: "v9_channel_dedupe",
+    up: "CREATE INDEX IF NOT EXISTS idx_inputs_channel_key ON inputs (idempotency_key) WHERE idempotency_key IS NOT NULL;\nUPDATE inputs SET idempotency_key = 'chan:' || COALESCE(json_extract(payload, '$.kian.channel'), json_extract(payload, '$.content.kian.channel'), json_extract(payload, '$.spill.channel')) || ':' || idempotency_key WHERE idempotency_key IS NOT NULL AND idempotency_key NOT LIKE 'chan:%' AND json_valid(payload) AND COALESCE(json_extract(payload, '$.kian.type'), json_extract(payload, '$.content.kian.type')) = 'channel_event' AND COALESCE(json_extract(payload, '$.kian.channel'), json_extract(payload, '$.content.kian.channel'), json_extract(payload, '$.spill.channel')) <> '' AND NOT EXISTS (SELECT 1 FROM inputs x WHERE x.session = inputs.session AND x.idempotency_key = 'chan:' || COALESCE(json_extract(inputs.payload, '$.kian.channel'), json_extract(inputs.payload, '$.content.kian.channel'), json_extract(inputs.payload, '$.spill.channel')) || ':' || inputs.idempotency_key)",
+};
+
 /// The registered adjacent chain, ordered v0 → head. Extensible: append
 /// the next [`Migration`]; never edit a committed entry.
 pub fn chain() -> &'static [Migration] {
@@ -185,6 +202,7 @@ pub fn chain() -> &'static [Migration] {
         V6_SESSION_KIND_INDEX,
         V7_CRON_STATE,
         V8_CRON_FIRING_SESSION,
+        V9_CHANNEL_DEDUPE,
     ]
 }
 
@@ -314,6 +332,17 @@ const PG_V8_CRON_FIRING_SESSION: Migration = Migration {
     up: "ALTER TABLE cron_firings ADD COLUMN session TEXT",
 };
 
+/// v9 (postgres chain) — channel-scoped admission keys, pg DDL (same
+/// version and name as the sqlite generation): the `jsonb` operators
+/// replace `json_extract`, everything else is identical. pg does not
+/// validate JSON on read, so the backfill relies on the store's invariant
+/// that `payload` is always `serde_json` output.
+const PG_V9_CHANNEL_DEDUPE: Migration = Migration {
+    version: 9,
+    name: "v9_channel_dedupe",
+    up: "CREATE INDEX IF NOT EXISTS idx_inputs_channel_key ON inputs (idempotency_key) WHERE idempotency_key IS NOT NULL;\nUPDATE inputs SET idempotency_key = 'chan:' || COALESCE(payload::jsonb #>> '{kian,channel}', payload::jsonb #>> '{content,kian,channel}', payload::jsonb #>> '{spill,channel}') || ':' || idempotency_key WHERE idempotency_key IS NOT NULL AND idempotency_key NOT LIKE 'chan:%' AND COALESCE(payload::jsonb #>> '{kian,type}', payload::jsonb #>> '{content,kian,type}') = 'channel_event' AND COALESCE(payload::jsonb #>> '{kian,channel}', payload::jsonb #>> '{content,kian,channel}', payload::jsonb #>> '{spill,channel}') <> '' AND NOT EXISTS (SELECT 1 FROM inputs x WHERE x.session = inputs.session AND x.idempotency_key = 'chan:' || COALESCE(inputs.payload::jsonb #>> '{kian,channel}', inputs.payload::jsonb #>> '{content,kian,channel}', inputs.payload::jsonb #>> '{spill,channel}') || ':' || inputs.idempotency_key)",
+};
+
 /// The postgres chain: same versions, same names, same ordering as
 /// [`chain`] — the two backends' schemas track each other generation for
 /// generation (DESIGN §3.3), enforced by
@@ -329,6 +358,7 @@ pub fn pg_chain() -> &'static [Migration] {
         PG_V6_SESSION_KIND_INDEX,
         PG_V7_CRON_STATE,
         PG_V8_CRON_FIRING_SESSION,
+        PG_V9_CHANNEL_DEDUPE,
     ]
 }
 
@@ -480,6 +510,29 @@ mod tests {
         assert_eq!(pg_v8.version, 8);
         assert_eq!(pg_v8.name, "v8_cron_firing_session");
         assert_eq!(pg_v8.up, "ALTER TABLE cron_firings ADD COLUMN session TEXT");
+    }
+
+    /// v9 is a committed generation: its SQL is pinned byte-for-byte so a
+    /// rewrite of the channel-key backfill trips this test instead of
+    /// silently diverging from every already-migrated database.
+    #[test]
+    fn v9_generation_sql_is_frozen() {
+        let v9: &Migration = &chain()[9];
+        assert_eq!(v9.version, 9);
+        assert_eq!(v9.name, "v9_channel_dedupe");
+        assert_eq!(
+            v9.up,
+            r##"CREATE INDEX IF NOT EXISTS idx_inputs_channel_key ON inputs (idempotency_key) WHERE idempotency_key IS NOT NULL;
+UPDATE inputs SET idempotency_key = 'chan:' || COALESCE(json_extract(payload, '$.kian.channel'), json_extract(payload, '$.content.kian.channel'), json_extract(payload, '$.spill.channel')) || ':' || idempotency_key WHERE idempotency_key IS NOT NULL AND idempotency_key NOT LIKE 'chan:%' AND json_valid(payload) AND COALESCE(json_extract(payload, '$.kian.type'), json_extract(payload, '$.content.kian.type')) = 'channel_event' AND COALESCE(json_extract(payload, '$.kian.channel'), json_extract(payload, '$.content.kian.channel'), json_extract(payload, '$.spill.channel')) <> '' AND NOT EXISTS (SELECT 1 FROM inputs x WHERE x.session = inputs.session AND x.idempotency_key = 'chan:' || COALESCE(json_extract(inputs.payload, '$.kian.channel'), json_extract(inputs.payload, '$.content.kian.channel'), json_extract(inputs.payload, '$.spill.channel')) || ':' || inputs.idempotency_key)"##
+        );
+        let pg_v9: &Migration = &pg_chain()[9];
+        assert_eq!(pg_v9.version, 9);
+        assert_eq!(pg_v9.name, "v9_channel_dedupe");
+        assert_eq!(
+            pg_v9.up,
+            r##"CREATE INDEX IF NOT EXISTS idx_inputs_channel_key ON inputs (idempotency_key) WHERE idempotency_key IS NOT NULL;
+UPDATE inputs SET idempotency_key = 'chan:' || COALESCE(payload::jsonb #>> '{kian,channel}', payload::jsonb #>> '{content,kian,channel}', payload::jsonb #>> '{spill,channel}') || ':' || idempotency_key WHERE idempotency_key IS NOT NULL AND idempotency_key NOT LIKE 'chan:%' AND COALESCE(payload::jsonb #>> '{kian,type}', payload::jsonb #>> '{content,kian,type}') = 'channel_event' AND COALESCE(payload::jsonb #>> '{kian,channel}', payload::jsonb #>> '{content,kian,channel}', payload::jsonb #>> '{spill,channel}') <> '' AND NOT EXISTS (SELECT 1 FROM inputs x WHERE x.session = inputs.session AND x.idempotency_key = 'chan:' || COALESCE(inputs.payload::jsonb #>> '{kian,channel}', inputs.payload::jsonb #>> '{content,kian,channel}', inputs.payload::jsonb #>> '{spill,channel}') || ':' || inputs.idempotency_key)"##
+        );
     }
 
     /// v0 is a committed generation: its SQL is pinned byte-for-byte so
@@ -925,6 +978,105 @@ mod tests {
             .expect("load legacy firing")
             .expect("row");
         assert_eq!(row.session, None, "pre-v8 row decodes with no session");
+        store.close().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// v8 -> v9 on a real database (ADR-081): the backfill prefixes every
+    /// legacy channel row (both marked payload shapes), leaves a
+    /// non-channel row alone, and skips a row whose new key already exists
+    /// in the same session instead of tripping the unique index.
+    #[tokio::test]
+    async fn v8_database_with_channel_rows_upgrades_to_channel_keys() {
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+        let path =
+            std::env::temp_dir().join(format!("kian-migrate-v9-{}.sqlite", uuid::Uuid::new_v4()));
+        {
+            let connect = SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true);
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(connect)
+                .await
+                .expect("raw pool opens");
+            sqlx::raw_sql(
+                "CREATE TABLE _kian_migrations (\n    version INTEGER PRIMARY KEY,\n    name TEXT NOT NULL,\n    applied_at INTEGER NOT NULL\n)",
+            )
+            .execute(&pool)
+            .await
+            .expect("meta table");
+            for migration in &super::chain()[..9] {
+                sqlx::raw_sql(migration.up)
+                    .execute(&pool)
+                    .await
+                    .expect("pre-v9 migration applies");
+                sqlx::query(
+                    "INSERT INTO _kian_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
+                )
+                .bind(i64::from(migration.version))
+                .bind(migration.name)
+                .bind(0i64)
+                .execute(&pool)
+                .await
+                .expect("bookkeeping row");
+            }
+            let under_cap =
+                r#"{"kian":{"type":"channel_event","channel":"imessage","event_id":"AAAA"}}"#;
+            let over_cap = concat!(
+                r#"{"content":{"kian":{"type":"channel_event","channel":"imessage","event_id":"BBBB"}},"#,
+                r#""spill":{"event_id":"BBBB","channel":"imessage"}}"#
+            );
+            let collision =
+                r#"{"kian":{"type":"channel_event","channel":"imessage","event_id":"DDDD"}}"#;
+            let session = "01890000-0000-7000-8000-000000000001";
+            for (key, payload) in [
+                ("AAAA", under_cap),
+                ("BBBB", over_cap),
+                ("CCCC", r#"{"text":"hi"}"#),
+                ("DDDD", collision),
+                ("chan:imessage:DDDD", collision),
+            ] {
+                sqlx::query(
+                    "INSERT INTO inputs (id, session, payload, admitted_at, eligible_at, idempotency_key) VALUES (?1, ?2, ?3, 0, 0, ?4)",
+                )
+                .bind(uuid::Uuid::new_v4().to_string())
+                .bind(session)
+                .bind(payload)
+                .bind(key)
+                .execute(&pool)
+                .await
+                .expect("legacy input row");
+            }
+            pool.close().await;
+        }
+
+        // The new build opens the file: migrate() applies v9 only.
+        let store = crate::EventStore::open(&path).await.expect("open store");
+        let versions = super::applied_versions(store.pool())
+            .await
+            .expect("versions");
+        assert!(versions.contains(&9), "v9 applied: {versions:?}");
+        let keys: Vec<String> = sqlx::query_scalar(
+            "SELECT idempotency_key FROM inputs WHERE session = '01890000-0000-7000-8000-000000000001' ORDER BY idempotency_key",
+        )
+        .fetch_all(store.pool())
+        .await
+        .expect("keys");
+        assert_eq!(
+            keys,
+            vec![
+                "CCCC".to_string(),
+                "DDDD".to_string(),
+                "chan:imessage:AAAA".to_string(),
+                "chan:imessage:BBBB".to_string(),
+                "chan:imessage:DDDD".to_string(),
+            ],
+            "channel rows are prefixed; a non-channel row and a colliding key are untouched"
+        );
         store.close().await;
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));

@@ -576,7 +576,7 @@ async fn no_cursor_source_repoll_produces_deduplicated_admissions_zero_duplicate
     }
     let rows = inbox.rows.lock().expect("rows lock");
     assert_eq!(rows.len(), 1, "zero duplicate rows across the re-polls");
-    assert_eq!(rows[0], (router, "tick-42".to_string()));
+    assert_eq!(rows[0], (router, "chan:timer:tick-42".to_string()));
 }
 
 // ---------------------------------------------------------------------

@@ -8,8 +8,9 @@
 //! topic through [`PassthroughRegistry`], admitting straight into the
 //! owning worker's inbox without Router judgment. Since the
 //! registry is many-to-many: **one row per subscriber** is admitted
-//! (idempotent per `(session, event_id)` — the store's dedupe index is
-//! per-session), so workers sharing a topic observe each other's
+//! (keyed `chan:<channel>:<event_id>` — the store's dedupe index is
+//! per-session, plus the Router route's cross-incarnation guard,
+//! ADR-081), so workers sharing a topic observe each other's
 //! events. A mid-set write failure does not prevent the remaining
 //! subscribers' rows: the loop continues, the error is returned for the
 //! adapter's idempotent retry, and every admission and every drop is
@@ -128,8 +129,9 @@ pub enum RoutingOutcome {
 pub struct FanoutAdmission {
     /// The subscriber whose inbox holds the durable row.
     pub session: SessionId,
-    /// True when this subscriber already held a row for the event id
-    /// (idempotent per `(session, event_id)`).
+    /// True when this subscriber already held a row for the event key
+    /// (idempotent per `(session, key)`; a Router target also dedupes
+    /// against a consumed row in any session).
     pub deduplicated: bool,
 }
 
@@ -488,14 +490,16 @@ impl SubscriptionService {
     }
 
     /// Handles one inbound channel event: rule match → route →
-    /// durable admit (idempotent per `(session, event_id)`) → wake.
+    /// durable admit (keyed `chan:<channel>:<event_id>`, idempotent per
+    /// session, cross-session for the Router route — ADR-081) → wake.
     ///
     /// Ordering is the point (invariant 1): each subscriber's `admit`
     /// future is awaited to completion — the row durably committed —
     /// *before* its `wake` is invoked. A failed admit wakes nothing;
     /// in a fan-out the remaining subscribers are still admitted (the
-    /// per-`(session, event_id)` idempotency means the adapter's retry
-    /// fills only the gap) and the first error is returned.
+    /// per-session idempotency (cross-session on the Router route) means
+    /// the adapter's retry fills only the gap) and the first error is
+    /// returned.
     pub async fn handle_event(
         &self,
         event: ChannelEvent,
@@ -720,21 +724,35 @@ impl SubscriptionService {
         // Invariant 1 per subscriber: the admit future resolves only
         // on commit, and that subscriber's wake strictly after. The
         // set is sorted, so a fan-out admits in deterministic order.
+        //
+        // The key is channel-scoped (`chan:<channel>:<event_id>`, ADR-081)
+        // and the Router target additionally gets the cross-incarnation
+        // guard: a key any session already consumed suppresses the row, so
+        // a rotation plus a bridge replay cannot re-answer an old message.
+        // A passthrough subscriber keeps plain per-session dedupe — in a
+        // fan-out a sibling admitted first may already be consumed, and
+        // that must not starve this subscriber.
+        let key = crate::intake::channel_idempotency_key(&event.channel, &event.event_id);
+        let router_session = self.router_session.load();
         let mut admitted: Vec<FanoutAdmission> = Vec::new();
         let mut first_err: Option<InboxWriteError> = None;
         for target in targets {
-            match self
-                .inbox
-                .admit(target, payload.clone(), Some(event.event_id.clone()))
-                .await
-            {
+            let receipt = if target == router_session {
+                self.inbox
+                    .admit_channel(target, payload.clone(), key.clone())
+                    .await
+            } else {
+                self.inbox
+                    .admit(target, payload.clone(), Some(key.clone()))
+                    .await
+            };
+            match receipt {
                 Ok(receipt) => {
                     self.inbox.wake(target);
                     // the admit line's code comes from the same
                     // mapping the assembly counters use — audit and
                     // metrics cannot disagree.
-                    let reason =
-                        routed_reason(target, self.router_session.load(), receipt.deduplicated);
+                    let reason = routed_reason(target, router_session, receipt.deduplicated);
                     info!(
                         target: "kian::subscriptions",
                         session = %target.0,
@@ -1024,7 +1042,7 @@ mod tests {
         assert_eq!(admits.len(), 1);
         assert_eq!(wakes, vec![router]);
         assert_eq!(admits[0].0, router);
-        assert_eq!(admits[0].1.as_deref(), Some("evt-1"));
+        assert_eq!(admits[0].1.as_deref(), Some("chan:mock-im:evt-1"));
     }
 
     #[tokio::test]
@@ -1260,8 +1278,8 @@ mod tests {
         assert_eq!(
             admits,
             vec![
-                (worker_a, Some("evt-fan".into())),
-                (worker_b, Some("evt-fan".into())),
+                (worker_a, Some("chan:ci:evt-fan".into())),
+                (worker_b, Some("chan:ci:evt-fan".into())),
             ]
         );
         assert_eq!(*inbox.wakes.lock().unwrap(), vec![worker_a, worker_b]);
@@ -1354,7 +1372,7 @@ mod tests {
         // never admitted, never woken.
         assert_eq!(
             inbox.admits.lock().unwrap().clone(),
-            vec![(worker, Some("evt-live".into()))]
+            vec![(worker, Some("chan:ci:evt-live".into()))]
         );
         assert_eq!(*inbox.wakes.lock().unwrap(), vec![worker]);
     }
@@ -1391,7 +1409,7 @@ mod tests {
         );
         assert_eq!(
             inbox.admits.lock().unwrap().clone(),
-            vec![(live, Some("evt-mixed".into()))]
+            vec![(live, Some("chan:ci:evt-mixed".into()))]
         );
 
         // All ended: the release — the Router is the single target.
@@ -1408,7 +1426,10 @@ mod tests {
             }
         );
         let admits = inbox.admits.lock().unwrap().clone();
-        assert_eq!(admits.last(), Some(&(router, Some("evt-release".into()))));
+        assert_eq!(
+            admits.last(),
+            Some(&(router, Some("chan:ci:evt-release".into())))
+        );
         assert_eq!(
             admits.iter().filter(|(s, _)| *s == ended).count(),
             0,
@@ -1723,7 +1744,7 @@ mod tests {
         // Durable row keyed by the tick id, then the wake — invariant 1.
         assert_eq!(
             inbox.admits.lock().unwrap().clone(),
-            vec![(watchdog, Some("tick-1".into()))]
+            vec![(watchdog, Some("chan:timer:tick-1".into()))]
         );
         assert_eq!(*inbox.wakes.lock().unwrap(), vec![watchdog]);
 
@@ -1938,6 +1959,132 @@ mod tests {
                 plugin: "g".into(),
                 reason: "r".into()
             }
+        );
+    }
+
+    // -- the channel guard (ADR-081) ---------------------------------------
+
+    /// Records which port method each admission took, so "Router ⇒ the
+    /// channel guard, fan-out ⇒ the plain per-session admit" is observable
+    /// without a server.
+    struct ChannelAwareInbox {
+        plain: Mutex<Vec<(SessionId, Option<String>)>>,
+        channel: Mutex<Vec<(SessionId, String)>>,
+    }
+
+    impl ChannelAwareInbox {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                plain: Mutex::new(Vec::new()),
+                channel: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl InboxWriter for ChannelAwareInbox {
+        fn admit(
+            &self,
+            session: SessionId,
+            _payload: Value,
+            idempotency_key: Option<String>,
+        ) -> BoxFuture<'static, Result<AdmitReceipt, InboxWriteError>> {
+            self.plain.lock().unwrap().push((session, idempotency_key));
+            Box::pin(async {
+                Ok(AdmitReceipt {
+                    deduplicated: false,
+                })
+            })
+        }
+
+        fn admit_channel(
+            &self,
+            session: SessionId,
+            _payload: Value,
+            idempotency_key: String,
+        ) -> BoxFuture<'static, Result<AdmitReceipt, InboxWriteError>> {
+            self.channel
+                .lock()
+                .unwrap()
+                .push((session, idempotency_key));
+            Box::pin(async {
+                Ok(AdmitReceipt {
+                    deduplicated: false,
+                })
+            })
+        }
+
+        fn wake(&self, _session: SessionId) -> WakeOutcome {
+            WakeOutcome::Folded
+        }
+    }
+
+    /// The Router route is the one that must survive session incarnations,
+    /// so it takes the channel-scoped key through `admit_channel` and never
+    /// the plain per-session admit.
+    #[tokio::test]
+    async fn router_route_uses_the_channel_guard() {
+        let inbox = ChannelAwareInbox::new();
+        let router = sid(1);
+        let service = SubscriptionService::new(
+            crate::binding::ResidentBinding::new(router),
+            rules(),
+            Arc::clone(&inbox) as Arc<dyn InboxWriter>,
+        );
+        service
+            .handle_event(event("mock-im", "evt-guard", None))
+            .await
+            .unwrap();
+        assert!(
+            inbox.plain.lock().unwrap().is_empty(),
+            "the Router route never takes the plain admit"
+        );
+        assert_eq!(
+            inbox.channel.lock().unwrap().clone(),
+            vec![(router, "chan:mock-im:evt-guard".to_string())]
+        );
+    }
+
+    /// A fan-out target keeps the per-session dedupe: one event may land in
+    /// several live worker sessions by design, and a subscriber's row may
+    /// already be consumed while its sibling's is not.
+    #[tokio::test]
+    async fn passthrough_route_stays_on_plain_per_session_admit() {
+        let inbox = ChannelAwareInbox::new();
+        let router = sid(1);
+        let worker = sid(2);
+        let service = SubscriptionService::new(
+            crate::binding::ResidentBinding::new(router),
+            rules(),
+            Arc::clone(&inbox) as Arc<dyn InboxWriter>,
+        );
+        service.register_topic("pr-9", worker);
+        service
+            .handle_event(event("ci", "evt-guard-2", Some("pr-9")))
+            .await
+            .unwrap();
+        assert!(
+            inbox.channel.lock().unwrap().is_empty(),
+            "a fan-out subscriber keeps per-session dedupe"
+        );
+        assert_eq!(
+            inbox.plain.lock().unwrap().clone(),
+            vec![(worker, Some("chan:ci:evt-guard-2".to_string()))]
+        );
+    }
+
+    /// The port default keeps every writer that only implements `admit`
+    /// compiling and working: `admit_channel` delegates.
+    #[tokio::test]
+    async fn the_port_defaults_admit_channel_to_admit() {
+        let inbox = ScriptedInbox::new();
+        let receipt = inbox
+            .admit_channel(sid(7), json!({"text": "hi"}), "chan:ci:evt-default".into())
+            .await
+            .unwrap();
+        assert!(!receipt.deduplicated);
+        assert_eq!(
+            inbox.admits.lock().unwrap().clone(),
+            vec![(sid(7), Some("chan:ci:evt-default".to_string()))]
         );
     }
 }

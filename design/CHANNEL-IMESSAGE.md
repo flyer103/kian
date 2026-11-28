@@ -735,23 +735,29 @@ failures, warnings}`, no token). Verified L1 against a scripted bridge mock and 
 
 ## 9. Dedupe and cursor discipline
 
-- **Durable guard = `guid` idempotency.** `event_id` is Apple's message GUID, so admission is
-  idempotent per `(session, event_id)` across polls, retries and restarts: a replay produces
-  `deduplicated` admissions and zero duplicate rows.
+- **Durable guard = channel-scoped `guid` idempotency.** `event_id` is Apple's message GUID, so the
+  admission key is `chan:<channel>:<event_id>` and admission is idempotent across polls, retries and
+  restarts: a replay produces `deduplicated` admissions and zero duplicate rows. The guard's scope
+  is the event, never the session: a Router-route admission is refused when a row with that key has
+  been **consumed** in any session, so a restart, a rotation or a re-pinned `router.session_id`
+  cannot re-admit — and the Router cannot re-answer — a processed message (ADR-081). Passthrough
+  subscribers keep one row per subscriber, and an admitted-but-unconsumed row is never swallowed.
 - **Bounded in-memory ring** (4096 guids) in front of the durable guard: a repeated guid inside the
   window is dropped without a fan-out. The ring is a cache; losing it costs nothing.
 - **Two cursors, two owners.** The bridge owns a `rowid` read position (persisted best-effort,
   disposable, reset on `chat.db` replacement). The adapter owns only an in-memory `since_rowid` for
   its current process. **Kian persists no position table** — a client-side read position is
-  pre-event durable state (constraint 1); the honest v1 bound is "exactly one admission per `guid`
-  (idempotent replay), never two rows", plus the bridge's bounded catch-up.
+  pre-event durable state (constraint 1); the honest v1 bound is "at most one *processed*
+  admission per `guid`, deduplicated across session incarnations" (ADR-081), plus the bridge's
+  bounded catch-up.
 - **A settling row parks the read position.** While a multi-attachment row is mid-commit (§4), the
   adapter passes `rowid - 1` instead of `next_rowid` for its next page, for at most
   `ROW_SETTLE_WINDOW` (five seconds). Nothing was admitted, so the re-read costs latency only, and
   the `guid` guard makes any duplicate read a no-op (ADR-070).
 - **Downtime bounds (honest).**
   - Adapter restart, bridge alive: `since_rowid: 0` → the bridge's tail replay (last
-    `watch.catchup_rows` rows); no gap inside the window, duplicates absorbed by `guid` dedupe; older
+    `watch.catchup_rows` rows); no gap inside the window, duplicates absorbed by the channel-scoped
+    `guid` guard (ADR-081); older
     than the window is a recorded gap.
   - Both restart (Mac reboot + kian restart): the same tail replay from the bridge's persisted
     cursor — no gap inside the window, because the cursor file outlives both processes.

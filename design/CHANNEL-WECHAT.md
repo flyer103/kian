@@ -347,9 +347,11 @@ kian wechat login [--config <path>] [--channel <name>] [--json]
 
 ## 10. Dedupe and cursor discipline
 
-- **Durable guard = `event_id` idempotency.** `event_id` is the platform `message_id`, so an
-  admission is idempotent per `(session, event_id)` across polls *and* restarts — a replay
-  produces `deduplicated` admissions, zero duplicate rows.
+- **Durable guard = channel-scoped `event_id` idempotency.** `event_id` is the platform
+  `message_id` and the admission key is `chan:<channel>:<event_id>`, so an admission is idempotent
+  across polls, restarts and resident incarnations — a replay produces `deduplicated` admissions and
+  zero duplicate rows; on the Router route the guard additionally spans sessions, refusing a key
+  that is already consumed anywhere (ADR-081).
 - **Bounded in-memory ring** (4096 ids) in front of the durable guard: a repeated id inside the
   window is dropped without a fan-out or a second admission attempt. The ring is a cache, not
   state; losing it on restart costs nothing (the durable guard still holds).

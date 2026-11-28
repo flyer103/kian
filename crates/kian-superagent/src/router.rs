@@ -2909,6 +2909,30 @@ impl InboxWriter for RouterInbox {
         })
     }
 
+    /// The channel admission (ADR-081) keeps the residency signal: a fresh
+    /// row in the Router session advances the counter exactly as `admit`
+    /// does, while the cross-incarnation guard itself lives in the inner
+    /// port (engine → store). Delegating to `admit` here would silently
+    /// downgrade every Router admission to the per-session dedupe — the
+    /// guard would never reach the store.
+    fn admit_channel(
+        &self,
+        session: SessionId,
+        payload: Value,
+        idempotency_key: String,
+    ) -> BoxFuture<'static, Result<AdmitReceipt, InboxWriteError>> {
+        let is_router = session == self.router.load();
+        let counter = Arc::clone(&self.admits);
+        let fut = self.inner.admit_channel(session, payload, idempotency_key);
+        Box::pin(async move {
+            let receipt = fut.await?;
+            if is_router && !receipt.deduplicated {
+                counter.fetch_add(1, Ordering::Release);
+            }
+            Ok(receipt)
+        })
+    }
+
     fn wake(&self, session: SessionId) -> WakeOutcome {
         self.inner.wake(session)
     }
@@ -4742,6 +4766,68 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(inbox.admit_count(), 0);
+    }
+
+    /// ADR-081: the channel admission must reach the inner port's
+    /// `admit_channel` (the port that carries the cross-incarnation guard),
+    /// not degrade to `admit` — and it keeps the residency signal.
+    #[tokio::test]
+    async fn router_inbox_forwards_the_channel_admit() {
+        struct ChannelInbox {
+            plain: Mutex<Vec<Option<String>>>,
+            channel: Mutex<Vec<String>>,
+        }
+        impl InboxWriter for ChannelInbox {
+            fn admit(
+                &self,
+                _session: SessionId,
+                _payload: serde_json::Value,
+                key: Option<String>,
+            ) -> BoxFuture<'static, Result<AdmitReceipt, InboxWriteError>> {
+                self.plain.lock().unwrap().push(key);
+                Box::pin(async {
+                    Ok(AdmitReceipt {
+                        deduplicated: false,
+                    })
+                })
+            }
+            fn admit_channel(
+                &self,
+                _session: SessionId,
+                _payload: serde_json::Value,
+                key: String,
+            ) -> BoxFuture<'static, Result<AdmitReceipt, InboxWriteError>> {
+                self.channel.lock().unwrap().push(key);
+                Box::pin(async {
+                    Ok(AdmitReceipt {
+                        deduplicated: false,
+                    })
+                })
+            }
+            fn wake(&self, _session: SessionId) -> WakeOutcome {
+                WakeOutcome::Folded
+            }
+        }
+        let inner = Arc::new(ChannelInbox {
+            plain: Mutex::new(Vec::new()),
+            channel: Mutex::new(Vec::new()),
+        });
+        let router = sid(10);
+        let inbox = RouterInbox::new(
+            inner.clone() as Arc<dyn InboxWriter>,
+            crate::binding::ResidentBinding::new(router),
+        );
+        inbox
+            .admit_channel(router, json!("evt"), "chan:imessage:evt".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            inner.channel.lock().unwrap().as_slice(),
+            ["chan:imessage:evt"],
+            "the guard-carrying method is the one that runs"
+        );
+        assert!(inner.plain.lock().unwrap().is_empty());
+        assert_eq!(inbox.admit_count(), 1, "a fresh router row counts");
     }
 
     #[test]

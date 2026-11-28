@@ -453,8 +453,9 @@ replica).
 
 `{"surfaced": n}` is the number of channel events surfaced downstream. `0` is a successful, honest
 drop (duplicate delivery id, unsupported/filtered event type, or a repository outside the mapping
-table). Delivery-id dedupe is downstream, per `(session, event_id)` — the webhook route itself does
-not keep a delivery table.
+table). Delivery-id dedupe is downstream, keyed `chan:<channel>:<event_id>` (the Router route
+additionally spans sessions, [ADR-081](decisions/ADR-081-channel-dedupe-across-session-incarnations.md))
+— the webhook route itself does not keep a delivery table.
 
 ## 8. KiandProto v3 — BYOM endpoint protocol
 

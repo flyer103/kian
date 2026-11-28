@@ -645,7 +645,7 @@ async fn lark_event_flows_through_classes_rules_and_provenance_untrusted() {
     );
     let (target, payload, key) = &admits[0];
     assert_eq!(*target, router); // empty-set passthrough fallback
-    assert_eq!(key.as_deref(), Some("om_1")); // event_id idempotency key
+    assert_eq!(key.as_deref(), Some("chan:lark:om_1")); // channel-scoped event key
     assert_eq!(inbox.wakes.lock().unwrap().len(), 1);
 
     // Provenance: the wrapper is the `{"kian":…}` channel-event

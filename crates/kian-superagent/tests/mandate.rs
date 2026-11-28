@@ -718,7 +718,7 @@ async fn inferred_under_changed_version_releases_to_the_router() {
         vec![(
             router,
             json!({"kian": {"type": "channel_event", "channel": "github", "topic": "acme/repo#7", "event_id": "evt-stale", "raw": {"action": "commented"}}}),
-            Some("evt-stale".into())
+            Some("chan:github:evt-stale".into())
         )]
     );
     // Honest audit: the release line names the worker, the stale

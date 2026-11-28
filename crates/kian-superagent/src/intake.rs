@@ -1,8 +1,9 @@
 //! Thread/Correlation intake projection (ADR-013 draft).
 //!
-//! Kian's intake already has channel-admit idempotency
-//! (`(session, event_id)`, one row per event, never two) and
-//! adapter-chosen topics. The prototype's domain layer (reference 001,
+//! Kian's intake already has channel-admit idempotency (one key per
+//! channel event, [`channel_idempotency_key`]; the Router route
+//! additionally refuses a key already consumed in any session
+//! incarnation — ADR-081) and adapter-chosen topics. The prototype's domain layer (reference 001,
 //! Source/Thread/Correlation rows) adds three things this module
 //! projects onto that substrate — **without a single new event kind,
 //! table, or core seam**:
@@ -65,6 +66,16 @@ pub const THREAD_KEY_FIELD: &str = "thread_key";
 /// `group` (adapter-declared chat/repo provenance), which fills the
 /// `<group>` slot of the canonical form.
 pub const GROUP_FIELD: &str = "group";
+
+/// The durable admission key of one channel event (ADR-081):
+/// `chan:<channel>:<event_id>`. Channel-scoped so two channels that
+/// reuse an id never collide, and readable in the store. The admission
+/// pipeline is the only writer; a channel rename or an adapter's
+/// event-id change re-delivers once, bounded by the adapter's catch-up
+/// window (ADR-081 consequences).
+pub fn channel_idempotency_key(channel: &str, event_id: &str) -> String {
+    format!("chan:{channel}:{event_id}")
+}
 
 // ---------------------------------------------------------------------
 // Thread key derivation

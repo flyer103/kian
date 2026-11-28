@@ -811,8 +811,10 @@ graph TB
  a PR created by a Worker flow straight into that Worker's inbox without Router judgment) — the
  load-reduction device validated by the article. The registry is many-to-many: a topic maps
  to the *set* of worker sessions that served it, and one event admits one durable row per
- subscriber (idempotent per `(session, event_id)`; a mid-set write failure is retried per
- subscriber), so workers sharing a topic observe each other's events and self-resolve conflicts
+ subscriber (keyed `chan:<channel>:<event_id>`, deduplicated per `(session, key)` — the Router's
+ cross-incarnation guard deliberately does not apply to a fan-out; a mid-set write failure is
+ retried per subscriber), so workers sharing a topic observe each other's events and self-resolve
+ conflicts
  without peer links — the Router stays the cross-task rendezvous, and only an empty set falls
  back to it.
 - **Follow-up ownership** (reference 002): a person's follow-up belongs to the
@@ -900,8 +902,8 @@ graph TB
  Inline view (a strictly shorter excerpt, canonical `topic`/`event_id`, and any configured
  top-level scalar association ids), `"spill": true`, and `continuation: {event_id}`; the row
  envelope carries the verbatim raw as its sidecar, producing the atomic admitted/spilled pair at
- the ordinary consumption write. Idempotent `(session, event_id)` admission still dedupes the
- whole pair. An optional `vision` flag (default false) additionally emits a sibling `images` array of
+ the ordinary consumption write. Admission keyed `chan:<channel>:<event_id>` still dedupes the
+ whole pair (the Router route across incarnations, ADR-081). An optional `vision` flag (default false) additionally emits a sibling `images` array of
  `{artifact, media_type}` beside the unchanged wrapper for post-edge image items, which is how a
  vision target reads pixels (ADR-065); over-cap inputs carry no images. There is no retroactive
  re-shaper: committed context remains immutable and `derive_model_context` stays verbatim. Neighbor inlining v1 reads only fields on this payload;
@@ -1925,7 +1927,7 @@ refused); then — and only then — parse and hand the verified `(event type, d
 triple to the github adapter's `ingest_delivery`. Verification precedes any parsing
 (untrusted-by-default, the discipline applied to the transport); delivery-id dedupe is
 deliberately not the receiver's — the delivery id is the event id, so the subscription pipeline's
-existing `(session, event_id)` idempotency is the durable guard. Rejections are honest 4xx
+existing channel admission guard (`chan:<channel>:<event_id>`, ADR-081) is the durable guard. Rejections are honest 4xx
 responses with `kian::webhook` audit lines — no event, no row, no parse — and the resident
 iron-rule test greps the webhook module with the same forbidden-token table as the other handler
 modules (the module names no execution or store-write symbol).

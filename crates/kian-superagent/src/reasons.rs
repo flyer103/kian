@@ -58,8 +58,9 @@ pub enum IntakeReason {
     /// (the watchdog ticks) — the shared "no judge turn spent"
     /// code, the closed set has no per-route variant.
     AdmittedPassthrough,
-    /// The `(session, event_id)` row already existed — exactly one
-    /// durable row either way (idempotent admission).
+    /// The row for this key already existed — in this session, or (on
+    /// the Router route) consumed in any session — exactly one durable
+    /// row either way (idempotent admission, ADR-081).
     Deduplicated,
     /// Reserved for: an all-ended subscriber set falls back to the
     /// Router as a *release to fresh evaluation*, not a plain admit.

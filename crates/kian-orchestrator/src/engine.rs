@@ -1719,6 +1719,32 @@ where
         Ok(outcome)
     }
 
+    /// Admits one channel event under the cross-incarnation guard
+    /// (ADR-081): the row lands like [`Engine::admit`], but the store
+    /// refuses the key when any session has already **consumed** it, so a
+    /// replay after a session rotation is a no-op. The wake still fires —
+    /// it is advisory, and a deduplicated admit may have left a live row
+    /// in this session to drain.
+    pub async fn admit_channel(
+        &self,
+        session: SessionId,
+        content: Value,
+        idempotency_key: String,
+    ) -> Result<AdmitOutcome, EngineError> {
+        let now = self.clock.now_ms();
+        let input = InputRow {
+            id: Uuid::new_v4(),
+            session,
+            payload: content,
+            admitted_at: now,
+            eligible_at: now,
+            idempotency_key: Some(idempotency_key),
+        };
+        let outcome = self.store.admit_channel(input).await?;
+        self.publish_admit_wake(session).await;
+        Ok(outcome)
+    }
+
     /// Admits one input at an explicit eligibility instant (ADR-060):
     /// the durable row is written exactly like Engine::admit, but a
     /// row that is not yet eligible does NOT wake. The due-wake

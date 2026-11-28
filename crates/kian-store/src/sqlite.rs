@@ -302,6 +302,20 @@ const ADMIT_SQL: &str = "INSERT INTO inputs (id, session, payload, admitted_at, 
 
 const INPUT_BY_KEY_SQL: &str = "SELECT id, session, payload, admitted_at, eligible_at, idempotency_key FROM inputs WHERE session = ?1 AND idempotency_key = ?2";
 
+/// Channel-scoped admit (ADR-081): the same durable write as [`ADMIT_SQL`]
+/// plus the cross-incarnation guard — the insert is refused when a row
+/// with this idempotency key is already *consumed* in any session. A row
+/// that was merely admitted never blocks, so a replay still rescues a
+/// pending row out of a frozen predecessor. Still one statement (the
+/// `NOT EXISTS` probe cannot race a check-then-insert window), served by
+/// `idx_inputs_channel_key` (migration v9).
+const ADMIT_CHANNEL_SQL: &str = "INSERT INTO inputs (id, session, payload, admitted_at, eligible_at, idempotency_key, admitted_seq)\nSELECT ?1, ?2, ?3, ?4, ?5, ?6, (SELECT COALESCE(MAX(admitted_seq), 0) + 1 FROM inputs)\nWHERE NOT EXISTS (SELECT 1 FROM inputs p WHERE p.idempotency_key = ?6 AND p.consumed_by_seq IS NOT NULL)\nON CONFLICT (session, idempotency_key) DO NOTHING";
+
+/// The suppressing row of a refused channel admit: the consumed row with
+/// this key in *any* session (ADR-081 decision 6 — the receipt names the
+/// row that already answered the event, wherever its incarnation lives).
+const CONSUMED_BY_KEY_SQL: &str = "SELECT id, session, payload, admitted_at, eligible_at, idempotency_key FROM inputs WHERE idempotency_key = ?1 AND consumed_by_seq IS NOT NULL ORDER BY admitted_at ASC LIMIT 1";
+
 const ELIGIBLE_SQL: &str = "SELECT id, session, payload, admitted_at, eligible_at, idempotency_key FROM inputs WHERE session = ?1 AND consumed_by_seq IS NULL AND eligible_at <= ?2 ORDER BY eligible_at ASC, admitted_seq ASC";
 
 /// (R17 C4, pin P3-5) the read-only per-session inbox read behind the
@@ -394,6 +408,70 @@ pub(crate) async fn admit(pool: &SqlitePool, input: InputRow) -> Result<AdmitOut
             session: SessionId(Uuid::parse_str(&session_key).unwrap_or_else(|_| Uuid::nil())),
             input_id: Uuid::nil(),
             reason: "unique index reported a collision but no row was found".into(),
+        })
+}
+
+/// The cross-incarnation channel admission (ADR-081). Identical to
+/// [`admit`] except the insert additionally refuses a key that is already
+/// consumed in any session; `deduplicated: true` then names the consumed
+/// row (this session's row is read back first, the suppressing row
+/// second).
+pub(crate) async fn admit_channel(
+    pool: &SqlitePool,
+    input: InputRow,
+) -> Result<AdmitOutcome, InboxError> {
+    let payload = serde_json::to_string(&input.payload)?;
+    let session_key = input.session.0.to_string();
+    let result = sqlx::query(ADMIT_CHANNEL_SQL)
+        .bind(input.id.to_string())
+        .bind(&session_key)
+        .bind(&payload)
+        .bind(ie_i64(input.admitted_at, "admitted_at")?)
+        .bind(ie_i64(input.eligible_at, "eligible_at")?)
+        .bind(input.idempotency_key.as_deref())
+        .execute(pool)
+        .await?;
+    if result.rows_affected() == 1 {
+        return Ok(AdmitOutcome {
+            input,
+            deduplicated: false,
+        });
+    }
+    let Some(key) = input.idempotency_key.clone() else {
+        return Err(InboxError::CorruptRow {
+            session: input.session,
+            input_id: input.id,
+            reason: "channel insert skipped without an idempotency key".into(),
+        });
+    };
+    // Zero rows: this session already holds the key (first write wins), or
+    // the cross-incarnation guard refused a key consumed elsewhere.
+    let existing: Option<InputCols> = sqlx::query_as(INPUT_BY_KEY_SQL)
+        .bind(&session_key)
+        .bind(&key)
+        .fetch_optional(pool)
+        .await?;
+    if let Some(existing) = existing {
+        return decode_input(existing).map(|input| AdmitOutcome {
+            input,
+            deduplicated: true,
+        });
+    }
+    let suppressed: Option<InputCols> = sqlx::query_as(CONSUMED_BY_KEY_SQL)
+        .bind(&key)
+        .fetch_optional(pool)
+        .await?;
+    suppressed
+        .map(decode_input)
+        .transpose()?
+        .map(|input| AdmitOutcome {
+            input,
+            deduplicated: true,
+        })
+        .ok_or(InboxError::CorruptRow {
+            session: SessionId(Uuid::parse_str(&session_key).unwrap_or_else(|_| Uuid::nil())),
+            input_id: Uuid::nil(),
+            reason: "channel admit was refused but neither this session's row nor a consumed row was found".into(),
         })
 }
 

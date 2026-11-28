@@ -351,7 +351,7 @@ async fn live_executor_owns_the_follow_up_with_zero_router_judge_turns() {
     // and no Router row or wake: the event cannot enter any Router
     // drain, so zero judge turns are spent on it.
     let admits = inbox.admits.lock().unwrap().clone();
-    assert_eq!(admits, vec![(worker, Some("evt-live".into()))]);
+    assert_eq!(admits, vec![(worker, Some("chan:ci:evt-live".into()))]);
     assert_eq!(*inbox.wakes.lock().unwrap(), vec![worker]);
 
     let text = log_text();
@@ -428,7 +428,7 @@ async fn ended_worker_releases_the_topic_to_fresh_eval() {
     // One row, for the Router (the fresh evaluation); the ended
     // worker's terminal session never receives one.
     let admits = inbox.admits.lock().unwrap().clone();
-    assert_eq!(admits, vec![(router, Some("evt-release".into()))]);
+    assert_eq!(admits, vec![(router, Some("chan:ci:evt-release".into()))]);
 
     let text = log_text();
     assert_eq!(

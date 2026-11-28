@@ -155,6 +155,17 @@ impl EventStore {
         }
     }
 
+    /// The channel-scoped admission (ADR-081): `(session, idempotency_key)`
+    /// dedupe as [`EventStore::admit`], plus the cross-incarnation guard —
+    /// the insert is refused when a row with this key is already *consumed
+    /// in any session*, and the result names that suppressed row.
+    pub async fn admit_channel(&self, input: InputRow) -> Result<AdmitOutcome, InboxError> {
+        match self {
+            EventStore::Sqlite(pool) => crate::sqlite::admit_channel(pool, input).await,
+            EventStore::Postgres(pool) => crate::postgres::admit_channel(pool, input).await,
+        }
+    }
+
     /// The session's inputs that are eligible (`eligible_at <= now_ms`)
     /// and not yet consumed, oldest first. Pure read — eligibility is
     /// never "taken" here.
@@ -460,6 +471,110 @@ mod tests {
         );
 
         assert_eq!(row_count(&store, "SELECT COUNT(*) FROM inputs").await, 1);
+        store.close().await;
+        cleanup(&path);
+    }
+
+    // -- channel admit (ADR-081) --------------------------------------------
+
+    /// The channel guard: a key **consumed** in one session refuses a later
+    /// admit into a fresh session (the rotation + replay case), and the
+    /// receipt names the row that already answered the event.
+    #[tokio::test]
+    async fn admit_channel_refuses_a_key_consumed_in_another_session() {
+        let (store, path) = test_store().await;
+        let old = SessionId::new();
+        let fresh = SessionId::new();
+        seed_running(&store, old, Epoch(1)).await; // seqs 1, 2
+
+        let first = input(
+            old,
+            Some("chan:imessage:AAAA"),
+            T0,
+            T0,
+            json!({ "text": "hi" }),
+        );
+        let out = store
+            .admit_channel(first.clone())
+            .await
+            .expect("first admit");
+        assert_eq!(
+            out,
+            AdmitOutcome {
+                input: first.clone(),
+                deduplicated: false
+            }
+        );
+        store
+            .mark_consumed(old, first.id, 2)
+            .await
+            .expect("consume");
+
+        let replay = input(
+            fresh,
+            Some("chan:imessage:AAAA"),
+            T0 + 1,
+            T0 + 1,
+            json!({ "text": "hi" }),
+        );
+        let out = store
+            .admit_channel(replay)
+            .await
+            .expect("replay after rotation");
+        assert!(
+            out.deduplicated,
+            "a consumed key is refused across sessions"
+        );
+        assert_eq!(out.input.id, first.id, "the receipt names the consumed row");
+        assert_eq!(out.input.session, old);
+        assert_eq!(row_count(&store, "SELECT COUNT(*) FROM inputs").await, 1);
+        store.close().await;
+        cleanup(&path);
+    }
+
+    /// "Already processed" is the guard, not "already seen": a key that was
+    /// admitted but never consumed does not block a fresh session, so a
+    /// replay still rescues a pending row out of a frozen predecessor. A
+    /// same-session replay keeps the plain per-session dedupe.
+    #[tokio::test]
+    async fn admit_channel_allows_an_unconsumed_key_into_a_new_session() {
+        let (store, path) = test_store().await;
+        let old = SessionId::new();
+        let fresh = SessionId::new();
+
+        let first = input(
+            old,
+            Some("chan:imessage:BBBB"),
+            T0,
+            T0,
+            json!({ "text": "hi" }),
+        );
+        store
+            .admit_channel(first.clone())
+            .await
+            .expect("first admit");
+        let same = input(old, Some("chan:imessage:BBBB"), T0 + 1, T0 + 1, json!(1));
+        let out = store
+            .admit_channel(same)
+            .await
+            .expect("same-session replay");
+        assert!(out.deduplicated);
+        assert_eq!(out.input.id, first.id);
+
+        let later = input(
+            fresh,
+            Some("chan:imessage:BBBB"),
+            T0 + 1,
+            T0 + 1,
+            json!({ "text": "hi" }),
+        );
+        let out = store
+            .admit_channel(later)
+            .await
+            .expect("unconsumed key admits into the new session");
+        assert!(!out.deduplicated, "an unconsumed key never blocks");
+        assert_eq!(out.input.session, fresh);
+        assert_eq!(row_count(&store, "SELECT COUNT(*) FROM inputs").await, 2);
         store.close().await;
         cleanup(&path);
     }

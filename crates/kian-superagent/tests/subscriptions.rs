@@ -510,9 +510,9 @@ async fn unmatched_event_dropped_with_audit_log_and_no_row() {
     );
 }
 
-/// Admit is idempotent per `event_id` key — the same event delivered
-/// twice yields exactly one durable row; the second handling reports
-/// the dedup.
+/// Admit is idempotent per the channel-scoped `chan:<channel>:<event_id>`
+/// key — the same event delivered twice yields exactly one durable row;
+/// the second handling reports the dedup.
 #[tokio::test]
 async fn admit_is_idempotent_per_event_id_key() {
     let store = temp_store().await;
@@ -554,11 +554,18 @@ async fn admit_is_idempotent_per_event_id_key() {
     // The store itself holds exactly one row for the key: a third
     // direct admit deduplicates and returns the original row.
     let probe = inbox
-        .private_admit(router, json!({"probe": true}), Some("evt-dup".into()))
+        .private_admit(
+            router,
+            json!({"probe": true}),
+            Some("chan:mock-im:evt-dup".into()),
+        )
         .await
         .unwrap();
     assert!(probe.deduplicated);
-    assert_eq!(probe.input.idempotency_key.as_deref(), Some("evt-dup"));
+    assert_eq!(
+        probe.input.idempotency_key.as_deref(),
+        Some("chan:mock-im:evt-dup")
+    );
 }
 
 /// NoLostWork analog: a restart rebuilds the passthrough registry

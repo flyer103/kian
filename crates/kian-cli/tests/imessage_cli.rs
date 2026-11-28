@@ -469,6 +469,153 @@ async fn e2e_one_inbound_admits_exactly_once_across_replay_and_restart() {
 }
 
 // ---------------------------------------------------------------------------
+// L2: the guard spans Router session incarnations (ADR-081)
+// ---------------------------------------------------------------------------
+
+const ROTATED_ROUTER_SESSION: &str = "5b1f1c4e-4f5f-4a3c-9d1a-2b3c4d5e6f71";
+
+/// A row is "processed" exactly when it was consumed — the only premise
+/// that may suppress a later admission. `input_rows` still shows the row
+/// (consumption never deletes it) and `eligible_inputs` excludes it.
+async fn consumed_key(
+    store: &kian_store::EventStore,
+    session: kian_core::model::SessionId,
+    key: &str,
+) -> bool {
+    let Ok(rows) = store.input_rows(session).await else {
+        return false;
+    };
+    let Some(row) = rows
+        .iter()
+        .find(|row| row.idempotency_key.as_deref() == Some(key))
+    else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as u64;
+    // A row the drain cannot take yet is not evidence of consumption: only
+    // an eligible row's disappearance from `eligible_inputs` is.
+    if row.eligible_at > now {
+        return false;
+    }
+    match store.eligible_inputs(session, now).await {
+        Ok(pending) => !pending
+            .iter()
+            .any(|row| row.idempotency_key.as_deref() == Some(key)),
+        Err(_) => false,
+    }
+}
+
+/// The restart above keeps the *same* pinned Router session, so the
+/// per-session key suffices. Production rotates the resident session (a
+/// re-arm successor, or an operator changing the pinned id), and the
+/// driver's startup `since_rowid=0` tail replay then re-delivers the last
+/// rows into the fresh session. Per-session dedupe alone admits — and
+/// answers — the already processed message again; the channel-scoped guard
+/// must refuse the replay while a genuinely new message still lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_a_rotated_router_session_does_not_readmit_a_processed_guid() {
+    const PROCESSED: &str = "G-E2E-ROTATED";
+    const PROCESSED_KEY: &str = "chan:imessage:G-E2E-ROTATED";
+    force_no_proxy();
+    let dir = temp_dir("imessage-e2e-rotate");
+    let mock = BridgeMock::new();
+    let bridge_url = mock.clone().serve().await;
+    let (router_base, _router) = spawn_scripted_provider(
+        vec![
+            ScriptedResponse::Text("bootstrap acknowledged".into()),
+            ScriptedResponse::Text("message handled".into()),
+            ScriptedResponse::Text("rotated bootstrap acknowledged".into()),
+        ],
+        0,
+    )
+    .await;
+    let (worker_base, _worker) =
+        spawn_scripted_provider(vec![ScriptedResponse::Text("unused".into())], 0).await;
+    let port = free_port().await;
+    let config = write_imessage_config(&dir, &router_base, &worker_base, &bridge_url, port);
+
+    let processed = bridge_message("G-E2E-ROTATED");
+    mock.push_updates(updates_with(&processed));
+
+    let mut child = spawn_kian_serve(&config, Some(TOKEN));
+    let read_only = open_read_only_when_ready(&dir).await;
+
+    within_fut(30, || {
+        let store = read_only.clone();
+        async move {
+            consumed_key(&store, router_session(), PROCESSED_KEY)
+                .await
+                .then_some(())
+        }
+    })
+    .await
+    .expect("the first incarnation consumed the message");
+    child.kill().expect("kill serve");
+    let _ = child.wait();
+
+    // Same database, a different resident session: the production shape.
+    let rotated = std::fs::read_to_string(&config)
+        .expect("config")
+        .replace(ROUTER_SESSION, ROTATED_ROUTER_SESSION);
+    let rotated_config = dir.join("kian-rotated.yaml");
+    std::fs::write(&rotated_config, rotated).expect("rotated config");
+    let rotated_session = kian_core::model::SessionId(
+        uuid::Uuid::parse_str(ROTATED_ROUTER_SESSION).expect("rotated uuid"),
+    );
+    mock.push_updates(updates_with(&processed));
+    mock.push_updates(updates_with(&bridge_message("G-E2E-ROTATED-NEW")));
+    let mut child = spawn_kian_serve(&rotated_config, Some(TOKEN));
+
+    // The new message lands: the channel is live on the rotated session and
+    // the replay body was handled first on the same poll loop.
+    let events = within_fut(30, || {
+        let store = read_only.clone();
+        async move {
+            let events = store.rebuild(rotated_session).await.ok()?;
+            (imessage_admits(&events).len() == 1).then_some(events)
+        }
+    })
+    .await
+    .expect("the new message is admitted in the rotated session");
+    assert_eq!(
+        imessage_admits(&events)[0]
+            .bytes
+            .pointer("/content/kian/event_id"),
+        Some(&json!("G-E2E-ROTATED-NEW"))
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let events = read_only.rebuild(rotated_session).await.expect("rebuild");
+    assert!(
+        imessage_admits(&events)
+            .iter()
+            .all(|event| event.bytes.pointer("/content/kian/event_id") != Some(&json!(PROCESSED))),
+        "the guid the previous incarnation processed is not admitted again"
+    );
+    let rotated_rows = read_only.input_rows(rotated_session).await.expect("rows");
+    assert!(
+        rotated_rows
+            .iter()
+            .all(|row| row.idempotency_key.as_deref() != Some(PROCESSED_KEY)),
+        "the rotated session holds no row for the processed guid"
+    );
+    let previous = read_only
+        .rebuild(router_session())
+        .await
+        .expect("rebuild old");
+    assert_eq!(
+        imessage_admits(&previous).len(),
+        1,
+        "the old incarnation keeps its single admission"
+    );
+    child.kill().expect("kill serve");
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
 // L2: a row settles before it is admitted
 // ---------------------------------------------------------------------------
 

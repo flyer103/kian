@@ -746,7 +746,7 @@ async fn github_event_flows_through_classes_rules_and_provenance_untrusted() {
     );
     let (target, payload, key) = &admits[0];
     assert_eq!(*target, router); // empty-set passthrough fallback
-    assert_eq!(key.as_deref(), Some("d-yes")); // delivery-id idempotency key
+    assert_eq!(key.as_deref(), Some("chan:github:d-yes")); // channel-scoped delivery key
     assert_eq!(inbox.wakes.lock().unwrap().len(), 1);
 
     // Provenance: the wrapper is the `{"kian":…}` channel-event
@@ -1118,8 +1118,12 @@ async fn bot_senders_are_ignored_by_the_classes_table_human_comments_flow() {
         .iter()
         .filter_map(|(_, _, key)| key.as_deref())
         .collect();
-    assert!(keys.contains(&"poll:issues:flyer103/kian-runtime#101:2026-11-04T10:00:00Z"));
-    assert!(keys.contains(&"poll:issue_comment:flyer103/kian-runtime#991:2026-11-04T11:00:00Z"));
+    assert!(
+        keys.contains(&"chan:github:poll:issues:flyer103/kian-runtime#101:2026-11-04T10:00:00Z")
+    );
+    assert!(keys.contains(
+        &"chan:github:poll:issue_comment:flyer103/kian-runtime#991:2026-11-04T11:00:00Z"
+    ));
     assert!(
         !keys.iter().any(|k| k.contains("#102")),
         "the bot's issue never admitted: {keys:?}"

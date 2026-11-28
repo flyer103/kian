@@ -19,7 +19,7 @@
 //!    per-turn and disposable.
 //! 3. `subscriptions.rs` does not retry a failed mid-set admit — it
 //!    leaves the subscriber to the **adapter's idempotent
-//!    re-delivery** (deduped per `(session, event_id)`). The read
+//!    re-delivery** (deduped by `chan:<channel>:<event_id>`, ADR-081). The read
 //!    side has a re-sender; the write side has none — that absence is
 //!    exactly what this module supplies.
 //!

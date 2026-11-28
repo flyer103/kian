@@ -196,6 +196,28 @@ impl InboxWriter for EngineInbox {
         })
     }
 
+    fn admit_channel(
+        &self,
+        session: SessionId,
+        payload: serde_json::Value,
+        idempotency_key: String,
+    ) -> BoxFuture<'static, Result<AdmitReceipt, InboxWriteError>> {
+        let engine = self
+            .engine
+            .get()
+            .expect("engine installed before the first admit")
+            .clone();
+        Box::pin(async move {
+            let outcome = engine
+                .admit_channel(session, payload, idempotency_key)
+                .await
+                .map_err(|e| InboxWriteError::Write(e.to_string()))?;
+            Ok(AdmitReceipt {
+                deduplicated: outcome.deduplicated,
+            })
+        })
+    }
+
     fn wake(&self, session: SessionId) -> WakeOutcome {
         self.engine
             .get()

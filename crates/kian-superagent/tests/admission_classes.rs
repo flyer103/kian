@@ -255,7 +255,7 @@ async fn explicit_only_admits_mention_event() {
     let admits = inbox.admits.lock().unwrap().clone();
     assert_eq!(admits.len(), 1);
     assert_eq!(admits[0].0, router);
-    assert_eq!(admits[0].2.as_deref(), Some("evt-mention"));
+    assert_eq!(admits[0].2.as_deref(), Some("chan:lark:evt-mention"));
     assert_eq!(*inbox.wakes.lock().unwrap(), vec![router]);
 }
 

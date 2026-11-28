@@ -1,11 +1,16 @@
 //! The `InboxWriter` port — the only thing the bundle may ask of the
 //! server (layered iron rule, AGENTS.md constraint 9).
 //!
-//! The port has exactly two capabilities, both control-plane-shaped:
+//! The port exposes two capabilities through three methods, all
+//! control-plane-shaped:
 //!
 //! - `admit` — make an input row durable. The row exists *before* any
 //!   wake may fire (constraint 6, invariant 1). Idempotent by
 //!   `(session, idempotency_key)` — first write wins.
+//! - `admit_channel` — the same write under the channel-scoped guard
+//!   (ADR-081): the key is `chan:<channel>:<event_id>` and a key already
+//!   consumed in *any* session suppresses the insert (the Router route's
+//!   semantics; a plain writer may keep `admit`'s per-session dedupe).
 //! - `wake` — the advisory liveness nudge. Wakes may fold, be lost or
 //!   race; the startup inbox rebuild re-derives them, so no work is lost
 //!   when a wake disappears.
@@ -26,7 +31,9 @@ use serde_json::Value;
 pub struct AdmitReceipt {
     /// True when this call deduplicated against an already-committed row
     /// with the same `(session, idempotency_key)` — the original row
-    /// stands, exactly one row exists.
+    /// stands, exactly one row exists. On [`InboxWriter::admit_channel`]
+    /// it also covers the channel guard: a consumed row with that key in
+    /// any session suppressed the insert (ADR-081).
     pub deduplicated: bool,
 }
 
@@ -58,6 +65,22 @@ pub trait InboxWriter: Send + Sync {
         payload: Value,
         idempotency_key: Option<String>,
     ) -> BoxFuture<'static, Result<AdmitReceipt, InboxWriteError>>;
+
+    /// The channel-scoped variant of [`InboxWriter::admit`] (ADR-081):
+    /// `idempotency_key` is the event's channel key
+    /// ([`crate::intake::channel_idempotency_key`]), and the write is
+    /// additionally suppressed when a row with that key is already
+    /// **consumed in any session** — the Router route's cross-incarnation
+    /// guard. Defaults to `admit` (per-session dedupe only), so a writer
+    /// without a scoped implementation keeps today's semantics.
+    fn admit_channel(
+        &self,
+        session: SessionId,
+        payload: Value,
+        idempotency_key: String,
+    ) -> BoxFuture<'static, Result<AdmitReceipt, InboxWriteError>> {
+        self.admit(session, payload, Some(idempotency_key))
+    }
 
     /// Wakes the session. Advisory by design (constraint 6): a folded or
     /// lost wake never loses work — the row is already durable and the
