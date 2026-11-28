@@ -237,6 +237,20 @@ pub async fn sessions_with_events(
         .collect()
 }
 
+/// The `thread/started` lineage across every stream — the worker
+/// board's bound-session source (`kian_superagent::bound_workers`). One
+/// indexed per-session kind read each, so the call is bounded by the
+/// number of streams, never by their size: no session is replayed.
+pub async fn thread_started_events(
+    store: &kian_store::EventStore,
+) -> Result<Vec<Event>, InboxError> {
+    let mut lineage = Vec::new();
+    for session in sessions_with_events(store).await? {
+        lineage.extend(store.scan_kind(session, EventKind::ThreadStarted).await?);
+    }
+    Ok(lineage)
+}
+
 /// Derives the whole-store aggregate: every session with events,
 /// rebuilt and folded into one [`CacheStatsReport`]. Optionally
 /// restricted to a single session.

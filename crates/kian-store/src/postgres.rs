@@ -62,6 +62,11 @@ const SCAN_SQL: &str = "SELECT version, envelope FROM events WHERE session = $1:
 /// postgres too.
 const SCAN_KIND_SQL: &str = "SELECT version, envelope FROM events WHERE session = $1::text AND kind = $2::text ORDER BY seq ASC";
 
+/// The multi-kind session read behind `EventStore::scan_kinds` (the same
+/// index, an array key set).
+const SCAN_KINDS_SQL: &str =
+    "SELECT version, envelope FROM events WHERE session = $1::text AND kind = ANY($2::text[])";
+
 /// Postgres sqlstate for a unique-constraint violation — the observable
 /// form of the concurrent same-session CAS race this backend must
 /// classify rather than leak.
@@ -220,6 +225,44 @@ pub(crate) async fn scan_kind(
         }
         events.push(event);
     }
+    Ok(events)
+}
+
+/// The multi-kind session read — the postgres arm of
+/// `EventStore::scan_kinds` (see the sqlite twin). One array bind keeps the
+/// statement static; `kind = ANY($2)` rides the same `session, kind, seq`
+/// index.
+pub(crate) async fn scan_kinds(
+    pool: &PgPool,
+    session: SessionId,
+    kinds: &[EventKind],
+) -> Result<Vec<Event>, StoreError> {
+    let mut keys: Vec<String> = kinds.iter().map(|kind| kind.as_str().to_string()).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows: Vec<(i64, String)> = sqlx::query_as(SCAN_KINDS_SQL)
+        .bind(session.0.to_string())
+        .bind(&keys)
+        .fetch_all(pool)
+        .await?;
+    let mut events = Vec::with_capacity(rows.len());
+    for (version_col, envelope) in rows {
+        let event: Event = serde_json::from_str(&envelope)?;
+        if i64::from(event.version) != version_col
+            || event.session != session
+            || !keys.iter().any(|key| key == event.kind.as_str())
+        {
+            return Err(StoreError::CorruptRow {
+                session,
+                seq: event.seq,
+            });
+        }
+        events.push(event);
+    }
+    events.sort_by_key(|event| event.seq);
     Ok(events)
 }
 

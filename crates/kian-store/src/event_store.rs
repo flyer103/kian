@@ -428,6 +428,30 @@ impl EventStore {
         }
     }
 
+    /// Reads one session's events of several kinds back in seq order —
+    /// `WHERE session = ? AND kind IN (...)`, the multi-kind companion of
+    /// [`scan_kind`](Self::scan_kind): same projection columns, same v6
+    /// `idx_events_session_kind_seq` index, same "can never disagree with
+    /// the stream" argument.
+    ///
+    /// Matching is by the `kind` column's string key, so the keys collapse
+    /// `SessionEnded`'s reasons onto `session/ended`: naming **any one**
+    /// reason reads every ended row for the session, and the decoded
+    /// variants are returned as stored. (That is the deliberate difference
+    /// from [`scan_kind`](Self::scan_kind), which compares the decoded kind
+    /// and so returns one reason.) `kinds` is deduplicated, and an empty
+    /// request reads nothing without a query.
+    pub async fn scan_kinds(
+        &self,
+        session: SessionId,
+        kinds: &[EventKind],
+    ) -> Result<Vec<Event>, StoreError> {
+        match self {
+            EventStore::Sqlite(pool) => crate::sqlite::scan_kinds(pool, session, kinds).await,
+            EventStore::Postgres(pool) => crate::postgres::scan_kinds(pool, session, kinds).await,
+        }
+    }
+
     /// The session's stream position: next free seq and epoch floor.
     pub async fn head(&self, session: SessionId) -> Result<Head, StoreError> {
         match self {
@@ -1365,6 +1389,142 @@ mod tests {
         cleanup(&path);
     }
 
+    /// `scan_kinds` is byte-identical to `scan`-then-filter over the same
+    /// key set, answers empty (never an error) for an empty request, an
+    /// absent kind and an unknown session, and never leaks another
+    /// session's rows.
+    #[tokio::test]
+    async fn scan_kinds_parity_with_scan_then_filter_on_a_mixed_stream() {
+        let (store, path) = test_store().await;
+        let sid = SessionId::new();
+        let other = SessionId::new();
+        seed_mixed(&store, sid, 300, 0x5EED_0101).await;
+        seed_mixed(&store, other, 120, 0x5EED_0102).await;
+
+        let keys = [EventKind::MemoryNote, EventKind::ToolCall];
+        let full = store.scan(sid, all()).await.unwrap();
+        let expected: Vec<String> = ser(&full
+            .iter()
+            .filter(|e| keys.iter().any(|k| k.as_str() == e.kind.as_str()))
+            .cloned()
+            .collect::<Vec<_>>());
+        let got = store.scan_kinds(sid, &keys).await.unwrap();
+        assert!(!got.is_empty(), "fixture must contain the requested kinds");
+        assert_eq!(
+            ser(&got),
+            expected,
+            "scan_kinds must be byte-identical to scan-then-filter"
+        );
+        for pair in got.windows(2) {
+            assert!(pair[0].seq < pair[1].seq, "seqs must arrive ascending");
+        }
+        assert!(got.iter().all(|e| e.session == sid));
+
+        // An empty request, an absent kind and an unknown session all
+        // answer empty without a query.
+        assert!(store.scan_kinds(sid, &[]).await.unwrap().is_empty());
+        assert!(
+            store
+                .scan_kinds(sid, &[EventKind::ThreadStarted])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .scan_kinds(SessionId::new(), &keys)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        store.close().await;
+        cleanup(&path);
+    }
+
+    /// `scan_kinds` matches by the `kind` column's key, so `session/ended`
+    /// is one key: naming any one reason reads every ended reason back,
+    /// variants decoded exactly as stored.
+    #[tokio::test]
+    async fn scan_kinds_collapses_session_ended_reasons_into_one_key() {
+        let (store, path) = test_store().await;
+        let sid = SessionId::new();
+        let reasons = [
+            EndReason::Completed,
+            EndReason::Cancelled,
+            EndReason::Interrupted,
+            EndReason::Failed,
+        ];
+        let mut seq = 0u64;
+        for reason in reasons {
+            seq += 1;
+            store
+                .append(
+                    sid,
+                    ev(sid, seq, Epoch(1), EventKind::SessionEnded { reason }),
+                    AppendGuard {
+                        epoch: Epoch(1),
+                        expected_seq: seq,
+                    },
+                )
+                .await
+                .expect("append ended");
+        }
+        let got = store
+            .scan_kinds(
+                sid,
+                &[EventKind::SessionEnded {
+                    reason: EndReason::Completed,
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(got.len(), reasons.len(), "every reason is one kind key");
+        let seen: Vec<EventKind> = got.iter().map(|e| e.kind).collect();
+        for reason in reasons {
+            assert!(
+                seen.contains(&EventKind::SessionEnded { reason }),
+                "{reason:?} must be read back"
+            );
+        }
+        store.close().await;
+        cleanup(&path);
+    }
+
+    /// The multi-kind read rides the same v6 index: the sqlite plan must
+    /// name `idx_events_session_kind_seq` for an `IN` list too, never a
+    /// table scan.
+    #[tokio::test]
+    async fn scan_kinds_query_plan_uses_the_session_kind_index() {
+        let (store, path) = test_store().await;
+        let sid = SessionId::new();
+        seed_mixed(&store, sid, 50, 0x5EED_0103).await;
+
+        let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+            "EXPLAIN QUERY PLAN SELECT version, envelope FROM events \
+             WHERE session = ? AND kind IN (?, ?)",
+        )
+        .bind(sid.0.to_string())
+        .bind("memory/note")
+        .bind("tool/call")
+        .fetch_all(store.pool())
+        .await
+        .expect("explain query plan");
+        let detail = plan
+            .iter()
+            .map(|(_, _, _, d)| d.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            detail.contains("idx_events_session_kind_seq"),
+            "plan does not use the per-session kind index: {detail}"
+        );
+        assert!(
+            !detail.contains("SCAN events"),
+            "plan degrades to a table scan: {detail}"
+        );
+        store.close().await;
+        cleanup(&path);
+    }
     /// A store that predates v6 (no index, no v6 bookkeeping row) still
     /// answers `scan_kind` correctly via the planner's fallback (A2),
     /// and the next read-write open forward-migrates it: v6 lands, the

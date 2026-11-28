@@ -1355,37 +1355,44 @@ pub async fn run_workers(config_path: &Path, db: Option<&Path>, json: bool) -> C
     // The bound live session/thread projection: `thread/started`
     // grouping across streams (the re-arm-robust form — the same scan
     // `ticket_board` performs), liveness per candidate worker stream.
+    //
+    // Bounded by construction: the lineage is one indexed `kind =
+    // 'thread/started'` listing plus one per-session kind read, and
+    // liveness reads only the four kinds `thread_liveness` consults. No
+    // session's whole stream is replayed here — on a multi-GB store a
+    // replay-everything board would cost gigabytes of heap for a table
+    // of two rows.
     let mut bound: std::collections::BTreeMap<String, (String, String)> =
         std::collections::BTreeMap::new();
     if config.as_ref().is_some_and(|cfg| cfg.superagent.is_some()) {
         let store = open_reader(&db).await?;
-        let mut bound_threads: std::collections::BTreeMap<
-            String,
-            Vec<kian_superagent::BoundThread>,
-        > = std::collections::BTreeMap::new();
-        let mut streams = std::collections::BTreeMap::new();
-        let sessions = crate::cache_metrics::sessions_with_events(&store)
+        let lineage = crate::cache_metrics::thread_started_events(&store)
             .await
-            .map_err(|e| format!("session listing: {e}"))?;
-        let mut all_events = Vec::new();
-        for session in &sessions {
-            if let Ok(events) = store.rebuild(*session).await {
-                all_events.extend(events.iter().cloned());
-                streams.insert(*session, events);
-            }
-        }
-        for (id, threads) in kian_superagent::bound_workers(&all_events) {
-            bound_threads.insert(id, threads);
-        }
-        for (id, threads) in bound_threads {
+            .map_err(|e| format!("thread lineage read: {e}"))?;
+        for (id, threads) in kian_superagent::bound_workers(&lineage) {
             // The live owner (at most one under 1:1): a malformed
             // stream with more than one live binding omits the fields
             // and is noted — never a guess.
             let mut live: Vec<&kian_superagent::BoundThread> = Vec::new();
             for thread in &threads {
-                let events = streams.get(&thread.worker_session);
-                let liveness = events.map(|events| kian_superagent::thread_liveness(events));
-                if liveness == Some(kian_superagent::ThreadLiveness::Live) {
+                let liveness = store
+                    .scan_kinds(
+                        thread.worker_session,
+                        &[
+                            EventKind::SessionCreated,
+                            EventKind::InputAdmitted,
+                            EventKind::ThreadCompleted,
+                            EventKind::SessionEnded {
+                                reason: kian_core::events::EndReason::Completed,
+                            },
+                        ],
+                    )
+                    .await
+                    .map(|events| kian_superagent::thread_liveness(&events))
+                    // An unreadable stream is not a live binding — the same
+                    // degrade the replay form had when a rebuild failed.
+                    .unwrap_or(kian_superagent::ThreadLiveness::Released);
+                if liveness == kian_superagent::ThreadLiveness::Live {
                     live.push(thread);
                 }
             }

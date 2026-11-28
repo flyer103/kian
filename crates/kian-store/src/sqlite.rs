@@ -217,6 +217,53 @@ pub(crate) async fn scan_kind(
     Ok(events)
 }
 
+/// The multi-kind session read behind `EventStore::scan_kinds` — the
+/// [`scan_kind`] index with an `IN` list (`session` equality first, so
+/// the index order still satisfies `ORDER BY seq`). Matching is by the
+/// `kind` projection column's key, which collapses `session/ended`'s
+/// reasons into one key: the decoded variants come back as stored.
+pub(crate) async fn scan_kinds(
+    pool: &SqlitePool,
+    session: SessionId,
+    kinds: &[EventKind],
+) -> Result<Vec<Event>, StoreError> {
+    let mut keys: Vec<&str> = kinds.iter().map(EventKind::as_str).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    // No `ORDER BY seq` here on purpose: with an `IN` list sqlite prefers
+    // the primary key (session, seq) and filters every row of the session,
+    // whereas the unordered form seeks the per-session kind index once per
+    // key. The seq order is restored in memory below.
+    let placeholders = vec!["?"; keys.len()].join(", ");
+    let sql = format!(
+        "SELECT version, envelope FROM events WHERE session = ? AND kind IN ({placeholders})"
+    );
+    let mut query = sqlx::query_as(&sql).bind(session.0.to_string());
+    for key in &keys {
+        query = query.bind(*key);
+    }
+    let rows: Vec<(i64, String)> = query.fetch_all(pool).await?;
+    let mut events = Vec::with_capacity(rows.len());
+    for (version_col, envelope) in rows {
+        let event: Event = serde_json::from_str(&envelope)?;
+        if i64::from(event.version) != version_col
+            || event.session != session
+            || !keys.contains(&event.kind.as_str())
+        {
+            return Err(StoreError::CorruptRow {
+                session,
+                seq: event.seq,
+            });
+        }
+        events.push(event);
+    }
+    events.sort_by_key(|event| event.seq);
+    Ok(events)
+}
+
 pub(crate) async fn head(pool: &SqlitePool, session: SessionId) -> Result<Head, StoreError> {
     let (epoch, max_seq): (i64, i64) = sqlx::query_as(HEAD_SQL)
         .bind(session.0.to_string())
