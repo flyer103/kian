@@ -4,7 +4,7 @@ description = "Wire-only embedded SDK for the kian control/ops planes (JSON-RPC 
 # the SDK carries its own version, decoupled from the workspace bump
 # cadence — do NOT switch this to `version.workspace = true`. Publishing to
 # crates.io happens only when the owner asks (VC convention).
-version = "0.3.0"
+version = "0.4.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
