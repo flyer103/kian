@@ -504,7 +504,9 @@ applies to the evidence as well: a run that could pick its own gate could pick a
 
 The gate is the dominant cost of a publish (a cold worktree builds the workspace), which is why
 `selfdev.publish.target_dir` can point `CARGO_TARGET_DIR` at an existing build cache, and why the
-step has `retries: 0`: paying the build twice is the failure mode to avoid, not the retry.
+step has `retries: 0`: paying the build twice is the failure mode to avoid, not the retry. Point that
+directory at a cache no other working tree builds into: cargo replaces binaries in place, so two
+trees sharing one target dir each end up with artifacts built from the other's sources.
 
 ## 10. Budgets and the circuit breaker
 

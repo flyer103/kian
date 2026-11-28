@@ -110,6 +110,7 @@ pub fn alert_plan(spec: &AlertSpec, facts: &AlertFacts<'_>) -> JobPlan {
             text: Some(alert_content(facts)),
             from_artifact: None,
         }),
+        publish: None,
     };
     JobPlan {
         id: alert_job_id(&spec.id),

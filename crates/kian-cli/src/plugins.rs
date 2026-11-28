@@ -633,6 +633,11 @@ pub struct SuperAgentPlugin {
     /// slots/budgets source for the per-assignee sides, never the
     /// worker template). Empty when the roster is off.
     pub roster_agent_defs: BTreeMap<String, AgentDef>,
+    /// (SELF-EVOLUTION-MODEL §13 A18) the selfdev.publish section: the
+    /// repository a publish writes into, its one gate command and the commit
+    /// author. None = no publish configured: a publish step is admitted and
+    /// fails honestly without writing.
+    pub selfdev_publish: Option<crate::config::SelfdevPublishSection>,
     /// Drain tuning shared by all three loops.
     pub max_iterations: usize,
     /// The declarative recovery-policy table.
@@ -1865,16 +1870,25 @@ impl Plugin for SuperAgentPlugin {
                 Some(directory) => directory,
                 None => Arc::new(crate::job_runtime::EmptyDirectory),
             };
-        let job_deps = Arc::new(kian_superagent::job::conduct::JobDeps::new(
-            crate::superagent::StoreWorkerStreams::new(self.event_store.clone()),
-            Arc::clone(&spawner),
-            job_directory,
-            crate::job_runtime::deliver_port(&channels),
-            Arc::clone(&job_alerts) as Arc<dyn kian_superagent::job::conduct::AlertPort>,
-            Arc::new(crate::job_runtime::JobClock::new(Arc::new(
-                kian_orchestrator::SystemClock,
-            ))),
-        ));
+        let job_publish: Arc<dyn kian_superagent::job::conduct::PublishPort> = match &self
+            .selfdev_publish
+        {
+            Some(publish) => Arc::new(crate::selfdev_publish::GitPublishPort::from_config(publish)),
+            None => Arc::new(kian_superagent::job::conduct::UnconfiguredPublish),
+        };
+        let job_deps = Arc::new(
+            kian_superagent::job::conduct::JobDeps::new(
+                crate::superagent::StoreWorkerStreams::new(self.event_store.clone()),
+                Arc::clone(&spawner),
+                job_directory,
+                crate::job_runtime::deliver_port(&channels),
+                Arc::clone(&job_alerts) as Arc<dyn kian_superagent::job::conduct::AlertPort>,
+                Arc::new(crate::job_runtime::JobClock::new(Arc::new(
+                    kian_orchestrator::SystemClock,
+                ))),
+            )
+            .with_publish(job_publish),
+        );
         driver = driver.with_job_runs(kian_superagent::job::conduct::JobLoopDriver::new(
             crate::job_runtime::run_port_for_ctx(),
             job_deps,

@@ -1819,7 +1819,7 @@ nothing and exits 2, and `--force` admits one run and records `circuit_overridde
 frozen value. `kian job run` returns exit 2 for every admission refusal and exit 1 only for a
 store failure.
 
- Refinement (publish, specified for S2 — not implemented): the publish step is a conductor action
+ Refinement (publish, as implemented by `kian-cli`): the publish step is a conductor action
 (JOB-MODEL §13.5, ADR-071), so it costs no worker, no capability and no model turn, and the plan
 cannot name a program. The sequence is fixed: resolve `from` (the step's single artifact input)
 and the base commit (the run's frozen `job.selfdev.base_commit`; `publish.base` names the branch a
@@ -1837,8 +1837,12 @@ between the two pairs leaves an intent with no receipt, which settles the attemp
 and leaves the worktree for the operator, and a retry never force-pushes or adopts a branch. S2b
 extends the same receipt with one `git push <remote> HEAD:refs/heads/<branch>` (never forced) and
 one `gh pr create --base <base> --head <branch>`, with the token read from the environment named
-by `selfdev.publish.token_env` and never written to an event. The action, the receipt and the gate
-configuration are specified in the contracts; S2a lands them.
+by `selfdev.publish.token_env` and never written to an event. S2a lands the local half: the
+repository work sits behind a `PublishPort` the bundle never implements (`kian-cli` does, in
+`crates/kian-cli/src/selfdev_publish.rs`), so every spawn goes through
+`cron_worktree::git_command()` and the inherited `GIT_*` environment cannot redirect a write into
+the caller's checkout; a gate that outlives its bound settles `needs_operator` with the commit in
+the detail rather than failing as if nothing was written. S2b is not implemented.
 
  Refinement (operational commands, as implemented by `kian-cli`): the SPEC §3.2 set lands as six
 commands with two access modes. Read-only commands (`kian session inspect <id>`, `kian session

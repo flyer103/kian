@@ -47,7 +47,7 @@ use crate::job::outcome::{
     retry_decision, run_outcome,
 };
 use crate::job::placement::{self, Placement, PlacementFacts, PlacementRefusal};
-use crate::job::plan::{JobPlan, StepPlan};
+use crate::job::plan::{JobCheck, JobPlan, StepPlan};
 use crate::job::status::{self, DispatchRecord, VerdictRecord};
 use crate::multiagent::SpawnIdentity;
 use crate::worker::{SpawnRequest, WorkerSpawner, thread_started_payload_bound};
@@ -81,6 +81,20 @@ pub const DELIVER_CALL_PREFIX: &str = "job:deliver:";
 
 /// The call-id prefix of an artifact harvest: `job:artifact:<step>:<attempt>`.
 pub const ARTIFACT_CALL_PREFIX: &str = "job:artifact:";
+
+/// The tool name of the publish pair (SELF-EVOLUTION-MODEL §13 A16).
+pub const PUBLISH_TOOL: &str = "job.publish";
+
+/// The call-id prefix of a publish attempt: `job:publish:<step>:<attempt>`
+/// (§9.4 step 4).
+pub const PUBLISH_CALL_PREFIX: &str = "job:publish:";
+
+/// The check a publish receipt is judged by (§13 A17).
+pub const PUBLISH_CHECK: &str = "publish_ok";
+
+/// The honest failure of a publish in a process with no `selfdev.publish`
+/// section (§14 V32).
+pub const PUBLISH_NOT_CONFIGURED: &str = "publish is not configured";
 
 /// The check a placement refusal records (§9.4).
 pub const NO_CANDIDATE_CHECK: &str = "no_candidate";
@@ -168,6 +182,146 @@ impl DeliverPort for crate::router::ChannelRegistry {
     }
 }
 
+/// The paths a publish derives from the operator's configuration (§9.4
+/// step 3): nothing here reads a stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishTargets {
+    /// The repository the worktree is created from.
+    pub repo: String,
+    /// `<repo>/.agents/worktrees/selfdev-<run_session>`.
+    pub worktree: String,
+}
+
+/// What the conductor asks the process to publish (§9.4 steps 5–8).
+#[derive(Debug, Clone)]
+pub struct PublishRequest {
+    /// The publish step.
+    pub step: String,
+    /// The attempt ordinal.
+    pub attempt: u32,
+    /// The frozen artifact ref: `{step, name, sha256, bytes, ref}` (§12.1).
+    pub from: Value,
+    /// The artifact's committed bytes, re-verified against `from.sha256`.
+    pub patch: String,
+    /// `job.selfdev.base_commit`, frozen at admission (§14 V30).
+    pub base_commit: String,
+    /// `selfdev/<run_session>` (§9.4 step 3).
+    pub branch: String,
+    /// The derived worktree path.
+    pub worktree: String,
+    /// The commit subject.
+    pub subject: String,
+    /// The audit trailers the commit message carries (§11).
+    pub trailers: Vec<(String, String)>,
+    /// The branch a pull request would target (S2b).
+    pub base: String,
+    /// Whether the configured gate runs (§9.5).
+    pub gates: bool,
+    /// S2b: push the branch.
+    pub push: bool,
+    /// S2b: open the pull request.
+    pub pull_request: bool,
+}
+
+/// One gate run's receipt (§9.4 step 8, A16).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateReceipt {
+    /// The configured command, as the operator wrote it.
+    pub command: String,
+    /// Its exit code.
+    pub exit_code: i32,
+    /// A digest over its bounded output.
+    pub digest: String,
+    /// The tail of its output, bounded.
+    pub output_tail: String,
+}
+
+/// The receipt of one publish (§9.4 step 9, A16).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishReceipt {
+    /// The full commit.
+    pub commit: String,
+    /// The branch it landed on: `selfdev/<run_session>`.
+    pub branch: String,
+    /// The worktree that holds it.
+    pub worktree: String,
+    /// The gate run, when `publish.gates` is true.
+    pub gate: Option<GateReceipt>,
+}
+
+/// Why a publish produced no receipt (§9.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublishError {
+    /// No `selfdev.publish` section: the step fails honestly and writes
+    /// nothing (§14 V32).
+    NotConfigured,
+    /// The configuration cannot derive a worktree.
+    Unavailable(String),
+    /// The derived worktree already exists: another attempt (or another run)
+    /// left state there, so only an operator can decide what it is (§9.2).
+    Occupied(String),
+    /// The sequence started and its end is unknown (a gate that outlived its
+    /// bound): an operator has to look.
+    Unknown(String),
+    /// The sequence failed; the detail says how far it got.
+    Failed(String),
+}
+
+impl PublishError {
+    /// The operator-facing reason.
+    #[must_use]
+    pub fn detail(&self) -> String {
+        match self {
+            Self::NotConfigured => PUBLISH_NOT_CONFIGURED.to_string(),
+            Self::Unavailable(detail)
+            | Self::Occupied(detail)
+            | Self::Unknown(detail)
+            | Self::Failed(detail) => detail.clone(),
+        }
+    }
+
+    /// The attempt outcome this failure settles.
+    #[must_use]
+    pub fn outcome(&self) -> AttemptOutcome {
+        match self {
+            Self::Occupied(_) | Self::Unknown(_) => AttemptOutcome::NeedsOperator,
+            Self::NotConfigured | Self::Unavailable(_) | Self::Failed(_) => AttemptOutcome::Failed,
+        }
+    }
+}
+
+/// The side effects a publish needs (§9.4), injected so the conductor itself
+/// never touches a repository or a process.
+pub trait PublishPort: Send + Sync {
+    /// The worktree a publish of this run would create, derived from
+    /// configuration alone. `None` means the process has no
+    /// `selfdev.publish` section.
+    fn derive(&self, run: SessionId) -> Option<PublishTargets>;
+    /// Run steps 6–8 of §9.4: the worktree, the applied patch, the commit and
+    /// the gate.
+    fn publish(
+        &self,
+        request: PublishRequest,
+    ) -> futures::future::BoxFuture<'static, Result<PublishReceipt, PublishError>>;
+}
+
+/// The port of a process whose configuration has no `selfdev.publish`
+/// section: every publish fails honestly instead of writing (§14 V32).
+pub struct UnconfiguredPublish;
+
+impl PublishPort for UnconfiguredPublish {
+    fn derive(&self, _run: SessionId) -> Option<PublishTargets> {
+        None
+    }
+
+    fn publish(
+        &self,
+        _request: PublishRequest,
+    ) -> futures::future::BoxFuture<'static, Result<PublishReceipt, PublishError>> {
+        Box::pin(async { Err(PublishError::NotConfigured) })
+    }
+}
+
 /// Admits an alert run (§13.3).
 pub trait AlertPort: Send + Sync {
     /// The alerts declared for `job_id`, in declaration order.
@@ -202,6 +356,8 @@ pub struct JobDeps {
     pub directory: Arc<dyn WorkerDirectoryPort>,
     /// Delivery, as a conductor action (§13.1).
     pub deliver: Arc<dyn DeliverPort>,
+    /// Publishing, as a conductor action (SELF-EVOLUTION-MODEL §9.4).
+    pub publish: Arc<dyn PublishPort>,
     /// Alerts, as runs of a synthetic job (§13.3).
     pub alerts: Arc<dyn AlertPort>,
     /// The clock every comparison uses.
@@ -228,11 +384,19 @@ impl JobDeps {
             spawner,
             directory,
             deliver,
+            publish: Arc::new(UnconfiguredPublish),
             alerts,
             clock,
             tick_floor_ms: JOB_TICK_MIN_MS,
             tick_ceiling_ms: JOB_TICK_MAX_MS,
         }
+    }
+
+    /// Replace the publish port (SELF-EVOLUTION-MODEL §9.4).
+    #[must_use]
+    pub fn with_publish(mut self, publish: Arc<dyn PublishPort>) -> Self {
+        self.publish = publish;
+        self
     }
 
     fn clamp_wait(&self, wait_ms: u64) -> u64 {
@@ -386,7 +550,8 @@ async fn tick(port: &Arc<dyn RunPort>, deps: &JobDeps) -> Tick {
 
     let dispatches = status::dispatches(&events);
     let verdict_log = status::verdicts(&events);
-    let intents = deliver_intents(&events);
+    let mut intents = deliver_intents(&events);
+    intents.extend(publish_intents(&events));
     let facts = facts_from(plan, &dispatches, &intents, &verdict_log);
     let artifacts = status::artifacts(&events, plan);
     let now = deps.clock.now_ms();
@@ -552,18 +717,30 @@ fn is_cancel_row(row: &Value) -> bool {
 /// Every delivery intent on the run stream: `(step, attempt)` (§13.2).
 #[must_use]
 pub fn deliver_intents(events: &[Event]) -> Vec<(String, u32)> {
+    intents_with(events, DELIVER_TOOL, DELIVER_CALL_PREFIX)
+}
+
+/// Every publish intent on the run stream: `(step, attempt)` (§9.4 step 4).
+#[must_use]
+pub fn publish_intents(events: &[Event]) -> Vec<(String, u32)> {
+    intents_with(events, PUBLISH_TOOL, PUBLISH_CALL_PREFIX)
+}
+
+/// The `(step, attempt)` pairs of one conductor action's intents on the run
+/// stream. An intent is the only evidence that the action may have happened.
+fn intents_with(events: &[Event], tool: &str, prefix: &str) -> Vec<(String, u32)> {
     let mut out = Vec::new();
     for event in events {
         if event.kind != EventKind::ToolCall {
             continue;
         }
-        if event.bytes.get("tool").and_then(Value::as_str) != Some(DELIVER_TOOL) {
+        if event.bytes.get("tool").and_then(Value::as_str) != Some(tool) {
             continue;
         }
         let Some(call_id) = event.bytes.get("call_id").and_then(Value::as_str) else {
             continue;
         };
-        let Some(rest) = call_id.strip_prefix(DELIVER_CALL_PREFIX) else {
+        let Some(rest) = call_id.strip_prefix(prefix) else {
             continue;
         };
         let Some((step, attempt)) = rest.rsplit_once(':') else {
@@ -954,6 +1131,9 @@ async fn observe(
     attempt: u32,
     now: u64,
 ) -> Tick {
+    if step.is_publish() {
+        return observe_publish(port, step, attempt, events).await;
+    }
     let record = dispatches
         .iter()
         .find(|record| record.step == step.id && record.attempt == attempt);
@@ -1289,6 +1469,9 @@ async fn dispatch_attempt(
     if step.is_deliver() {
         return execute_deliver(port, deps, step, attempt).await;
     }
+    if step.is_publish() {
+        return execute_publish(port, deps, marker, events, step, attempt).await;
+    }
     dispatch_agent(port, deps, marker, facts, events, step, attempt).await
 }
 
@@ -1497,6 +1680,384 @@ async fn execute_deliver(
     }
 }
 
+/// The branch a publish derives from its run (§9.4 step 3).
+#[must_use]
+pub fn publish_branch(run: SessionId) -> String {
+    format!("selfdev/{}", run.0)
+}
+
+/// Observe an in-flight publish attempt (§9.4, §12): a committed receipt
+/// settles it from the same bytes a re-drive reads, and an intent without one
+/// is a write whose end nobody saw.
+async fn observe_publish(
+    port: &Arc<dyn RunPort>,
+    step: &StepPlan,
+    attempt: u32,
+    events: &[Event],
+) -> Tick {
+    let call_id = format!("{PUBLISH_CALL_PREFIX}{}:{attempt}", step.id);
+    let branch = publish_branch(port.session());
+    if let Some(result) = events.iter().rev().find(|event| {
+        event.kind == EventKind::ToolResult
+            && event.bytes.get("call_id").and_then(Value::as_str) == Some(call_id.as_str())
+    }) {
+        return settle_publish(port, step, attempt, &result.bytes, &branch).await;
+    }
+    let attempted = events.iter().any(|event| {
+        event.kind == EventKind::ToolCall
+            && event.bytes.get("call_id").and_then(Value::as_str) == Some(call_id.as_str())
+    });
+    let (detail, outcome) = if attempted {
+        (
+            "the conductor stopped between the publish intent and its receipt: the worktree may exist and what landed is unknown",
+            AttemptOutcome::NeedsOperator,
+        )
+    } else {
+        (
+            "the attempt has no publish intent, so nothing was written",
+            AttemptOutcome::Failed,
+        )
+    };
+    let gate = failed_gate(attempt, PUBLISH_CHECK, Some(detail.to_string()));
+    settle_step(port, step, attempt, gate, outcome).await
+}
+
+/// Run one publish step in the conductor's own drain (§9.4). The intent is
+/// committed before the first write and the receipt after the last one: the
+/// pair is the only evidence, so a crash between them leaves a fact an
+/// operator can act on.
+async fn execute_publish(
+    port: &Arc<dyn RunPort>,
+    deps: &JobDeps,
+    marker: &status::JobMarker,
+    events: &[Event],
+    step: &StepPlan,
+    attempt: u32,
+) -> Tick {
+    let Some(publish) = step.publish() else {
+        let gate = failed_gate(
+            attempt,
+            PUBLISH_CHECK,
+            Some("invalid publish step: the step carries no publish block".to_string()),
+        );
+        return settle_step(port, step, attempt, gate, AttemptOutcome::Failed).await;
+    };
+    let Some(input) = step.inputs.first() else {
+        let gate = failed_gate(
+            attempt,
+            INPUT_CHECK,
+            Some("the step names no input to publish".to_string()),
+        );
+        return settle_step(port, step, attempt, gate, AttemptOutcome::Failed).await;
+    };
+    let Some(from) = artifact_intent(events, &input.step, &input.name) else {
+        let gate = failed_gate(
+            attempt,
+            INPUT_CHECK,
+            Some(format!(
+                "artifact {} from step {} was not produced",
+                input.name, input.step
+            )),
+        );
+        return settle_step(port, step, attempt, gate, AttemptOutcome::Failed).await;
+    };
+    let Some(targets) = deps.publish.derive(port.session()) else {
+        let gate = failed_gate(
+            attempt,
+            PUBLISH_CHECK,
+            Some(PUBLISH_NOT_CONFIGURED.to_string()),
+        );
+        return settle_step(port, step, attempt, gate, AttemptOutcome::Failed).await;
+    };
+    let base_commit = marker
+        .selfdev
+        .as_ref()
+        .and_then(|selfdev| selfdev.get("base_commit"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if base_commit.is_empty() {
+        let gate = failed_gate(
+            attempt,
+            PUBLISH_CHECK,
+            Some(
+                "the marker carries no base commit: the run was not admitted from an evidence pack"
+                    .to_string(),
+            ),
+        );
+        return settle_step(port, step, attempt, gate, AttemptOutcome::Failed).await;
+    }
+
+    let branch = publish_branch(port.session());
+    let call_id = format!("{PUBLISH_CALL_PREFIX}{}:{attempt}", step.id);
+    let intent = json!({
+        "tool": PUBLISH_TOOL,
+        "call_id": call_id,
+        "args": {
+            "step": &step.id,
+            "attempt": attempt,
+            "from": &from,
+            "base_commit": &base_commit,
+            "branch": &branch,
+            "worktree": &targets.worktree,
+        },
+    });
+    if let Err(err) = port.emit(EventKind::ToolCall, intent).await {
+        warn!(session = %port.session().0, error = %err, "job run: cannot record a publish intent");
+        return Tick::park(JOB_DEFER_TICK_MS);
+    }
+
+    let patch = match verified_patch(deps, &from).await {
+        Ok(patch) => patch,
+        Err(detail) => return fail_publish(port, step, attempt, &call_id, &branch, detail).await,
+    };
+    let request = PublishRequest {
+        step: step.id.clone(),
+        attempt,
+        from: from.clone(),
+        patch,
+        base_commit,
+        branch: branch.clone(),
+        worktree: targets.worktree,
+        subject: format!("selfdev: the proposal from run {}", port.session().0),
+        trailers: publish_trailers(marker, &from),
+        base: publish.base.clone(),
+        gates: publish.gates,
+        push: publish.push,
+        pull_request: publish.pull_request,
+    };
+    let result = match deps.publish.publish(request).await {
+        Ok(receipt) => {
+            let receipt = receipt_json(&receipt);
+            let verdict = publish_receipt_ok(&receipt, &branch, publish.gates);
+            let ok = verdict.is_ok();
+            let mut result = json!({ "call_id": call_id, "ok": ok, "result": receipt });
+            if let Err(detail) = verdict {
+                result["error"] = Value::String(detail);
+            }
+            result
+        }
+        Err(err) => json!({
+            "call_id": call_id,
+            "ok": false,
+            "error": err.detail(),
+            "needs_operator": matches!(err, PublishError::Occupied(_) | PublishError::Unknown(_)),
+        }),
+    };
+    if let Err(err) = port.emit(EventKind::ToolResult, result.clone()).await {
+        warn!(session = %port.session().0, error = %err, "job run: cannot close a publish intent");
+        return Tick::park(JOB_TICK_MIN_MS);
+    }
+    settle_publish(port, step, attempt, &result, &branch).await
+}
+
+/// Fail one publish attempt before any write: the intent stands, and the
+/// receipt says why nothing was published (§9.4 step 5).
+async fn fail_publish(
+    port: &Arc<dyn RunPort>,
+    step: &StepPlan,
+    attempt: u32,
+    call_id: &str,
+    branch: &str,
+    detail: String,
+) -> Tick {
+    let result = json!({ "call_id": call_id, "ok": false, "error": detail });
+    if let Err(err) = port.emit(EventKind::ToolResult, result.clone()).await {
+        warn!(session = %port.session().0, error = %err, "job run: cannot close a publish intent");
+        return Tick::park(JOB_TICK_MIN_MS);
+    }
+    settle_publish(port, step, attempt, &result, branch).await
+}
+
+/// Settle one publish attempt from its committed receipt (§9.4, A17). The
+/// gate is derived from the receipt, so a re-drive after a crash between the
+/// receipt and the verdict decides the same way.
+async fn settle_publish(
+    port: &Arc<dyn RunPort>,
+    step: &StepPlan,
+    attempt: u32,
+    result: &Value,
+    branch: &str,
+) -> Tick {
+    let gates = step.publish().is_none_or(|publish| publish.gates);
+    let mut checks = vec![check_publish_ok(result, branch, gates)];
+    for check in &step.verify {
+        if matches!(check, JobCheck::PublishOk) {
+            continue;
+        }
+        checks.push(CheckOutcome {
+            name: check.name().to_string(),
+            passed: false,
+            detail: Some(
+                "a publish step is judged by its receipt: this check is not evaluable".to_string(),
+            ),
+        });
+    }
+    let passed = checks.iter().all(|check| check.passed);
+    let gate = GateVerdict {
+        passed,
+        checks,
+        attempt: u64::from(attempt.saturating_sub(1)),
+    };
+    let needs_operator = result
+        .get("needs_operator")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let outcome = if passed {
+        AttemptOutcome::Succeeded
+    } else if needs_operator {
+        AttemptOutcome::NeedsOperator
+    } else {
+        AttemptOutcome::Failed
+    };
+    settle_step(port, step, attempt, gate, outcome).await
+}
+
+/// Judge one publish receipt (§9.4): a full commit, the derived branch, and a
+/// gate that exited zero when the plan asked for one.
+#[must_use]
+pub fn check_publish_ok(result: &Value, branch: &str, gates: bool) -> CheckOutcome {
+    let fail = |detail: String| CheckOutcome {
+        name: PUBLISH_CHECK.to_string(),
+        passed: false,
+        detail: Some(detail),
+    };
+    if result.get("ok").and_then(Value::as_bool) != Some(true) {
+        let detail = result
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("the publish produced no receipt");
+        return fail(detail.to_string());
+    }
+    let receipt = result.get("result").cloned().unwrap_or(Value::Null);
+    let commit = receipt
+        .get("commit")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !is_full_commit(commit) {
+        return fail(format!("the receipt names no full commit: {commit:?}"));
+    }
+    let named = receipt
+        .get("branch")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if named != branch {
+        return fail(format!(
+            "the receipt names branch {named:?}, not the derived {branch:?}"
+        ));
+    }
+    if gates {
+        let Some(gate) = receipt.get("gate") else {
+            return fail(
+                "the receipt carries no gate: the configured gate did not run".to_string(),
+            );
+        };
+        if gate.get("exit_code").and_then(Value::as_i64) != Some(0) {
+            let code = gate
+                .get("exit_code")
+                .map_or_else(|| "nothing".to_string(), |code| code.to_string());
+            return fail(format!("the gate exited {code}, not 0"));
+        }
+    }
+    CheckOutcome {
+        name: PUBLISH_CHECK.to_string(),
+        passed: true,
+        detail: Some(format!("receipt {commit}")),
+    }
+}
+
+fn publish_receipt_ok(receipt: &Value, branch: &str, gates: bool) -> Result<(), String> {
+    let wrapped = json!({ "ok": true, "result": receipt });
+    let outcome = check_publish_ok(&wrapped, branch, gates);
+    if outcome.passed {
+        Ok(())
+    } else {
+        Err(outcome
+            .detail
+            .unwrap_or_else(|| "the receipt does not satisfy the publish contract".to_string()))
+    }
+}
+
+fn is_full_commit(commit: &str) -> bool {
+    commit.len() == 40 && commit.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn receipt_json(receipt: &PublishReceipt) -> Value {
+    let mut value = json!({
+        "branch": &receipt.branch,
+        "worktree": &receipt.worktree,
+        "commit": &receipt.commit,
+    });
+    if let Some(gate) = &receipt.gate {
+        value["gate"] = json!({
+            "command": &gate.command,
+            "exit_code": gate.exit_code,
+            "digest": &gate.digest,
+            "output_tail": &gate.output_tail,
+        });
+    }
+    value
+}
+
+fn publish_trailers(marker: &status::JobMarker, from: &Value) -> Vec<(String, String)> {
+    let pack = marker
+        .selfdev
+        .as_ref()
+        .and_then(|selfdev| selfdev.get("pack"))
+        .and_then(|pack| pack.get("manifest_sha256"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let patch = from
+        .get("sha256")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    vec![
+        ("Kian-Run".to_string(), marker.run_id.clone()),
+        ("Kian-Plan-Digest".to_string(), marker.plan_digest.clone()),
+        ("Kian-Patch-Sha256".to_string(), patch.to_string()),
+        ("Kian-Pack".to_string(), pack.to_string()),
+    ]
+}
+
+/// Re-read the producer's committed bytes and hold them to the frozen digest
+/// (§9.4 step 5): a commit can only contain bytes the plan's checks saw.
+async fn verified_patch(deps: &JobDeps, from: &Value) -> Result<String, String> {
+    let reference = from.get("ref").ok_or("the artifact ref names no event")?;
+    let producer = reference
+        .get("session")
+        .and_then(Value::as_str)
+        .ok_or("the artifact ref names no session")?;
+    let seq = reference
+        .get("seq")
+        .and_then(Value::as_u64)
+        .ok_or("the artifact ref names no seq")?;
+    let producer = uuid::Uuid::parse_str(producer)
+        .map(SessionId)
+        .map_err(|err| format!("the artifact ref names no session: {err}"))?;
+    let events = deps
+        .streams
+        .read_stream(producer)
+        .await
+        .map_err(|err| format!("the producer's stream is unreadable: {err}"))?;
+    let event = events
+        .iter()
+        .find(|event| event.seq == seq)
+        .ok_or_else(|| format!("the producer has no event at seq {seq}"))?;
+    let text = message_text(event)
+        .ok_or_else(|| format!("event {seq} of the producer carries no text"))?;
+    let expected = from
+        .get("sha256")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let digest = crate::job::plan::digest_text(&text);
+    if digest != expected {
+        return Err(format!(
+            "the artifact's committed bytes hash to {digest}, not the frozen {expected}"
+        ));
+    }
+    Ok(text)
+}
+
 /// The child's task text (§8.4): deterministic, so a re-drive admits identical
 /// bytes. Declared inputs are inlined from the producer's own committed event,
 /// never from a copy (§12.2).
@@ -1603,6 +2164,27 @@ fn artifact_ref(events: &[Event], step: &str, name: &str) -> Option<(SessionId, 
         let producer = reference.get("session")?.as_str()?;
         let seq = reference.get("seq")?.as_u64()?;
         Some((SessionId(uuid::Uuid::parse_str(producer).ok()?), seq))
+    })
+}
+
+/// The frozen ref of one artifact on the run stream (§12.1): the value a
+/// publish carries as `from`.
+fn artifact_intent(events: &[Event], step: &str, name: &str) -> Option<Value> {
+    events.iter().rev().find_map(|event| {
+        if event.kind != EventKind::ToolCall {
+            return None;
+        }
+        if event.bytes.get("tool").and_then(Value::as_str) != Some(status::ARTIFACT_TOOL) {
+            return None;
+        }
+        let artifact = event.bytes.get("args")?.get("artifact")?;
+        if artifact.get("step").and_then(Value::as_str) != Some(step) {
+            return None;
+        }
+        if artifact.get("name").and_then(Value::as_str) != Some(name) {
+            return None;
+        }
+        Some(artifact.clone())
     })
 }
 

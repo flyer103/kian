@@ -1053,7 +1053,7 @@ The run's outcome rides one additive `evidence/verdict` with gate `run`, because
 driver — owns the session end.
 
 
-### Self-evolution (S1 landed, S2 specified)
+### Self-evolution (S1 landed, S2a landed, S2b specified)
 
 Scope: a committed failure becomes a reviewable proposal. A self-dev run is an ordinary job run
 whose subject is a verified evidence pack, and no run merges, deploys or holds a credential while
@@ -1066,7 +1066,7 @@ key on the admitted row. The normative contract is
 | Phase | Contents | Status |
 |-------|----------|--------|
 | S1 propose | `kian job run --pack <dir>` verifies the pack before admitting, the `job.selfdev` key, the `patch_paths_allowed` surface check, the `consecutive_failures` breaker, the proposal delivered as artifacts on the run | landed |
-| S2a publish-local | the conductor's `publish` step: one derived worktree and branch at the frozen base, the patch artifact applied and committed with the audit trailers, the configured scoped gates re-run inside the worktree — no credential | specified, not implemented |
+| S2a publish-local | the conductor's `publish` step: one derived worktree and branch at the frozen base, the patch artifact applied and committed with the audit trailers, the configured scoped gates re-run inside the worktree — no credential | landed |
 | S2b publish-remote | one non-forced push of that branch and one pull request whose body carries the audit chain, with the credential read from the environment at publish time | specified, not implemented |
 | S3 land | merge, tag, deploy, rollback — the owner's action | not designed |
 
@@ -1085,6 +1085,14 @@ Publishing is a conductor action, not a general command: the `publish` step's se
 leaves a receipt on the run stream, and a plan can ask for a publish but never for an arbitrary
 command ([design/JOB-MODEL.md](../design/JOB-MODEL.md) §13.5,
 [design/SELF-EVOLUTION-MODEL.md](../design/SELF-EVOLUTION-MODEL.md) §9.4).
+
+S2a lands that sequence with no credential and no network write: the receipt carries the branch,
+the commit and the gate's exit code, `kian job status <run>` renders it, an operator whose
+configuration has no `selfdev.publish` section sees the step fail honestly with
+`publish is not configured` before anything is written, and the gate is the operator's
+configuration — a plan cannot choose the evidence that judges its own proposal. A worktree already
+on disk, or an intent whose receipt was never written, settles the attempt `needs_operator`: the
+worktree stays as the evidence and the attempt is never retried.
 
 ### Deferred (unchanged)
 | Item | Reason |
