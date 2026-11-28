@@ -3118,29 +3118,70 @@ fn metrics_router(server: Arc<Server>) -> axum::Router {
 /// a pure projection, so it is as durable as the log itself. With the
 /// superagent assembly mounted, the fragment adds evidence-verdict,
 /// subscription, channel-policy and watchdog counters.
+///
+/// A scrape never replays the store. The cache and usage aggregates come
+/// from the fresh views when the read model publishes them; otherwise they
+/// answer a `degraded` marker and the honest full-scan fold stays behind an
+/// explicit `?full=1`. That fold is O(store bytes), so it belongs to an
+/// operator who asked for it, never to a monitor scraping on a timer.
+#[derive(serde::Deserialize)]
+struct MetricsQuery {
+    /// `?full=1` opts into the full-scan fold.
+    full: Option<String>,
+}
+
+/// The cache/usage answer when the projection would need a full scan:
+/// an explicit gap, never a silent zero.
+fn degraded_metrics() -> serde_json::Value {
+    serde_json::json!({
+        "degraded": "views_unavailable",
+        "hint": "pass ?full=1 to fold the whole store (O(store bytes))",
+    })
+}
+
 async fn metrics_handler(
     axum::extract::State(server): axum::extract::State<Arc<Server>>,
+    axum::extract::Query(query): axum::extract::Query<MetricsQuery>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
     let engine =
         serde_json::to_value(server.engine.metrics().snapshot()).unwrap_or(serde_json::Value::Null);
-    let cache =
+    let full = matches!(query.full.as_deref(), Some("1") | Some("true"));
+    let cache = if full {
         match crate::cache_metrics::cache_stats_report(&server.store, None, server.views_enabled)
             .await
         {
             Ok(report) => serde_json::to_value(report).unwrap_or(serde_json::Value::Null),
             Err(e) => serde_json::json!({"error": e.to_string()}),
-        };
+        }
+    } else {
+        match crate::cache_metrics::cache_stats_report_bounded(&server.store, server.views_enabled)
+            .await
+        {
+            Ok(Some(report)) => serde_json::to_value(report).unwrap_or(serde_json::Value::Null),
+            Ok(None) => degraded_metrics(),
+            Err(e) => serde_json::json!({"error": e.to_string()}),
+        }
+    };
     // the usage aggregate, derived on read from `turn/end` payloads
     // (pure projection — no drain ever bumps a counter).
-    let usage =
+    let usage = if full {
         match crate::usage_metrics::usage_stats_report(&server.store, None, server.views_enabled)
             .await
         {
             Ok(report) => serde_json::to_value(report).unwrap_or(serde_json::Value::Null),
             Err(e) => serde_json::json!({"error": e.to_string()}),
-        };
+        }
+    } else {
+        match crate::usage_metrics::usage_stats_report_bounded(&server.store, server.views_enabled)
+            .await
+        {
+            Ok(Some(report)) => serde_json::to_value(report).unwrap_or(serde_json::Value::Null),
+            Ok(None) => degraded_metrics(),
+            Err(e) => serde_json::json!({"error": e.to_string()}),
+        }
+    };
     let superagent = match &server.superagent {
         Some(runtime) => runtime.metrics_report(&server.store).await,
         None => serde_json::Value::Null,

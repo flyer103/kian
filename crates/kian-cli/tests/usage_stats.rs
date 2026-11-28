@@ -223,7 +223,7 @@ async fn usage_surfaces_inspect_stats_and_metrics_over_a_seeded_store() {
         axum::serve(listener, router).await.expect("serve");
     });
     let metrics: Value = reqwest::Client::new()
-        .get(format!("{base}/metrics"))
+        .get(format!("{base}/metrics?full=1"))
         .send()
         .await
         .expect("metrics")

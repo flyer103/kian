@@ -307,6 +307,27 @@ pub async fn cache_stats_report(
     Ok(report)
 }
 
+/// The `/metrics` path: the fresh-view fold only. `None` means the
+/// derivation would need a full store scan — the caller decides whether
+/// the operator asked for that (`?full=1`) instead of paying it inline
+/// on every scrape.
+pub async fn cache_stats_report_bounded(
+    store: &kian_store::EventStore,
+    use_views: bool,
+) -> Result<Option<CacheStatsReport>, InboxError> {
+    if !use_views {
+        return Ok(None);
+    }
+    let Some(entries) = crate::views::fresh_cache(store).await else {
+        return Ok(None);
+    };
+    let mut report = CacheStatsReport::default();
+    for entry in &entries {
+        report.add_session(&entry.report());
+    }
+    Ok(Some(report))
+}
+
 /// Runs `kian cache-stats`: loads the config (fail-closed), opens the
 /// configured sqlite store read-only-in-intent, derives the report
 /// and renders it (human-readable, or JSON with `json = true`).

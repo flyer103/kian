@@ -230,6 +230,27 @@ pub async fn usage_stats_report(
     Ok(report)
 }
 
+/// The `/metrics` path: the fresh-view fold only. `None` means the
+/// derivation would need a full store scan — the caller decides whether
+/// the operator asked for that (`?full=1`) instead of paying it inline
+/// on every scrape.
+pub async fn usage_stats_report_bounded(
+    store: &kian_store::EventStore,
+    use_views: bool,
+) -> Result<Option<UsageStatsReport>, InboxError> {
+    if !use_views {
+        return Ok(None);
+    }
+    let Some(entries) = crate::views::fresh_usage(store).await else {
+        return Ok(None);
+    };
+    let mut report = UsageStatsReport::default();
+    for entry in &entries {
+        report.add_session(&entry.report());
+    }
+    Ok(Some(report))
+}
+
 /// Renders the human-readable `kian usage-stats` output (deterministic:
 /// a pure function of the report).
 #[must_use]

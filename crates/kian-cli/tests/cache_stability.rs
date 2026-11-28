@@ -327,7 +327,7 @@ async fn cache_stability_consecutive_requests_share_prefix_and_metrics_expose_it
 
     // -- 3. GET /metrics exposes the cache report and engine counters.
     let metrics: Value = client
-        .get(format!("{base}/metrics"))
+        .get(format!("{base}/metrics?full=1"))
         .send()
         .await
         .expect("metrics")

@@ -2226,7 +2226,12 @@ impl SuperAgentRuntime {
         let mut im = 0u64;
         let mut structured = 0u64;
         let mut truncated = 0u64;
-        if let Ok(events) = store.rebuild(self.router.load()).await {
+        // one indexed kind read over the Router stream (never a replay:
+        // the router session is the largest stream in a busy store).
+        if let Ok(events) = store
+            .scan_kind(self.router.load(), EventKind::ChannelDelivered)
+            .await
+        {
             for event in &events {
                 if event.kind != EventKind::ChannelDelivered {
                     continue;

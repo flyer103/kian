@@ -385,8 +385,8 @@ Read-only JSON snapshot. HTTP 200, `application/json`.
 |---|---|---|
 | `engine` | object | In-memory engine counters (drain depth, drains started, state transitions, wakes…) — reset with the process |
 | `pending_wake_depth` | integer | In-process pending wake registry depth |
-| `cache` | object | Prefix-cache stability report derived from the durable stream; a store error surfaces as `{"error": "<message>"}` |
-| `usage` | object | Provider token-usage aggregate projected from `turn/end`; the provider's own numbers, no pricing or normalization. Nested counters are additive: the cache-miss count is always reported (an explicit miss spelling wins; otherwise it is derived from the hit spelling's billing convention, and with no cache spelling all input is miss), and the CLI derives a hit rate at render. Pricing is a separate CLI projection over a config book and never appears here |
+| `cache` | object | Prefix-cache stability report derived from the durable stream; a store error surfaces as `{"error": "<message>"}`, an unavailable projection as `{"degraded": "views_unavailable", ...}` |
+| `usage` | object | Provider token-usage aggregate projected from `turn/end`, with the same degraded/error spellings as `cache`; the provider's own numbers, no pricing or normalization. Nested counters are additive: the cache-miss count is always reported (an explicit miss spelling wins; otherwise it is derived from the hit spelling's billing convention, and with no cache spelling all input is miss), and the CLI derives a hit rate at render. Pricing is a separate CLI projection over a config book and never appears here |
 | `superagent` | object or `null` | Bundle counters (evidence, subscription, channel, watchdog, batching); `null` when no `superagent:` section assembled |
 | `memory` | object or `null` | Counters of the memory assembly: dream counters (dreams, read/parse/append failures, notes appended/deduped) and, when `memory.session` is configured (P2), the injection counters `injected_sessions`/`injected_items`/`injected_bytes`/`injected_truncations`/`injected_skips`; `null` when no `memory:` section assembled |
 | `event_stream` | object | Fan-in `GET /events` gauges (READ-MODEL §4.2, §5.4): `subscribers` and `sessions_watched` (live gauges) plus `events_sent` (monotonic counter) — process-local, reset with the process |
@@ -395,6 +395,14 @@ The seven top-level keys are stable; nested counters are additive. Consumers mus
 keys and unknown nested fields. `engine` and `pending_wake_depth` are process-local, while `cache`
 and `usage` are pure projections over durable events — a restart resets the former and not the
 latter. `event_stream` is process-local like `engine`.
+
+`cache` and `usage` are the two keys whose derivation is proportional to the store's byte size, so
+neither is ever computed inline on a plain scrape. They are served from the fresh read-model views
+(READ-MODEL §6) when those publish them; otherwise the key answers
+`{"degraded": "views_unavailable", "hint": ...}`. The honest full-scan fold is reachable only by
+asking for it with `?full=1`, which is an operator gesture (it reads the whole event log), never a
+monitor's. A degraded key means "not measurable from a projection right now" — consumers must not
+read it as zero, and a zero-valued `cache`/`usage` still means a real, derivable zero.
 
 ## 7. GitHub webhook — `POST /webhooks/github`
 
