@@ -79,13 +79,31 @@ impl StoreKey {
     }
 }
 
-/// The sha256 digest over a view's row set, domain-separated per view.
-/// Rows are taken session-ascending (the read order), so the digest is
-/// order-independent for any row set a publisher sorted the same way.
+/// The row-payload schema version of every materialized view.
+///
+/// The digest domain below carries it, so a bump invalidates every
+/// stored view at once: the next maintenance tick cannot reuse the old
+/// bytes and derives the whole set again. Views are disposable
+/// accelerators — serving rows written for another shape is not an
+/// option, whether they still decode or not.
+pub const VIEW_SCHEMA_VERSION: u32 = 1;
+
+/// The sha256 digest over a view's row set, domain-separated per view
+/// and per row-payload schema version. Rows are taken session-ascending
+/// (the read order), so the digest is order-independent for any row set
+/// a publisher sorted the same way.
 #[must_use]
 pub fn view_rows_digest(view: &str, rows: &[ViewRow]) -> String {
+    view_rows_digest_in(view, rows, VIEW_SCHEMA_VERSION)
+}
+
+/// [`view_rows_digest`] at an explicit schema version (the version is
+/// part of the domain, so two versions never collide).
+fn view_rows_digest_in(view: &str, rows: &[ViewRow], version: u32) -> String {
     let mut h = Sha256::new();
-    h.update(b"kian-view-v1");
+    h.update(b"kian-view");
+    h.update([0u8]);
+    h.update(version.to_string().as_bytes());
     h.update([0u8]);
     h.update(view.as_bytes());
     h.update([0u8]);
@@ -376,7 +394,7 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    use super::{StoreKey, ViewRow, view_rows_digest};
+    use super::{StoreKey, VIEW_SCHEMA_VERSION, ViewRow, view_rows_digest, view_rows_digest_in};
     use crate::{AppendGuard, EventStore};
 
     fn temp_db_path() -> PathBuf {
@@ -581,6 +599,44 @@ mod tests {
 
         store.close().await;
         cleanup(&path);
+    }
+
+    /// The digest domain is (view, row-payload schema version, rows):
+    /// two views never share a digest, and a schema-version bump moves
+    /// every digest even over byte-identical rows — the invalidation
+    /// that makes a changed payload shape un-reusable.
+    #[test]
+    fn the_digest_domain_carries_the_view_and_the_schema_version() {
+        let rows = vec![
+            row("a", 1, r#"{"events":1}"#),
+            row("b", 3, r#"{"events":7}"#),
+        ];
+        assert_eq!(
+            view_rows_digest("session_usage", &rows),
+            view_rows_digest_in("session_usage", &rows, VIEW_SCHEMA_VERSION),
+            "the public digest is the current schema version's digest"
+        );
+        assert_ne!(
+            view_rows_digest("session_usage", &rows),
+            view_rows_digest("session_directory", &rows),
+            "the view name is part of the domain"
+        );
+        assert_ne!(
+            view_rows_digest_in("session_usage", &rows, VIEW_SCHEMA_VERSION),
+            view_rows_digest_in("session_usage", &rows, VIEW_SCHEMA_VERSION + 1),
+            "a schema bump invalidates the stored bytes"
+        );
+        assert_ne!(
+            view_rows_digest("session_usage", &rows),
+            view_rows_digest(
+                "session_usage",
+                &[
+                    row("a", 1, r#"{"events":1}"#),
+                    row("b", 3, r#"{"events":8}"#)
+                ]
+            ),
+            "the payload is part of the domain"
+        );
     }
 
     /// A read-only store last migrated before v4 answers "no view"

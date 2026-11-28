@@ -251,9 +251,11 @@ Landed shape (P2a):
   store's read-only `input_rows`) is as of the last rebuild: `B = read_model.views.interval_ms`.
 - **Freshness gate.** A view is served only at exactly the store key it was derived at (any
   append makes it stale — not a TTL), only when the digest over the read rows matches the stored
-  digest, and only when every payload decodes. Stale, corrupt, undecodable, absent (a read-only
-  reader of a pre-v4 store) or disabled (`read_model.views.enabled: false`) → the honest full
-  stream derivation.
+  digest, and only when every payload decodes. The digest's domain carries the view's
+  row-payload schema version, so a shape change invalidates every stored view at once instead of
+  leaving rows that no longer match what the surface serves. Stale, corrupt, undecodable, absent
+  (a read-only reader of a pre-v4 store) or disabled (`read_model.views.enabled: false`) → the
+  honest full stream derivation.
 - **`ticket_stage` declared bound.** Event-derived fields are exact-version fresh;
   `pending_inbox` (an inbox row can become eligible with no append, via `eligible_at`) and the
   stage's dependence on it are as of the last rebuild — the declared staleness bound `B` (the
@@ -266,11 +268,14 @@ Landed shape (P2a):
 - **Incremental rebuild.** The maintenance tick is incremental: a session whose head is
   unchanged since the last publication is *reused*, not re-derived — a stored row whose
   `row_version` equals the live head was derived from an identical stream (streams are
-  append-only under CAS guards, so the head determines the stream). An unchanged store is a
-  no-op tick (one index-only heads scan, one pending-inbox scan, four digest verifications,
-  nothing published); per-tick fold work is proportional to the *changed* sessions. Publication
-  is the same one-transaction version flip, expressed as a delta (upserts for changed sessions,
-  deletes for gone sessions, state flip to the merged set's digest). The `ticket_stage` view is
+  append-only under CAS guards, so the head determines the stream). A stored row is reusable
+  only when it is digest-clean **and** it still decodes as the served entry type: a payload whose
+  shape the surface no longer accepts is not a reuse base, however consistent its stored digest
+  is. An unchanged store is a no-op tick (one index-only heads scan, one pending-inbox scan,
+  four digest-and-decode verifications, nothing published); per-tick fold work is proportional
+  to the *changed* sessions. Publication is the same one-transaction version flip, expressed as
+  a delta (upserts for changed sessions, deletes for gone sessions, state flip to the merged
+  set's digest). The `ticket_stage` view is
   all-or-nothing: its global folds read board-kind events across every session and
   `pending_inbox` moves with `eligible_at` alone, so a board-kind change, a session deletion or
   a pending drift re-derives the whole board — from a kind-filtered events read plus the worker
@@ -288,6 +293,9 @@ Rules:
 - No control read may consume a view (R1/R8). Operator surfaces may serve a view within its
   declared bound.
 - Maintenance rebuilds run under a lease; a view is visible only when complete for its version.
+- A change to a view's stored payload shape MUST bump `kian_store::VIEW_SCHEMA_VERSION` in the
+  same change. The version lives in the digest domain, so the bump invalidates every stored
+  view and the next tick derives them again — no manual `view_state` drop.
 
 ## 7. Retention and archival (P2)
 

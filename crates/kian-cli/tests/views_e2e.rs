@@ -626,6 +626,75 @@ async fn tampered_view_self_heals_on_the_next_incremental_tick() {
     cleanup(&path);
 }
 
+/// READ-MODEL §6: the reuse base must prove the stored rows DECODE,
+/// not merely that their digest matches. A digest-clean payload whose
+/// shape the served type no longer accepts — the production state
+/// where every usage row predated a new counter — would otherwise be
+/// reused forever, because the reuse key is the live head, not the
+/// payload.
+#[tokio::test]
+async fn digest_clean_but_undecodable_view_self_heals_on_the_next_tick() {
+    let path = temp_db("undecodable");
+    let store = EventStore::open(&path).await.unwrap();
+    seed_store(&store, 4, 2, 47).await;
+    kian_cli::views::rebuild_views(&store, "builder", 1_000, false)
+        .await
+        .unwrap();
+
+    // Stamp one payload the served type cannot decode and re-seal the
+    // stored digest over it: the stored version is now cryptographically
+    // consistent and structurally unusable.
+    let mut rows = store
+        .view_rows("session_usage")
+        .await
+        .unwrap()
+        .expect("usage published");
+    assert!(!rows.is_empty());
+    rows[0].payload = json!({
+        "session": rows[0].session.clone(),
+        "requests_with_usage": "many",
+    })
+    .to_string();
+    if let EventStore::Sqlite(pool) = &store {
+        sqlx::query("UPDATE view_rows SET payload = ? WHERE view = ? AND session = ?")
+            .bind(&rows[0].payload)
+            .bind("session_usage")
+            .bind(&rows[0].session)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE view_state SET digest = ? WHERE view = ?")
+            .bind(kian_store::view_rows_digest("session_usage", &rows))
+            .bind("session_usage")
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+    assert!(
+        serde_json::from_str::<kian_cli::views::UsageEntry>(&rows[0].payload).is_err(),
+        "the stamped payload must not decode as the served shape"
+    );
+
+    let out = kian_cli::views::rebuild_views(&store, "builder", 1_100, false)
+        .await
+        .unwrap();
+    assert!(out.derived > 0, "undecodable payload ⇒ full re-derivation");
+    let entries = kian_cli::views::fresh_usage(&store)
+        .await
+        .expect("fresh usage after the self-heal");
+    assert_eq!(entries.len(), rows.len(), "every session is served again");
+    let via_view = kian_cli::usage_metrics::usage_stats_report(&store, None, true)
+        .await
+        .unwrap();
+    let honest = kian_cli::usage_metrics::usage_stats_report(&store, None, false)
+        .await
+        .unwrap();
+    assert_eq!(via_view, honest, "the healed view equals the derivation");
+
+    store.close().await;
+    cleanup(&path);
+}
+
 /// R9-10: `pending_inbox` can move with no append at all (an inbox row
 /// crossing its `eligible_at`). The incremental tick must detect the
 /// drift against the stored ticket rows and refresh the board (the

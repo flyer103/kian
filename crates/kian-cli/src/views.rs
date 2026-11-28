@@ -42,9 +42,12 @@
 //! identical stream — streams are append-only under CAS guards, so the
 //! head determines the stream). An unchanged store is a no-op tick;
 //! per-tick work is proportional to the *changed* sessions. Any doubt
-//! about the stored views (absent state, digest mismatch, undecodable
-//! ticket payload) falls back to [`rebuild_views_full`] — the self-heal
-//! a per-tick full rebuild used to give. The `ticket_stage` view is
+//! about the stored views (absent state, a digest mismatch — the
+//! digest domain carries the row-payload schema version, so a bump
+//! invalidates every stored view at once — or a payload that no longer
+//! decodes into the served type) falls back to
+//! [`rebuild_views_full`] — the self-heal a per-tick full rebuild used
+//! to give. The `ticket_stage` view is
 //! all-or-nothing (its global folds read board-kind events across
 //! every session, and `pending_inbox` moves with `eligible_at` alone):
 //! a board-kind change, a deletion, or a pending drift re-derives the
@@ -414,9 +417,11 @@ pub struct RebuildOutcome {
 /// live head was derived from an identical stream — streams are
 /// append-only under CAS guards, so the head determines the stream).
 /// An unchanged store is a no-op tick. Any doubt about the stored
-/// views (absent state, digest mismatch, undecodable ticket payload)
-/// falls back to [`rebuild_views_full`] — the self-heal a per-tick
-/// full rebuild used to give.
+/// views (absent state, a digest mismatch — including a row-schema
+/// version bump, which the digest domain carries — or a payload that
+/// no longer decodes into the served type) falls back to
+/// [`rebuild_views_full`] — the self-heal a per-tick full rebuild used
+/// to give.
 ///
 /// The store key is pinned **before** any read; publication records
 /// that pinned key, so an append racing the build makes this whole
@@ -510,15 +515,28 @@ pub async fn rebuild_views_full_with(
     outcome
 }
 
-/// Reads one view's stored rows and verifies the digest over exactly
-/// the bytes read. `None` on any doubt (absent tables/state, digest
-/// mismatch, store error) — the caller falls back to the full rebuild.
-async fn stored_view_verified(store: &EventStore, view: &str) -> Option<Vec<ViewRow>> {
+/// Reads one view's stored rows, verifies the digest over exactly
+/// the bytes read, and proves every payload decodes as the view's
+/// served entry type: a view the reader would discard can never
+/// anchor a reuse base. `None` on any doubt (absent tables/state, a
+/// digest mismatch — including a row-schema version bump, which the
+/// digest domain carries — an undecodable payload, a store error) —
+/// the caller falls back to the full rebuild.
+async fn stored_view_decodes<T: for<'de> Deserialize<'de>>(
+    store: &EventStore,
+    view: &str,
+) -> Option<Vec<ViewRow>> {
     let state = store.view_state(view).await.ok()??;
     let rows = store.view_rows(view).await.ok()??;
     if view_rows_digest(view, &rows) != state.digest {
         tracing::warn!(view, "stored view digest mismatch — full rebuild");
         return None;
+    }
+    for row in &rows {
+        if serde_json::from_str::<T>(&row.payload).is_err() {
+            tracing::warn!(view, "stored view payload failed to decode — full rebuild");
+            return None;
+        }
     }
     Some(rows)
 }
@@ -536,13 +554,13 @@ async fn incremental_under_lease(
         .await
         .map_err(|e| format!("view store key: {e}"))?;
 
-    // The reuse base: all four views must be present and digest-clean.
-    // Any doubt → the full rebuild (self-heal).
+    // The reuse base: all four views must be present, digest-clean and
+    // decodable. Any doubt → the full rebuild (self-heal).
     let (Some(directory), Some(usage), Some(cache), Some(tickets)) = (
-        stored_view_verified(store, VIEW_DIRECTORY).await,
-        stored_view_verified(store, VIEW_USAGE).await,
-        stored_view_verified(store, VIEW_CACHE).await,
-        stored_view_verified(store, VIEW_TICKETS).await,
+        stored_view_decodes::<DirectoryEntry>(store, VIEW_DIRECTORY).await,
+        stored_view_decodes::<UsageEntry>(store, VIEW_USAGE).await,
+        stored_view_decodes::<CacheEntry>(store, VIEW_CACHE).await,
+        stored_view_decodes::<TicketEntry>(store, VIEW_TICKETS).await,
     ) else {
         return rebuild_under_lease(store, now_ms, board_enabled).await;
     };
@@ -553,7 +571,7 @@ async fn incremental_under_lease(
     // a stale era. Board on but absent/corrupt stored rows ⇒ the
     // board re-derives (the self-heal the four views just got).
     let task_board_stored = if board_enabled {
-        stored_view_verified(store, VIEW_TASK_BOARD).await
+        stored_view_decodes::<TaskBoardEntry>(store, VIEW_TASK_BOARD).await
     } else {
         drop_task_board_if_present(store).await?;
         None
