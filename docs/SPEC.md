@@ -1053,22 +1053,23 @@ The run's outcome rides one additive `evidence/verdict` with gate `run`, because
 driver — owns the session end.
 
 
-### Self-evolution (S1 landed, S2a landed, S2b landed)
+### Self-evolution (S1 landed, S2a landed, S2b landed, S3 specified)
 
 Scope: a committed failure becomes a reviewable proposal. A self-dev run is an ordinary job run
 whose subject is a verified evidence pack, and no run merges, deploys or holds a credential while
 proposing. No new session state, event kind, table or daemon: the marking travels as one additive
 key on the admitted row. The normative contract is
 [design/SELF-EVOLUTION-MODEL.md](../design/SELF-EVOLUTION-MODEL.md); the decision records are
-[ADR-069](../design/decisions/ADR-069-self-evolution-is-a-proposal-pipeline.md) and
-[ADR-071](../design/decisions/ADR-071-publish-is-a-conductor-action.md).
+[ADR-069](../design/decisions/ADR-069-self-evolution-is-a-proposal-pipeline.md),
+[ADR-071](../design/decisions/ADR-071-publish-is-a-conductor-action.md) and
+[ADR-075](../design/decisions/ADR-075-landing-is-the-owners-merge-verified.md).
 
 | Phase | Contents | Status |
 |-------|----------|--------|
 | S1 propose | `kian job run --pack <dir>` verifies the pack before admitting, the `job.selfdev` key, the `patch_paths_allowed` surface check, the `consecutive_failures` breaker, the proposal delivered as artifacts on the run | landed |
 | S2a publish-local | the conductor's `publish` step: one derived worktree and branch at the frozen base, the patch artifact applied and committed with the audit trailers, the configured scoped gates re-run inside the worktree — no credential | landed |
 | S2b publish-remote | one non-forced push of that branch and one pull request whose body carries the audit chain, with the credential read from the environment at publish time | landed |
-| S3 land | merge, tag, deploy, rollback — the owner's action | not designed |
+| S3 land | the owner merges the reviewed pull request; `kian self verify <run>` recomputes the audit chain (read-only) and `--merged` reports the merge | specified, not implemented |
 
 A symptom is packaged by `kian self evidence` (§3.1). A proposal's `succeeded` means "a reviewable
 patch exists inside the declared surface", never "the defect is fixed": the patch is evidence, and
@@ -1100,6 +1101,14 @@ pull request whose body carries the audit chain, with the credential read from
 push that landed while its pull request failed settles `needs_operator` with the branch on the
 remote, and `kian job status <run>` renders `pushed` and the pull request URL alongside the
 commit.
+
+S3 keeps the merge with the owner: no `land` verb, no auto-merge, no credential. `kian self verify
+<run>` reads the run streams and the local repository and recomputes the chain — the frozen plan,
+the artifact bytes, the commit's parent, diff and `Kian-*` trailers, the branch — and `--merged`
+reports whether the commit is in the base branch's history. It writes nothing and never fetches; a
+chain that breaks exits 2 naming the link. The landing shape is a merge commit, because a squash or
+a rebase drops the artifact commit from history
+([design/SELF-EVOLUTION-MODEL.md](../design/SELF-EVOLUTION-MODEL.md) §18).
 
 ### Deferred (unchanged)
 | Item | Reason |
