@@ -610,6 +610,68 @@ fn tool_result_strings(events: &[kian_core::events::Event]) -> Vec<String> {
         .collect()
 }
 
+/// Every accepted spawn on the Router stream in order: the judged task and
+/// the thread it minted. One per accepted `spawn_worker` call, none for a
+/// refused one, so a count above the accepted calls means an input was judged
+/// again after its worker slot had been released.
+fn router_lineages(events: &[kian_core::events::Event]) -> Vec<(String, String)> {
+    events
+        .iter()
+        .filter(|e| e.kind == EventKind::ThreadStarted)
+        .map(|e| {
+            let content = &e.bytes["task"]["content"];
+            (
+                content["task"].as_str().unwrap_or("<unset>").to_string(),
+                content["thread_id"]
+                    .as_str()
+                    .unwrap_or("<unset>")
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Replays what the Router decided: which input each turn judged, which tool
+/// calls it made, what they answered and which spawns were accepted. Printed
+/// on a lineage-count failure so the extra spawn names its own task.
+fn router_decision_trail(events: &[kian_core::events::Event]) -> String {
+    fn short(value: &str) -> String {
+        value.chars().take(160).collect()
+    }
+    let mut trail = Vec::new();
+    for e in events {
+        let line = match e.kind {
+            EventKind::StepRequest => {
+                let judged = e.bytes["body"]["messages"]
+                    .as_array()
+                    .and_then(|messages| messages.iter().rev().find(|m| m["role"] == "user"))
+                    .map(|m| short(m["content"].as_str().unwrap_or("")))
+                    .unwrap_or_default();
+                format!("{:>3} step/request judged: {judged}", e.seq)
+            }
+            EventKind::ToolCall => format!(
+                "{:>3} tool/call {}: {}",
+                e.seq,
+                e.bytes["content"]["id"].as_str().unwrap_or("?"),
+                short(&e.bytes["content"]["arguments"].to_string())
+            ),
+            EventKind::ToolResult => format!(
+                "{:>3} tool/result {}: {}",
+                e.seq,
+                e.bytes["content"]["call_id"].as_str().unwrap_or("?"),
+                short(&e.bytes["content"].to_string())
+            ),
+            EventKind::ThreadStarted => {
+                let (task, thread) = router_lineages(std::slice::from_ref(e)).remove(0);
+                format!("{:>3} thread/started {thread}: {task}", e.seq)
+            }
+            _ => continue,
+        };
+        trail.push(line);
+    }
+    trail.join("\n")
+}
+
 async fn wait_for_file(path: &Path, timeout_ms: u64) -> String {
     let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
     loop {
@@ -1382,13 +1444,23 @@ async fn bye_and_kill9_offline_watchdog_park_redrive_prefix() {
     )
     .await;
     let router_events = fx.store.rebuild(router_session()).await.expect("rebuild");
-    assert_eq!(
-        router_events
+    let lineages = router_lineages(&router_events);
+    let spawned = |task: &str| {
+        lineages
             .iter()
-            .filter(|e| e.kind == EventKind::ThreadStarted)
-            .count(),
-        2,
-        "the refused busy probe left no thread; the offline-known probe spawned one"
+            .filter(|(spawned_task, _)| spawned_task == task)
+            .count()
+    };
+    assert!(
+        lineages.len() == 2
+            && spawned("job-leave: the leave check") == 1
+            && spawned("job-leave: busy probe on the offline worker") == 0
+            && spawned("job-leave: the offline-note probe") == 1,
+        "one lineage per accepted spawn: the leave probe and the offline-known probe \
+         spawn, the refused busy probe leaves none, and no input is judged twice. \
+         Got {} lineages:\n{}",
+        lineages.len(),
+        router_decision_trail(&router_events)
     );
 
     kill_serve(&mut serve).await;
