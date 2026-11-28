@@ -1053,7 +1053,7 @@ The run's outcome rides one additive `evidence/verdict` with gate `run`, because
 driver — owns the session end.
 
 
-### Self-evolution (S1 landed, S2a landed, S2b landed, S3 specified)
+### Self-evolution (S1 landed, S2a landed, S2b landed, S3 landed)
 
 Scope: a committed failure becomes a reviewable proposal. A self-dev run is an ordinary job run
 whose subject is a verified evidence pack, and no run merges, deploys or holds a credential while
@@ -1069,7 +1069,7 @@ key on the admitted row. The normative contract is
 | S1 propose | `kian job run --pack <dir>` verifies the pack before admitting, the `job.selfdev` key, the `patch_paths_allowed` surface check, the `consecutive_failures` breaker, the proposal delivered as artifacts on the run | landed |
 | S2a publish-local | the conductor's `publish` step: one derived worktree and branch at the frozen base, the patch artifact applied and committed with the audit trailers, the configured scoped gates re-run inside the worktree — no credential | landed |
 | S2b publish-remote | one non-forced push of that branch and one pull request whose body carries the audit chain, with the credential read from the environment at publish time | landed |
-| S3 land | the owner merges the reviewed pull request; `kian self verify <run>` recomputes the audit chain (read-only) and `--merged` reports the merge | specified, not implemented |
+| S3 land | the owner merges the reviewed pull request; `kian self verify <run>` recomputes the audit chain (read-only) and `--merged` reports the merge | landed |
 
 A symptom is packaged by `kian self evidence` (§3.1). A proposal's `succeeded` means "a reviewable
 patch exists inside the declared surface", never "the defect is fixed": the patch is evidence, and

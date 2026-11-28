@@ -1850,15 +1850,16 @@ the branch stays on the remote, and no receipt is written. The repository work s
 the caller's checkout; a gate that outlives its bound settles `needs_operator` with the commit in
 the detail rather than failing as if nothing was written.
 
- Refinement (landing, specified): S3 adds no merge command. The owner merges the reviewed pull
-request with a merge commit, and `kian self verify <run> [--merged]` recomputes the audit chain
-from the run streams and the local repository: the frozen plan digest, the artifact bytes through
-its producer ref, the publish receipt, the commit's parent and diff, its `Kian-*` trailers and the
-branch, plus the merge's place in the base branch. It opens the store read-only, spawns git only
-through `cron_worktree::git_command()`, never fetches and writes no event, row or ref; a broken
-link exits 2 as `audit chain broken at <link>`. A squash or rebase merge is reported unmerged
-because the artifact commit is unreachable (ADR-075). The verifier is specified with the contract
-and lands with its implementation.
+ Refinement (landing, as implemented by `kian-cli`): S3 adds no merge command. The owner merges the
+reviewed pull request with a merge commit, and `kian self verify <run> [--merged]` recomputes the
+audit chain from the run streams and the local repository: the frozen plan digest, the artifact
+bytes through its producer ref, the publish receipt, the commit's parent and diff, its `Kian-*`
+trailers and the branch, plus the merge's place in the base branch. It opens the store read-only,
+spawns git only through `cron_worktree::git_command()`, never fetches and writes no event, row or
+ref; a broken link exits 2 as `audit chain broken at <link>`. A squash or rebase merge is reported
+unmerged because the artifact commit is unreachable (ADR-075). The verifier lives in
+`crates/kian-cli/src/self_verify.rs`: success prints one line per link, `--json` emits
+`{ok, run, links, merged?}`, and a broken chain exits 2 naming the link.
 
  Refinement (operational commands, as implemented by `kian-cli`): the SPEC §3.2 set lands as six
 commands with two access modes. Read-only commands (`kian session inspect <id>`, `kian session

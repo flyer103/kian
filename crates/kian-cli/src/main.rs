@@ -91,6 +91,9 @@ const USAGE: &str = "usage:
   kian self evidence --session <uuid> --seq <n> --out <dir> [--context <k>] [--db <sqlite>] [--config <path>] [--json]
                                          one anchor row -> a handoff package: raw slice,
                                          session/repo identity, inspect projection, sha256s
+  kian self verify <run> [--merged] [--base <branch>] [--config <path>] [--json]
+                                         recompute one self-dev run's audit chain
+                                         (read-only; exit 2 names the broken link)
   kian tickets [--db <sqlite>] [--config <path>] [--json]
                                          Ticket stage board: every worker session's
                                          'what is it waiting for' stage
@@ -1780,7 +1783,7 @@ fn lease(args: &[String]) -> ExitCode {
 fn self_cmd(args: &[String]) -> ExitCode {
     let Some(sub) = args.first() else {
         eprintln!(
-            "kian: `kian self` needs a subcommand (`inspect`, `evidence`)
+            "kian: `kian self` needs a subcommand (`inspect`, `evidence`, `verify`)
 {USAGE}"
         );
         return ExitCode::from(2);
@@ -1788,6 +1791,7 @@ fn self_cmd(args: &[String]) -> ExitCode {
     match sub.as_str() {
         "inspect" => self_inspect_cmd(&args[1..]),
         "evidence" => self_evidence_cmd(&args[1..]),
+        "verify" => self_verify_cmd(&args[1..]),
         other => {
             eprintln!(
                 "kian: unknown self subcommand `{other}`
@@ -1991,6 +1995,89 @@ fn self_evidence_cmd(args: &[String]) -> ExitCode {
         out: &out,
     };
     run_command(kian_cli::self_evidence::run(opts, json), "self evidence")
+}
+
+/// `kian self verify <run> [--merged] [--base <branch>] [--config <path>]
+/// [--json]` — recompute one self-dev run's audit chain (read-only;
+/// SELF-EVOLUTION §18.3). The report prints on stdout; a broken chain prints
+/// exactly one `audit chain broken at <link>: <detail>` line on stderr.
+fn self_verify_cmd(args: &[String]) -> ExitCode {
+    let mut config = std::path::PathBuf::from("kian.yaml");
+    let mut run: Option<String> = None;
+    let mut base: Option<String> = None;
+    let mut merged = false;
+    let mut json = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--config" => match iter.next() {
+                Some(p) => config = p.into(),
+                None => {
+                    eprintln!("kian: --config requires a path\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--base" => match iter.next() {
+                Some(branch) if !branch.trim().is_empty() => base = Some(branch.clone()),
+                Some(_) => {
+                    eprintln!("kian: --base needs a branch name\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+                None => {
+                    eprintln!("kian: --base requires a branch name\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--merged" => merged = true,
+            "--json" => json = true,
+            other if other.starts_with('-') => {
+                eprintln!("kian: unknown self verify option `{other}`\n{USAGE}");
+                return ExitCode::from(2);
+            }
+            other => {
+                if run.is_some() {
+                    eprintln!("kian: `kian self verify` takes one run id, not `{other}`\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+                run = Some(other.to_string());
+            }
+        }
+    }
+    let Some(run) = run else {
+        eprintln!("kian: `kian self verify` needs a run id (`job@slot`)\n{USAGE}");
+        return ExitCode::from(2);
+    };
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(error) => {
+            eprintln!("kian: cannot start async runtime: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let options = kian_cli::self_verify::Options {
+        config,
+        run,
+        base,
+        merged,
+    };
+    match runtime.block_on(kian_cli::self_verify::run(options, json)) {
+        Ok(report) => {
+            print!("{}", report.stdout);
+            eprint!("{}", report.stderr);
+            if report.ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(2)
+            }
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::from(2)
+        }
+    }
 }
 
 /// `kian tickets [--db <sqlite>] [--config <path>] [--json]` — the
