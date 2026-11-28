@@ -55,9 +55,16 @@ alert.
 ## Backups
 
 `kian-backup.timer` fires `kian-backup.service` every night at 03:20 UTC (up to 5 min of jitter),
-which runs `/usr/local/bin/kian-backup.sh`: one `VACUUM INTO` snapshot of `/srv/kian/kian.db` into
-`/srv/kian/backups/kian-<UTC>.db`, a row-count probe of the copy, then pruning down to the five
-most recent files — about 3.4 GB each, about 35 s of wall clock.
+which runs `/usr/local/bin/kian-backup.sh` in three steps: one `VACUUM INTO` snapshot of
+`/srv/kian/kian.db` into `/srv/kian/backups/kian-<UTC>.db` plus a row-count probe of the copy, an
+`rsync -a --delete` mirror of `/srv/kian/archive` into `/srv/kian/backups/archive`, then pruning
+of the database snapshots down to the five most recent files (the archive mirror always tracks the
+live directory). After retention has folded the payloads out, a snapshot is ~250 MB with a ~2.9 GB
+mirror beside it (measured: 0 s and 35 s).
+
+Both halves belong to one backup: retention moves oversized payloads out of the event log into
+`/srv/kian/archive`, so from then on the log only carries references. A database-only snapshot
+would restore sessions whose bytes are gone.
 
 `VACUUM INTO`, not `.backup`: the backup API writes its destination page by page through a rollback
 journal, and against a store the server never stops writing that amplified to hundreds of GB of
@@ -72,6 +79,16 @@ sudo journalctl -u kian-backup.service -n 5        # backup ok: <path> (<bytes>,
 ls -l /srv/kian/backups
 ```
 
+`kian archive verify <session>` resolves the package path recorded in the store, not the `archive_dir`
+of the config it is handed, so it checks the live directory even when pointed at a copy. Verify the
+mirror by comparing bytes (they match the live directory exactly) or by restoring it into place
+first:
+
+```bash
+diff <(cd /srv/kian/archive && find . -type f -exec md5sum {} + | sort -k2) \
+     <(cd /srv/kian/backups/archive && find . -type f -exec md5sum {} + | sort -k2)
+```
+
 Restore — the snapshot is the whole store (events, queue, registry, projections), so replay
 rebuilds every in-memory projection from it and nothing else on the box needs restoring:
 
@@ -81,6 +98,7 @@ install -o kian -g kian -m 0644 /srv/kian/backups/kian-<UTC>.db /srv/kian/kian.d
 mv /srv/kian/kian.db /srv/kian/kian.db.before-restore
 mv /srv/kian/kian.db.restore /srv/kian/kian.db
 rm -f /srv/kian/kian.db-wal /srv/kian/kian.db-shm   # the snapshot is self-contained
+rsync -a --delete /srv/kian/backups/archive/ /srv/kian/archive/   # the bytes the log refers to
 systemctl start kian
 ```
 
