@@ -282,7 +282,17 @@ Landed shape (P2a):
   streams, never from every session's full stream. Any doubt about the stored views (absent
   state, digest mismatch, undecodable payload) falls back to the full rebuild — the self-heal a
   per-tick full rebuild used to give. Read semantics are unchanged: the merged row set is
-  byte-identical to a full rebuild's, pinned to the same store key.
+  byte-identical to a full rebuild's, pinned to the same store key. The full rebuild itself is
+  bounded: see below.
+- **Bounded full rebuild.** The full rebuild — the fallback above — streams one session at a time:
+  each session's events are read, folded into its directory/usage/cache rows and dropped before the
+  next session is read, so peak memory tracks the largest single stream rather than the store. The
+  two global views are derived the same way: `ticket_stage` reads the board-kind events once for
+  its global inputs, then one worker stream at a time through the same per-worker row function the
+  incremental tick uses, and `task_board` reads its kind-filtered parents plus each delegated
+  child one at a time. The published rows and the pinned store key are identical to the
+  whole-store derivation ([ADR-080](decisions/ADR-080-bounded-view-rebuild.md)); the change is
+  memory, not meaning.
 
 Rules:
 

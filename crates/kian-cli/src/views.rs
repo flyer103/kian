@@ -201,6 +201,24 @@ impl TicketEntry {
             parked: self.parked.clone(),
         })
     }
+
+    /// Builds the stored entry from the derivation row (the build side
+    /// of the equivalence; first_ts is the worker stream first event ts,
+    /// the input to_row recomputes age_ms from).
+    #[must_use]
+    pub fn from_row(row: crate::commands::TicketRow, first_ts: u64) -> Self {
+        Self {
+            session: row.session.0.to_string(),
+            thread: row.thread.map(|th| th.to_string()),
+            topic: row.topic,
+            stage: row.stage.as_str().to_string(),
+            thread_status: row.thread_status,
+            pending_inbox: row.pending_inbox as u64,
+            first_ts,
+            events: row.events as u64,
+            parked: row.parked,
+        }
+    }
 }
 
 /// One `task_board` row (R17 C4, pin P3-3): the stored form of
@@ -754,48 +772,7 @@ async fn incremental_under_lease(
     // digest are unchanged) so the freshness gate keeps holding.
     let board_refreshed = board_touched;
     if board_touched {
-        let kinds = crate::commands::board_event_kind_names();
-        let board_events = store
-            .events_where_kinds(&kinds)
-            .await
-            .map_err(|e| format!("view board events: {e}"))?;
-        let mut worker_streams = BTreeMap::new();
-        for worker in kian_superagent::worker_sessions(&board_events) {
-            worker_streams.insert(
-                worker,
-                store
-                    .rebuild(worker)
-                    .await
-                    .map_err(|e| format!("view read events for {worker:?}: {e}"))?,
-            );
-            tokio::task::yield_now().await;
-        }
-        let mut ticket_rows_out = Vec::new();
-        for t in
-            crate::commands::ticket_rows_from(store, &board_events, &worker_streams, now_ms).await?
-        {
-            let first_ts = worker_streams
-                .get(&t.session)
-                .and_then(|events| events.first())
-                .map(|e| e.ts)
-                .ok_or_else(|| format!("ticket session {} missing from streams", t.session.0))?;
-            let entry = TicketEntry {
-                session: t.session.0.to_string(),
-                thread: t.thread.map(|th| th.to_string()),
-                topic: t.topic.clone(),
-                stage: t.stage.as_str().to_string(),
-                thread_status: t.thread_status.clone(),
-                pending_inbox: t.pending_inbox as u64,
-                first_ts,
-                events: t.events as u64,
-                parked: t.parked.clone(),
-            };
-            ticket_rows_out.push(ViewRow {
-                session: t.session.0.to_string(),
-                row_version: first_ts_version(&worker_streams, &t.session),
-                payload: serde_json::to_string(&entry).map_err(|e| e.to_string())?,
-            });
-        }
+        let ticket_rows_out = derive_ticket_view_rows(store, now_ms).await?;
         store
             .view_publish(VIEW_TICKETS, ticket_rows_out, key, now_ms)
             .await
@@ -825,55 +802,7 @@ async fn incremental_under_lease(
     // new key so the freshness gate keeps holding.
     if board_enabled {
         if task_board_touched {
-            let kinds = crate::commands::task_board_event_kind_names();
-            let task_events = store
-                .events_where_kinds(&kinds)
-                .await
-                .map_err(|e| format!("view task board events: {e}"))?;
-            let mut filtered: BTreeMap<SessionId, Vec<Event>> = BTreeMap::new();
-            for event in task_events {
-                filtered.entry(event.session).or_default().push(event);
-            }
-            // The discovered children need their FULL streams; every
-            // other involved session (the parents) contributes its
-            // kind-filtered subset — an equivalent input for discovery
-            // and the attempt ordinal, which read thread/started only.
-            let mut children = std::collections::BTreeSet::new();
-            for events in filtered.values() {
-                for event in events.iter().filter(|e| e.kind == EventKind::ThreadStarted) {
-                    let carries_identity = event
-                        .bytes
-                        .get("task")
-                        .and_then(|t| t.get("content"))
-                        .and_then(|w| kian_superagent::worker::spawn_identity_of(w).map(|_| ()))
-                        .is_some();
-                    if !carries_identity {
-                        continue;
-                    }
-                    if let Some(worker) = event
-                        .bytes
-                        .get("worker")
-                        .and_then(serde_json::Value::as_str)
-                        .and_then(|raw| uuid::Uuid::parse_str(raw).ok())
-                    {
-                        children.insert(SessionId(worker));
-                    }
-                }
-            }
-            let mut task_streams: BTreeMap<SessionId, Vec<Event>> = BTreeMap::new();
-            for child in children {
-                task_streams.insert(
-                    child,
-                    store
-                        .rebuild(child)
-                        .await
-                        .map_err(|e| format!("view read events for {child:?}: {e}"))?,
-                );
-                tokio::task::yield_now().await;
-            }
-            for (session, events) in filtered {
-                task_streams.entry(session).or_insert(events);
-            }
+            let task_streams = read_task_board_inputs(store).await?;
             publish_task_board(store, &task_streams, key, now_ms).await?;
         } else {
             let rows = task_board_stored.unwrap_or_default();
@@ -937,6 +866,83 @@ async fn publish_task_board(
     Ok(())
 }
 
+/// Derives the ticket_stage view rows (ADR-080): the global folds read
+/// the board-kind events once, then each worker stream is read,
+/// projected and dropped in turn — the peak is one worker stream. The
+/// row is TicketEntry::from_row over the shared per-worker derivation,
+/// so the view matches the honest path by construction.
+async fn derive_ticket_view_rows(store: &EventStore, now_ms: u64) -> CmdResult<Vec<ViewRow>> {
+    let tickets = crate::commands::ticket_rows_streaming(store, now_ms).await?;
+    let mut out = Vec::with_capacity(tickets.len());
+    for t in tickets {
+        let session = t.row.session.0.to_string();
+        let entry = TicketEntry::from_row(t.row, t.first_ts);
+        out.push(ViewRow {
+            session,
+            row_version: t.head_seq,
+            payload: serde_json::to_string(&entry).map_err(|e| e.to_string())?,
+        });
+    }
+    Ok(out)
+}
+
+/// Reads the task board bounded inputs (ADR-080): the kind-filtered
+/// projection events plus the discovered children full streams, one
+/// child at a time — exactly the input shape the incremental path
+/// reads. The children full streams are needed because the outcome fold
+/// reads turn/end classes and interrupts; every other involved session
+/// (the parents) contributes its kind-filtered subset, an equivalent
+/// input for discovery and the attempt ordinal (which read
+/// thread/started only).
+async fn read_task_board_inputs(store: &EventStore) -> CmdResult<BTreeMap<SessionId, Vec<Event>>> {
+    let kinds = crate::commands::task_board_event_kind_names();
+    let task_events = store
+        .events_where_kinds(&kinds)
+        .await
+        .map_err(|e| format!("view task board events: {e}"))?;
+    let mut filtered: BTreeMap<SessionId, Vec<Event>> = BTreeMap::new();
+    for event in task_events {
+        filtered.entry(event.session).or_default().push(event);
+    }
+    let mut children = std::collections::BTreeSet::new();
+    for events in filtered.values() {
+        for event in events.iter().filter(|e| e.kind == EventKind::ThreadStarted) {
+            let carries_identity = event
+                .bytes
+                .get("task")
+                .and_then(|t| t.get("content"))
+                .and_then(|w| kian_superagent::worker::spawn_identity_of(w).map(|_| ()))
+                .is_some();
+            if !carries_identity {
+                continue;
+            }
+            if let Some(worker) = event
+                .bytes
+                .get("worker")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|raw| uuid::Uuid::parse_str(raw).ok())
+            {
+                children.insert(SessionId(worker));
+            }
+        }
+    }
+    let mut task_streams: BTreeMap<SessionId, Vec<Event>> = BTreeMap::new();
+    for child in children {
+        task_streams.insert(
+            child,
+            store
+                .rebuild(child)
+                .await
+                .map_err(|e| format!("view read events for {child:?}: {e}"))?,
+        );
+        tokio::task::yield_now().await;
+    }
+    for (session, events) in filtered {
+        task_streams.entry(session).or_insert(events);
+    }
+    Ok(task_streams)
+}
+
 /// Deletes any stored `task_board` rows + state (R17 C4, pin P3-1): a
 /// disabled board is a disposable view — nothing is published and
 /// nothing is served, and a later re-enable cannot serve a stale era.
@@ -976,7 +982,11 @@ async fn rebuild_under_lease(
         .await
         .map_err(|e| format!("view session listing: {e}"))?;
 
-    let mut streams: BTreeMap<SessionId, Vec<Event>> = BTreeMap::new();
+    // ADR-080: the full rebuild streams one session at a time. Every
+    // per-session view is derived from that session's events alone, so
+    // the stream is dropped before the next read — the peak is one
+    // session stream, never the whole store. The tickets below need
+    // per-worker streams too; they re-read one worker at a time.
     let mut directory = Vec::with_capacity(sessions.len());
     let mut usage = Vec::with_capacity(sessions.len());
     let mut cache = Vec::with_capacity(sessions.len());
@@ -1004,36 +1014,14 @@ async fn rebuild_under_lease(
             )),
             &events,
         ));
-        streams.insert(*session, events);
+        drop(events);
+        tokio::task::yield_now().await;
     }
 
-    // ticket_stage: the same derivation `kian tickets` runs on its
-    // honest path (equivalence by construction).
-    let tickets = crate::commands::ticket_rows(store, &streams, now_ms).await?;
-    let mut ticket_rows_out = Vec::with_capacity(tickets.len());
-    for t in &tickets {
-        let first_ts = streams
-            .get(&t.session)
-            .and_then(|events| events.first())
-            .map(|e| e.ts)
-            .ok_or_else(|| format!("ticket session {} missing from streams", t.session.0))?;
-        let entry = TicketEntry {
-            session: t.session.0.to_string(),
-            thread: t.thread.map(|th| th.to_string()),
-            topic: t.topic.clone(),
-            stage: t.stage.as_str().to_string(),
-            thread_status: t.thread_status.clone(),
-            pending_inbox: t.pending_inbox as u64,
-            first_ts,
-            events: t.events as u64,
-            parked: t.parked.clone(),
-        };
-        ticket_rows_out.push(ViewRow {
-            session: t.session.0.to_string(),
-            row_version: first_ts_version(&streams, &t.session),
-            payload: serde_json::to_string(&entry).map_err(|e| e.to_string())?,
-        });
-    }
+    // ticket_stage (ADR-080): the global folds read the board-kind
+    // events once; each worker stream is read, projected and dropped
+    // in turn.
+    let ticket_rows_out = derive_ticket_view_rows(store, now_ms).await?;
 
     for (view, rows) in [
         (VIEW_DIRECTORY, directory),
@@ -1046,12 +1034,13 @@ async fn rebuild_under_lease(
             .await
             .map_err(|e| format!("view publish `{view}`: {e}"))?;
     }
-    // The fifth view (R17 C4, pin P3-3): the task board over the same
-    // full streams just read — the derivation the honest path runs,
-    // published at the pinned key. Off: any stored rows from an
-    // earlier enabled era are deleted (pin P3-1).
+    // The fifth view (R17 C4, pin P3-3): the task board over its
+    // bounded inputs — the discovered children full streams one at a
+    // time, the parents kind-filtered subsets. Off: any stored rows
+    // from an earlier enabled era are deleted (pin P3-1).
     if board_enabled {
-        publish_task_board(store, &streams, key, now_ms).await?;
+        let task_streams = read_task_board_inputs(store).await?;
+        publish_task_board(store, &task_streams, key, now_ms).await?;
     } else {
         drop_task_board_if_present(store).await?;
     }
@@ -1062,15 +1051,6 @@ async fn rebuild_under_lease(
         board_refreshed: true,
         lease_held: false,
     })
-}
-
-/// The head version of one session's stream (its row_version).
-fn first_ts_version(streams: &BTreeMap<SessionId, Vec<Event>>, session: &SessionId) -> u64 {
-    streams
-        .get(session)
-        .and_then(|events| events.last())
-        .map(|e| e.seq)
-        .unwrap_or(0)
 }
 
 fn row<T: Serialize>(session: &str, entry: T, events: &[Event]) -> ViewRow {

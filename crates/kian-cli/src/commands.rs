@@ -1540,11 +1540,192 @@ pub(crate) fn is_board_event(event: &Event) -> bool {
     )
 }
 
+/// The ticket derivation's global folds over the board-kind input
+/// (ADR-080): worker discovery, the topic registry and the outbox
+/// status. Every fold reads only [`board_event_kind_names`] kinds, so a
+/// kind-filtered store read is an equivalent input to the full streams —
+/// the view paths read exactly that shape.
+pub(crate) struct TicketGlobals {
+    /// The discovered workers, in deterministic uuid order.
+    pub(crate) workers: Vec<SessionId>,
+    /// The registry's binding, inverted to worker → topics.
+    pub(crate) worker_topics: std::collections::BTreeMap<SessionId, Vec<String>>,
+    /// The outbox's pending/parked deliveries.
+    pub(crate) outbox_status: kian_superagent::OutboxStatus,
+}
+
+/// Derives [`TicketGlobals`] over already-read events (the board-kind
+/// input).
+pub(crate) fn ticket_globals(all_events: &[Event]) -> TicketGlobals {
+    let workers = kian_superagent::worker_sessions(all_events);
+    // Topic binding: the same disposable registry projection the
+    // runtime rebuilds, inverted to worker → topics.
+    let registry = kian_superagent::PassthroughRegistry::rebuild(all_events);
+    let mut worker_topics: std::collections::BTreeMap<SessionId, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for topic in registry.topics() {
+        for worker in registry.resolve(&topic) {
+            worker_topics.entry(worker).or_default().push(topic.clone());
+        }
+    }
+    let outbox_status = kian_superagent::OutboxStatus::from_events(all_events);
+    TicketGlobals {
+        workers,
+        worker_topics,
+        outbox_status,
+    }
+}
+
+/// One worker's ticket row over its already-read stream — the per-worker
+/// half of the derivation, shared by the full-streams form
+/// ([`ticket_rows_from`]) and the bounded form
+/// ([`ticket_rows_streaming`], ADR-080) so the two cannot drift.
+pub(crate) fn ticket_row_of(
+    globals: &TicketGlobals,
+    worker: SessionId,
+    events: &[Event],
+    pending_inbox: usize,
+    now_ms: u64,
+) -> TicketRow {
+    let topics = globals.worker_topics.get(&worker);
+    let thread = events
+        .iter()
+        .find(|e| e.kind == EventKind::ThreadStarted)
+        .and_then(|e| e.bytes.get("thread_id"))
+        .and_then(Value::as_str)
+        .and_then(|raw| uuid::Uuid::parse_str(raw).ok());
+    // Registry topics contribute both their alias form and the
+    // conversations they name (a thread-key topic of the github shape
+    // derives them; anything else derives none).
+    let mut conversations: Vec<String> = topics
+        .map(|topics| {
+            topics
+                .iter()
+                .flat_map(|topic| kian_superagent::github::topic_conversation_keys(topic))
+                .collect()
+        })
+        .unwrap_or_default();
+    // The worker's own stream is the registry-independent source: every
+    // admitted wrapper names its topic on the durable log.
+    conversations.extend(kian_superagent::worker_conversation_keys(events));
+    conversations.sort();
+    conversations.dedup();
+    // Aliases exist only for a registry-bound worker whose stream names
+    // its thread — the shape the store-wide fold had, kept exactly.
+    let aliases: Vec<String> = match (topics, thread) {
+        (Some(topics), Some(thread)) => {
+            let mut aliases = vec![thread.to_string()];
+            aliases.extend(topics.iter().cloned());
+            aliases
+        }
+        _ => Vec::new(),
+    };
+    let mut thread_aliases = std::collections::BTreeMap::new();
+    let mut thread_conversations = std::collections::BTreeMap::new();
+    if let Some(thread) = thread {
+        if !aliases.is_empty() {
+            thread_aliases.insert(thread, aliases.clone());
+        }
+        thread_conversations.insert(thread, conversations.clone());
+    }
+    let outbox_view = kian_superagent::ThreadOutboxView::with_conversations(
+        globals.outbox_status.clone(),
+        thread_aliases,
+        thread_conversations,
+    );
+    // The parked message named on the board: a worker whose ticket has a
+    // pending/parked delivery shows its parked lines. Attribution is
+    // alias-or-conversation: an alias hit keeps the historical all-lines
+    // shape; otherwise the lines are the parked deliveries of the
+    // conversations the worker's own stream names.
+    let parked = if aliases
+        .iter()
+        .any(|alias| globals.outbox_status.pending_for(alias))
+    {
+        globals.outbox_status.parked_lines()
+    } else {
+        globals
+            .outbox_status
+            .parked_lines_in(&conversations.into_iter().collect())
+    };
+    let stage = kian_superagent::project_stage(events, pending_inbox, &outbox_view);
+    let thread_status = events
+        .iter()
+        .rev()
+        .find(|e| e.kind == EventKind::ThreadCompleted)
+        .and_then(|e| e.bytes.get("status"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| "outstanding".to_string());
+    let first_ts = events.first().map(|e| e.ts).unwrap_or(0);
+    TicketRow {
+        session: worker,
+        thread,
+        topic: topics.map(|topics| topics.join(",")),
+        stage,
+        thread_status,
+        pending_inbox,
+        age_ms: now_ms.saturating_sub(first_ts),
+        events: events.len(),
+        parked,
+    }
+}
+
+/// One ticket row plus the worker stream's head seq and first timestamp —
+/// the two per-stream facts the view's stored row carries
+/// ([`TicketRowAt`]'s caller converts it to a view row).
+pub(crate) struct TicketRowAt {
+    pub(crate) row: TicketRow,
+    /// The worker stream's first event timestamp.
+    pub(crate) first_ts: u64,
+    /// The worker stream's head seq (the view's `row_version`).
+    pub(crate) head_seq: u64,
+}
+
+/// The bounded form of [`ticket_rows`] (ADR-080): the global folds read
+/// the board-kind events once, then each worker's full stream is read,
+/// projected and dropped in turn — the peak is one worker stream, not
+/// every stream at once. Equivalent to the full-streams form by
+/// construction ([`ticket_row_of`] is shared); [`ticket_rows`] stays the
+/// reference the equivalence tests compare against.
+pub(crate) async fn ticket_rows_streaming(
+    store: &EventStore,
+    now_ms: u64,
+) -> CmdResult<Vec<TicketRowAt>> {
+    let kinds = board_event_kind_names();
+    let board_events = store
+        .events_where_kinds(&kinds)
+        .await
+        .map_err(|e| format!("view board events: {e}"))?;
+    let globals = ticket_globals(&board_events);
+    let mut rows = Vec::with_capacity(globals.workers.len());
+    for worker in &globals.workers {
+        let events = store
+            .rebuild(*worker)
+            .await
+            .map_err(|e| format!("view read events for {worker:?}: {e}"))?;
+        let pending = store
+            .eligible_inputs(*worker, now_ms)
+            .await
+            .map_err(|e| format!("inbox read: {e}"))?
+            .len();
+        let first_ts = events.first().map(|e| e.ts).unwrap_or(0);
+        let head_seq = events.last().map(|e| e.seq).unwrap_or(0);
+        rows.push(TicketRowAt {
+            row: ticket_row_of(&globals, *worker, &events, pending, now_ms),
+            first_ts,
+            head_seq,
+        });
+        tokio::task::yield_now().await;
+    }
+    Ok(rows)
+}
+
 /// The full-streams form of the board derivation (the honest path and
-/// the full-rebuild path): the global fold input is the concatenation
-/// of every session's stream. The incremental path calls
-/// [`ticket_rows_from`] directly with a kind-filtered read instead —
-/// equivalent by construction (the folds read board kinds only).
+/// the equivalence tests): the global fold input is the concatenation
+/// of every session's stream. The bounded path reads the kind-filtered
+/// events instead — equivalent by construction (the folds read board
+/// kinds only).
 pub(crate) async fn ticket_rows(
     store: &EventStore,
     streams: &std::collections::BTreeMap<SessionId, Vec<Event>>,
@@ -1558,173 +1739,27 @@ pub(crate) async fn ticket_rows(
 }
 
 /// The pure-ish core of the board derivation over already-read events:
-/// `all_events` is the global fold input (worker discovery, registry,
-/// outbox — the folds only ever read [`board_event_kind_names`] kinds,
-/// so a kind-filtered store read is an equivalent input), `streams` carries
-/// the full streams of the discovered workers (the only per-session
-/// streams the board needs; the only store access left is the
-/// per-worker pending-inbox read).
+/// `all_events` is the global fold input, `streams` carries the full
+/// streams of the discovered workers (the only per-session streams the
+/// board needs; the only store access left is the per-worker
+/// pending-inbox read). Each row is [`ticket_row_of`] over that worker's
+/// stream — the same construction the bounded path uses.
 pub(crate) async fn ticket_rows_from(
     store: &EventStore,
     all_events: &[Event],
     streams: &std::collections::BTreeMap<SessionId, Vec<Event>>,
     now_ms: u64,
 ) -> CmdResult<Vec<TicketRow>> {
-    // Worker discovery: `thread/started` across every stream (a
-    // Router's dispatch side names the workers; worker-side lineage
-    // names them too). BTreeSet ⇒ deterministic uuid order.
-    let workers = kian_superagent::worker_sessions(all_events);
-    // Topic binding: the same disposable registry projection the
-    // runtime rebuilds, inverted to worker → topics.
-    let registry = kian_superagent::PassthroughRegistry::rebuild(all_events);
-    let mut worker_topics: std::collections::BTreeMap<SessionId, Vec<String>> =
-        std::collections::BTreeMap::new();
-    for topic in registry.topics() {
-        for worker in registry.resolve(&topic) {
-            worker_topics.entry(worker).or_default().push(topic.clone());
-        }
-    }
-
-    // the real outbox view — the delivery-retry stage arm's input
-    // ('s stub exemption: this construction replaces `NoOutbox`).
-    // Ticket aliases per thread: the thread's own id string plus the
-    // topics its worker owns (a delivery's `correlation` names either).
-    // adds the conversation attribution: a live intent's ticket
-    // key is the freeform correlation the model passed (the triggering
-    // event id) and matches no alias — but the target conversation is
-    // derivable from the worker's own stream (its admitted wrappers)
-    // and its registry topics, so both paths feed the view.
-    let outbox_status = kian_superagent::OutboxStatus::from_events(all_events);
-    let mut thread_aliases: std::collections::BTreeMap<uuid::Uuid, Vec<String>> =
-        std::collections::BTreeMap::new();
-    let mut worker_aliases: std::collections::BTreeMap<SessionId, Vec<String>> =
-        std::collections::BTreeMap::new();
-    let mut thread_conversations: std::collections::BTreeMap<uuid::Uuid, Vec<String>> =
-        std::collections::BTreeMap::new();
-    let mut worker_conversations: std::collections::BTreeMap<SessionId, Vec<String>> =
-        std::collections::BTreeMap::new();
-    for (worker, topics) in &worker_topics {
-        let Some(events) = streams.get(worker) else {
-            continue;
-        };
-        let thread = events
-            .iter()
-            .find(|e| e.kind == EventKind::ThreadStarted)
-            .and_then(|e| e.bytes.get("thread_id"))
-            .and_then(Value::as_str)
-            .and_then(|raw| uuid::Uuid::parse_str(raw).ok());
-        // Registry topics contribute both their alias form and the
-        // conversations they name (a thread-key topic of the github
-        // shape derives them; anything else derives none).
-        let mut conversations: Vec<String> = topics
-            .iter()
-            .flat_map(|topic| kian_superagent::github::topic_conversation_keys(topic))
-            .collect();
-        // The worker's own stream is the registry-independent source:
-        // every admitted wrapper names its topic on the durable log
-        // (the live run had no registry binding at all —).
-        conversations.extend(kian_superagent::worker_conversation_keys(events));
-        conversations.sort();
-        conversations.dedup();
-        worker_conversations.insert(*worker, conversations.clone());
-        if let Some(thread) = thread {
-            let mut aliases = vec![thread.to_string()];
-            aliases.extend(topics.iter().cloned());
-            worker_aliases.insert(*worker, aliases.clone());
-            thread_aliases.entry(thread).or_default().extend(aliases);
-            thread_conversations
-                .entry(thread)
-                .or_default()
-                .extend(conversations);
-        }
-    }
-    // Workers the registry never bound (the live shape) still
-    // get their conversations from their own streams.
-    for worker in &workers {
-        let entry = worker_conversations.entry(*worker).or_default();
-        if let Some(events) = streams.get(worker) {
-            entry.extend(kian_superagent::worker_conversation_keys(events));
-            entry.sort();
-            entry.dedup();
-        }
-        if let Some(thread) = streams.get(worker).and_then(|events| {
-            events
-                .iter()
-                .find(|e| e.kind == EventKind::ThreadStarted)
-                .and_then(|e| e.bytes.get("thread_id"))
-                .and_then(Value::as_str)
-                .and_then(|raw| uuid::Uuid::parse_str(raw).ok())
-        }) {
-            let convs = worker_conversations
-                .get(worker)
-                .cloned()
-                .unwrap_or_default();
-            thread_conversations
-                .entry(thread)
-                .or_default()
-                .extend(convs);
-        }
-    }
-    let outbox_view = kian_superagent::ThreadOutboxView::with_conversations(
-        outbox_status.clone(),
-        thread_aliases,
-        thread_conversations,
-    );
-    let parked_lines = outbox_status.parked_lines();
-    let mut rows = Vec::new();
-    for worker in workers {
-        let events = streams.get(&worker).cloned().unwrap_or_default();
+    let globals = ticket_globals(all_events);
+    let mut rows = Vec::with_capacity(globals.workers.len());
+    for worker in &globals.workers {
+        let events = streams.get(worker).cloned().unwrap_or_default();
         let pending = store
-            .eligible_inputs(worker, now_ms)
+            .eligible_inputs(*worker, now_ms)
             .await
             .map_err(|e| format!("inbox read: {e}"))?
             .len();
-        let stage = kian_superagent::project_stage(&events, pending, &outbox_view);
-        let thread = events
-            .iter()
-            .find(|e| e.kind == EventKind::ThreadStarted)
-            .and_then(|e| e.bytes.get("thread_id"))
-            .and_then(Value::as_str)
-            .and_then(|raw| uuid::Uuid::parse_str(raw).ok());
-        // The parked message named on the board: a worker whose
-        // ticket has a pending/parked delivery shows its parked lines.
-        // Attribution is alias-or-conversation: an alias hit
-        // keeps the historical all-lines shape; otherwise the lines
-        // are the parked deliveries of the conversations the worker's
-        // own stream names — the live path, where the freeform
-        // correlation ticket matches no alias.
-        let alias_hit = worker_aliases
-            .get(&worker)
-            .is_some_and(|aliases| aliases.iter().any(|a| outbox_status.pending_for(a)));
-        let parked = if alias_hit {
-            parked_lines.clone()
-        } else {
-            let conversations: std::collections::BTreeSet<String> = worker_conversations
-                .get(&worker)
-                .map(|c| c.iter().cloned().collect())
-                .unwrap_or_default();
-            outbox_status.parked_lines_in(&conversations)
-        };
-        let thread_status = events
-            .iter()
-            .rev()
-            .find(|e| e.kind == EventKind::ThreadCompleted)
-            .and_then(|e| e.bytes.get("status"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| "outstanding".to_string());
-        let first_ts = events.first().map(|e| e.ts).unwrap_or(0);
-        rows.push(TicketRow {
-            session: worker,
-            thread,
-            topic: worker_topics.get(&worker).map(|topics| topics.join(",")),
-            stage,
-            thread_status,
-            pending_inbox: pending,
-            age_ms: now_ms.saturating_sub(first_ts),
-            events: events.len(),
-            parked,
-        });
+        rows.push(ticket_row_of(&globals, *worker, &events, pending, now_ms));
     }
     Ok(rows)
 }
@@ -4419,5 +4454,120 @@ mod tests {
         assert_eq!(stored_image_parts(&body), 2);
         assert_eq!(stored_image_parts(&json!({"messages": []})), 0);
         assert_eq!(stored_image_parts(&json!({"model": "m"})), 0);
+    }
+
+    /// ADR-080: the per-worker ticket row attributes a parked delivery
+    /// exactly as the store-wide fold did — a registry-bound worker
+    /// whose aliases are hit shows every parked line (the historical
+    /// shape); an unbound worker shows only the parked deliveries of
+    /// the conversations its own stream names.
+    #[test]
+    fn ticket_row_attributes_parked_deliveries_by_alias_or_conversation() {
+        use kian_superagent::{OutboxPark, conversation_key};
+
+        let router = SessionId(uuid::Uuid::new_v4());
+        let worker = SessionId(uuid::Uuid::new_v4());
+        let thread = uuid::Uuid::new_v4();
+        let topic = "issue-github:flyer103/kian-runtime#7".to_string();
+        let mk = |seq: u64, session: SessionId, kind: EventKind, bytes: serde_json::Value| Event {
+            seq,
+            session,
+            epoch: Epoch(1),
+            ts: 1_761_900_000_000 + seq,
+            kind,
+            bytes,
+            version: SCHEMA_VERSION,
+        };
+        let target = |number: u64| json!({"kind":"issue_comment","number":number,"owner":"flyer103","repo":"kian-runtime"});
+        let own = conversation_key("issue-github", &target(7));
+        let other = conversation_key("issue-github", &target(8));
+        let park = |conversation: &str| OutboxPark {
+            attempts: 6,
+            conversation: conversation.to_string(),
+            last_error: "delivery failed: github send rejected: HTTP 502".into(),
+        };
+        let router_events = vec![
+            mk(
+                1,
+                router,
+                EventKind::ToolCall,
+                json!({"role": "assistant", "content": {"id": "c1", "name": "deliver_structured",
+                    "arguments": {"channel": "issue-github", "target": target(7), "payload": {},
+                                  "correlation": thread.to_string()}}}),
+            ),
+            mk(
+                2,
+                router,
+                EventKind::ToolResult,
+                json!({"role": "tool", "content": {"call_id": "c1", "is_error": true,
+                    "output": {"error": format!(
+                        "tool execution failed: {}", park(&own).error_message())}}}),
+            ),
+            mk(
+                3,
+                router,
+                EventKind::ToolCall,
+                json!({"role": "assistant", "content": {"id": "c2", "name": "deliver_structured",
+                    "arguments": {"channel": "issue-github", "target": target(8), "payload": {},
+                                  "correlation": "poll:issues:flyer103/kian-runtime#8:2026-11-03T21:31:04Z"}}}),
+            ),
+            mk(
+                4,
+                router,
+                EventKind::ToolResult,
+                json!({"role": "tool", "content": {"call_id": "c2", "is_error": true,
+                    "output": {"error": format!(
+                        "tool execution failed: {}", park(&other).error_message())}}}),
+            ),
+        ];
+        let wrapper = json!({"kian": {"type": "channel_event", "channel": "issue-github",
+            "topic": topic, "event_id": "poll:issues:flyer103/kian-runtime#7:2026-11-03T21:31:04Z",
+            "raw": {}}})
+        .to_string();
+        let worker_events = vec![
+            mk(
+                1,
+                worker,
+                EventKind::InputAdmitted,
+                json!({"role": "user", "content": {"correlation": topic, "task": wrapper}}),
+            ),
+            mk(
+                2,
+                worker,
+                EventKind::ThreadStarted,
+                json!({"thread_id": thread.to_string(), "worker": worker.0.to_string()}),
+            ),
+        ];
+        let mut all_events = router_events;
+        all_events.push(worker_events[1].clone());
+        let mut globals = super::ticket_globals(&all_events);
+        assert_eq!(globals.workers, vec![worker]);
+        let now = 1_761_900_010_000;
+        // Unbound: no registry binding and no thread alias (the alias
+        // set exists only for a bound worker) — the parked line is the
+        // one of the conversation the worker stream names.
+        let unbound = super::ticket_row_of(&globals, worker, &worker_events, 0, now);
+        assert_eq!(unbound.thread, Some(thread));
+        assert_eq!(unbound.topic, None);
+        assert_eq!(
+            unbound.parked,
+            vec![format!("{own} (parked after 6 attempts)")]
+        );
+        // Bound: the alias set is the thread id plus the owned topics;
+        // the thread-named intent hits it and the bound worker shows
+        // every parked line, including the other conversation's.
+        globals.worker_topics.insert(worker, vec![topic.clone()]);
+        let bound = super::ticket_row_of(&globals, worker, &worker_events, 0, now);
+        assert_eq!(bound.thread, Some(thread));
+        assert_eq!(bound.topic, Some(topic));
+        assert_eq!(
+            bound.parked,
+            vec![
+                format!("{own} (parked after 6 attempts)"),
+                format!("{other} (parked after 6 attempts)"),
+            ]
+        );
+        assert_eq!(bound.pending_inbox, 0);
+        assert_eq!(bound.events, worker_events.len());
     }
 }
