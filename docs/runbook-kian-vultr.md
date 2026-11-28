@@ -142,6 +142,32 @@ Deploying a build with [ADR-037](../design/decisions/ADR-037-endpoint-result-ded
 endpoint result record by default (`<home>/.kian/kiand/results.jsonl`, `--no-dedupe` opts out); the
 startup log line `result record enabled` is the evidence it is active.
 
+## Memory guard
+
+`/etc/systemd/system/kian.service.d/memory.conf` pins the server to four allocator arenas and a hard
+ceiling:
+
+```ini
+[Service]
+Environment=MALLOC_ARENA_MAX=4
+MemoryMax=4096M
+MemorySwapMax=1024M
+```
+
+The box has 7.9 GB; before this drop-in the process held 3.0 GB of largely empty heap — glibc had
+grown a 64 MB arena per thread (45 of them). Four arenas plus `MemoryMax` left RSS at ~1.6 GB on the
+same workload (measured, unchanged by `systemctl set-property`).
+
+`MemoryHigh` is deliberately **not** set: any fraction of the working set that is page cache counts
+toward it, so a 3.5 GB limit throttled for 33 k events within minutes while the server was healthy.
+A cgroup at `MemoryMax` reclaims cache first and only OOMs when anonymous memory alone exceeds the
+limit, which is the behaviour wanted from a guard.
+
+```bash
+systemctl show -p MemoryMax -p MemorySwapMax kian.service
+cat /sys/fs/cgroup/system.slice/kian.service/memory.events   # high/max/oom counters
+```
+
 ## Incident record: 2026-11-19
 
 A worker-dispatched root command rewrote the config with `os.replace`, leaving it `root:root 0640`.
