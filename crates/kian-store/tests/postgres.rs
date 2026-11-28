@@ -1324,6 +1324,118 @@ async fn pg_archive_marker_commit_and_inputs() {
     pg.finish().await;
 }
 
+/// ADR-082 on postgres: the archive commit materializes the consumed
+/// `chan:` keys into the receipt ledger, the online rows are deleted, and
+/// a replay of the same key into a fresh session is refused by the receipt
+/// — the guard outlives the incarnation that consumed it. A key that was
+/// never consumed stays replayable, exactly like the sqlite twin.
+#[tokio::test]
+async fn pg_channel_receipts_keep_the_replay_guard_across_archival() {
+    if !gated() {
+        return;
+    }
+    let pg = PgStore::open().await;
+    let versions = migrations::applied_versions_pg(pg.store.pg_pool().expect("pg pool"))
+        .await
+        .expect("applied versions");
+    assert!(
+        versions.contains(&10),
+        "open_postgres applies v10, got {versions:?}"
+    );
+
+    let sid = SessionId::new();
+    seed(&pg.store, sid, 4, Epoch(1)).await;
+    pg.store
+        .append_end(
+            sid,
+            ev(
+                sid,
+                5,
+                Epoch(1),
+                EventKind::SessionEnded {
+                    reason: EndReason::Completed,
+                },
+            ),
+            AppendGuard {
+                epoch: Epoch(1),
+                expected_seq: 5,
+            },
+        )
+        .await
+        .expect("end write");
+
+    let payload = json!({"kian": {"channel": "imessage", "type": "channel_event"}});
+    let consumed = input(sid, Some("chan:imessage:pg-guid"), T0, payload.clone());
+    let unconsumed = input(
+        sid,
+        Some("chan:imessage:pg-guid-pending"),
+        T0,
+        payload.clone(),
+    );
+    pg.store.admit(consumed.clone()).await.expect("admit");
+    pg.store.admit(unconsumed.clone()).await.expect("admit");
+    pg.store
+        .mark_consumed(sid, consumed.id, 2)
+        .await
+        .expect("consume");
+
+    let marker = kian_store::ArchivedMarker {
+        session: sid,
+        last_seq: 5,
+        event_count: 5,
+        input_count: 2,
+        package_path: "/tmp/pg-pkg-receipts".into(),
+        events_sha256: "e".repeat(64),
+        inputs_sha256: "i".repeat(64),
+        manifest_sha256: "bb".into(),
+        archived_at: 42,
+    };
+    assert_eq!(
+        pg.store.archive_commit(&marker, 5).await.expect("commit"),
+        kian_store::ArchiveCommitOutcome::Committed
+    );
+    assert!(pg.store.rebuild(sid).await.expect("rebuild").is_empty());
+
+    // The replay: a fresh incarnation asks for the consumed key. Its online
+    // row is gone with the archived session; the receipt refuses it and
+    // names the row that already answered the event.
+    let fresh = SessionId::new();
+    let outcome = pg
+        .store
+        .admit_channel(input(
+            fresh,
+            Some("chan:imessage:pg-guid"),
+            T0 + 1,
+            payload.clone(),
+        ))
+        .await
+        .expect("admit_channel");
+    assert!(outcome.deduplicated, "an archived consumed key is refused");
+    assert_eq!(outcome.input.id, consumed.id, "the receipt names the row");
+    assert!(
+        pg.store
+            .rebuild(fresh)
+            .await
+            .expect("rebuild fresh")
+            .is_empty()
+    );
+
+    // An unconsumed key never blocks: archival removed the pending row, and
+    // the replay re-admits it.
+    let outcome = pg
+        .store
+        .admit_channel(input(
+            fresh,
+            Some("chan:imessage:pg-guid-pending"),
+            T0 + 1,
+            payload,
+        ))
+        .await
+        .expect("admit pending");
+    assert!(!outcome.deduplicated, "an unconsumed key never blocks");
+    pg.finish().await;
+}
+
 // -- scan_kind (memory P3b-1) -------------------------------------------------
 
 /// `scan_kind` on postgres: byte-identical to scan-then-filter on a
