@@ -235,7 +235,7 @@ impl StreamPort for DrainCtxPort {
     fn read_stream(&self) -> BoxFuture<'static, Result<Vec<Event>, StreamPortError>> {
         let ctx = self.0.clone();
         Box::pin(async move {
-            ctx.events()
+            ctx.events_vec()
                 .await
                 .map_err(|e| StreamPortError(e.to_string()))
         })
@@ -954,7 +954,7 @@ impl kian_dsh::DshCtx for DrainDshCtx {
     }
 
     fn events(&self) -> BoxFuture<'_, Result<Vec<Event>, kian_dsh::DshCtxError>> {
-        let fut = self.0.events();
+        let fut = self.0.events_vec();
         Box::pin(async move {
             fut.await
                 .map_err(|e| kian_dsh::DshCtxError::Failure(e.to_string()))
@@ -1042,7 +1042,7 @@ impl kian_harness::BridgeCtx for DrainBridgeCtx {
     }
 
     fn events(&self) -> BoxFuture<'_, Result<Vec<Event>, kian_harness::BridgeCtxError>> {
-        let fut = self.0.events();
+        let fut = self.0.events_vec();
         Box::pin(async move {
             fut.await
                 .map_err(|e| kian_harness::BridgeCtxError::Failure(e.to_string()))

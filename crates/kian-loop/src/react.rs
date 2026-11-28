@@ -1110,7 +1110,7 @@ impl Inner {
     async fn binding_for(
         &self,
         ctx: &DrainCtx,
-        events: &mut Vec<Event>,
+        events: &mut Arc<Vec<Event>>,
     ) -> Result<SlotBinding, LoopError> {
         let session = ctx.session();
         if let Ok(slots) = SessionSlots::replay(session, events)

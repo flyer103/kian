@@ -614,8 +614,12 @@ only deliberate cache-invalidation point (constraint 3). Contract: `design/READ-
 Landed in P0: `projection` versioned/unchanged reads, SSE `id:` + `Last-Event-ID` resume with
 tail-only polls, and the per-drain committed-event cache in `DrainCtx` — one event Vec per drain
 episode, tail-extended per iteration, fully re-derived only on a `compact` event (the single
-invalidation point; the returned Vec is byte-identical to a fresh rebuild, so model request bytes
-are untouched).
+invalidation point; the snapshot is byte-identical to a fresh rebuild, so model request bytes are
+untouched). The snapshot is handed out shared (`Arc`): a read with nothing new clones a handle, and
+a tail extension copies only while a reader still holds the old snapshot — a stream of a long
+session is hundreds of megabytes, so a per-iteration deep copy is the difference between a bounded
+working set and a memory spike. The owned-`Vec` port traits (`StreamPort`, `DshCtx`, `BridgeCtx`)
+pay one copy at that boundary (`DrainCtx::events_vec`).
 
 **The loop conventions (built-in ReAct loop, frozen after merge, additions-only)**: the built-in
 loop (kian-loop) is a passenger inside the drain — it interacts with the engine only through the

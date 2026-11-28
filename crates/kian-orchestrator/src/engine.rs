@@ -447,7 +447,15 @@ struct DrainCtxCore {
     /// [`DrainCtx::events`]. Disposable by construction — every entry
     /// is a committed stream event and a full re-derivation is always
     /// one `rebuild` away (R1: the stream stays the truth).
-    events: tokio::sync::Mutex<Vec<Event>>,
+    ///
+    /// Shared as `Arc` so a reader that only needs to *read* the stream
+    /// (the loop's per-iteration projection source) never pays for a
+    /// second copy of it: a materialized stream of a long session is
+    /// hundreds of megabytes, and a deep clone per model request was the
+    /// single largest transient allocation of a drain. The tail
+    /// extension goes through `Arc::make_mut`, which copies only when a
+    /// reader still holds the previous snapshot.
+    events: tokio::sync::Mutex<Arc<Vec<Event>>>,
     /// The drain's interrupt flag. Shared with the engine's
     /// `DrainHandle` when the ctx is built by `drain_episode`, so a
     /// consumed current-epoch control row and an `interrupt` RPC flip
@@ -732,7 +740,7 @@ impl DrainCtx {
                 epoch,
                 seq: AtomicU64::new(head.next_seq),
                 in_turn: AtomicBool::new(false),
-                events: tokio::sync::Mutex::new(Vec::new()),
+                events: tokio::sync::Mutex::new(Arc::new(Vec::new())),
                 interrupt,
                 clock,
                 metrics,
@@ -816,42 +824,66 @@ impl DrainCtx {
     /// never rewritten, reordered or reformatted here — the returned
     /// Vec is byte-identical to a fresh `rebuild` (the cache-stability
     /// witness suites pin the derived request bytes).
-    pub async fn events(&self) -> Result<Vec<Event>, EngineError> {
-        let mut cache = self.core.events.lock().await;
+    ///
+    /// The snapshot is handed out as `Arc<Vec<Event>>`: a stream of a
+    /// long session is hundreds of megabytes, and a reader that only
+    /// reads it (every loop iteration) clones an eight-byte handle, not
+    /// the stream. The next tail extension copies only while such a
+    /// reader still holds the snapshot (`Arc::make_mut`).
+    pub async fn events(&self) -> Result<Arc<Vec<Event>>, EngineError> {
+        let mut guard = self.core.events.lock().await;
         // The seq axis alone: this refresh must stay cheap at any
         // history size (the epoch-floor aggregate of `head` is not
         // needed for reads).
         let version = self.core.store.version(self.core.session).await?;
-        match cache.last().map(|e| e.seq) {
-            // Up to date: one version query, no scan (R3's fast path).
+        // The mutable cache is taken ONLY on a branch that changes it:
+        // `Arc::make_mut` copies while any reader still holds the
+        // snapshot, and the loop reads the stream once per iteration —
+        // an up-to-date read must hand the same allocation back.
+        match guard.last().map(|e| e.seq) {
+            // Up to date: one version query, no scan, no copy (R3's
+            // fast path).
             Some(seq) if version == seq => {}
             // The durable head behind the cache: the stream cannot
             // legitimately shrink. Treat as skew and re-derive in full —
             // honesty over cleverness (never serve a skew as truth).
             Some(seq) if version < seq => {
-                *cache = self.core.store.rebuild(self.core.session).await?;
+                *guard = Arc::new(self.core.store.rebuild(self.core.session).await?);
             }
             _ => {
-                let start = cache.last().map(|e| e.seq + 1).unwrap_or(0);
+                let start = guard.last().map(|e| e.seq + 1).unwrap_or(0);
                 let fresh = self
                     .core
                     .store
                     .scan(self.core.session, start..version + 1)
                     .await?;
-                if fresh.iter().any(|e| matches!(e.kind, EventKind::Compact)) {
+                let rederive = fresh.iter().any(|e| matches!(e.kind, EventKind::Compact))
+                    // A non-contiguous tail (store bug or reset): re-derive
+                    // rather than append a gap.
+                    || !fresh.first().is_none_or(|e| e.seq == start);
+                if rederive {
                     // R5: compact is the ONLY deliberate invalidation
-                    // point — one full re-derivation from the stream.
-                    *cache = self.core.store.rebuild(self.core.session).await?;
-                } else if fresh.first().is_none_or(|e| e.seq == start) {
-                    cache.extend(fresh);
-                } else {
-                    // A non-contiguous tail (store bug or reset):
-                    // re-derive rather than append a gap.
-                    *cache = self.core.store.rebuild(self.core.session).await?;
+                    // point — one full re-derivation from the stream. The
+                    // handle is replaced outright: a reader that still
+                    // holds the old snapshot keeps it, and nothing is
+                    // cloned only to be thrown away.
+                    *guard = Arc::new(self.core.store.rebuild(self.core.session).await?);
+                } else if !fresh.is_empty() {
+                    Arc::make_mut(&mut *guard).extend(fresh);
                 }
             }
         }
-        Ok(cache.clone())
+        Ok(Arc::clone(&*guard))
+    }
+
+    /// [`DrainCtx::events`] as an owned `Vec` — for the port traits whose
+    /// contract is an owned stream (`StreamPort::read_stream`,
+    /// `DshCtx::events`, `BridgeCtx::events`). This is the one place that
+    /// pays for a copy: those contracts hand the events out by value, and
+    /// the drain cache still holds the stream. A caller that only reads
+    /// should use [`DrainCtx::events`] and take the shared snapshot.
+    pub async fn events_vec(&self) -> Result<Vec<Event>, EngineError> {
+        Ok((*self.events().await?).clone())
     }
 
     /// Takes every eligible input at this safe boundary: appends the
@@ -6262,7 +6294,7 @@ mod tests {
 
         // First read: full (the cache starts empty) — and equals rebuild.
         assert_eq!(
-            ctx.events().await.unwrap(),
+            *ctx.events().await.unwrap(),
             store.rebuild(sid).await.unwrap()
         );
 
@@ -6272,7 +6304,7 @@ mod tests {
             .unwrap();
         ctx.begin_turn().await.unwrap();
         assert_eq!(
-            ctx.events().await.unwrap(),
+            *ctx.events().await.unwrap(),
             store.rebuild(sid).await.unwrap()
         );
 
@@ -6281,14 +6313,69 @@ mod tests {
         // this ctx's own writes.
         raw_append(&store, sid, 4, EventKind::AssistantMessage).await;
         assert_eq!(
-            ctx.events().await.unwrap(),
+            *ctx.events().await.unwrap(),
             store.rebuild(sid).await.unwrap()
         );
 
         // Repeated reads with nothing new are stable.
         assert_eq!(
-            ctx.events().await.unwrap(),
+            *ctx.events().await.unwrap(),
             store.rebuild(sid).await.unwrap()
+        );
+
+        store.close().await;
+        cleanup(&path);
+    }
+
+    /// The snapshot is shared, not copied: an up-to-date read hands back
+    /// the SAME allocation even while the caller still holds the previous
+    /// one (the loop reads once per iteration — that read is a handle
+    /// clone, never a second copy of a long session). A tail extension
+    /// under a live reader copies instead of mutating shared bytes, and
+    /// the copy still equals a full `rebuild`.
+    #[tokio::test]
+    async fn drain_ctx_events_reads_share_one_snapshot_until_a_write_copies() {
+        let (store, path) = open_store().await;
+        let sid = SessionId::new();
+        raw_append(&store, sid, 1, EventKind::SessionCreated).await;
+        let ctx = DrainCtx::new(
+            store.clone(),
+            sid,
+            Epoch(1),
+            Arc::new(ManualClock::new(T0)),
+            Arc::new(Metrics::default()),
+        )
+        .await
+        .unwrap();
+
+        let first = ctx.events().await.unwrap();
+        let held = ctx.events().await.unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &held),
+            "an up-to-date read must share the snapshot, not copy the stream"
+        );
+
+        ctx.append(EventKind::DrainClaimed, json!({}))
+            .await
+            .unwrap();
+        let extended = ctx.events().await.unwrap();
+        assert!(
+            !Arc::ptr_eq(&held, &extended),
+            "extending under a live reader must copy, never mutate shared bytes"
+        );
+        assert_eq!(held.len(), 1, "the held snapshot keeps its own history");
+        assert_eq!(
+            *extended,
+            store.rebuild(sid).await.unwrap(),
+            "the copy stays byte-identical to a full rebuild"
+        );
+
+        drop(held);
+        drop(first);
+        let third = ctx.events().await.unwrap();
+        assert!(
+            Arc::ptr_eq(&extended, &third),
+            "with nothing new the read shares the snapshot again"
         );
 
         store.close().await;
@@ -6322,14 +6409,14 @@ mod tests {
         // The compaction lands (as recovery would append it).
         raw_append(&store, sid, 3, EventKind::Compact).await;
         let events = ctx.events().await.unwrap();
-        assert_eq!(events, store.rebuild(sid).await.unwrap());
+        assert_eq!(*events, store.rebuild(sid).await.unwrap());
         assert_eq!(events.len(), 3);
         assert!(matches!(events[2].kind, EventKind::Compact));
 
         // Post-compact reads are ordinary tail reads again.
         raw_append(&store, sid, 4, EventKind::AssistantMessage).await;
         assert_eq!(
-            ctx.events().await.unwrap(),
+            *ctx.events().await.unwrap(),
             store.rebuild(sid).await.unwrap()
         );
 

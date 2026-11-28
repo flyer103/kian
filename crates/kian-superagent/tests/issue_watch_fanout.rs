@@ -342,7 +342,7 @@ impl StreamPort for CtxPort {
     fn read_stream(&self) -> BoxFuture<'static, Result<Vec<Event>, StreamPortError>> {
         let ctx = self.0.clone();
         Box::pin(async move {
-            ctx.events()
+            ctx.events_vec()
                 .await
                 .map_err(|e| StreamPortError(e.to_string()))
         })

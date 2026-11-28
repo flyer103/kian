@@ -72,7 +72,7 @@ impl RunPort for DrainRunPort {
 
     fn read_stream(&self) -> BoxFuture<'static, Result<Vec<Event>, String>> {
         let ctx = self.0.clone();
-        Box::pin(async move { ctx.events().await.map_err(|error| error.to_string()) })
+        Box::pin(async move { ctx.events_vec().await.map_err(|error| error.to_string()) })
     }
 
     fn interrupt_requested(&self) -> bool {

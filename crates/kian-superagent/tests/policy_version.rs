@@ -199,7 +199,7 @@ impl kian_superagent::StreamPort for CtxPort {
     ) -> BoxFuture<'static, Result<Vec<Event>, kian_superagent::StreamPortError>> {
         let ctx = self.0.clone();
         Box::pin(async move {
-            ctx.events()
+            ctx.events_vec()
                 .await
                 .map_err(|e| kian_superagent::StreamPortError(e.to_string()))
         })
