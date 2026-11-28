@@ -593,6 +593,10 @@ pub struct PublishRecord {
     pub commit: String,
     /// The gate's exit code, when one ran.
     pub gate_exit_code: Option<i64>,
+    /// Whether the branch was pushed to its remote.
+    pub pushed: bool,
+    /// The pull request's URL, when one was opened.
+    pub pull_request: Option<String>,
 }
 
 /// Assemble the view of one run from its own stream (§15.1).
@@ -754,6 +758,12 @@ pub fn publish_receipts(events: &[Event]) -> Vec<PublishRecord> {
                 .get("gate")
                 .and_then(|gate| gate.get("exit_code"))
                 .and_then(Value::as_i64),
+            pushed: receipt.get("push").is_some(),
+            pull_request: receipt
+                .get("pull_request")
+                .and_then(|request| request.get("url"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
         });
     }
     out
@@ -810,10 +820,18 @@ pub fn render(view: &RunView) -> String {
         let gate = publish
             .gate_exit_code
             .map_or_else(|| "off".to_string(), |code| format!("exit {code}"));
-        out.push_str(&format!(
-            "publish  {} attempt {}  {}  {}  gate {}\n",
+        let mut line = format!(
+            "publish  {} attempt {}  {}  {}  gate {}",
             publish.step, publish.attempt, publish.branch, publish.commit, gate
-        ));
+        );
+        if publish.pushed {
+            line.push_str("  pushed");
+        }
+        if let Some(url) = &publish.pull_request {
+            line.push_str(&format!("  pr {url}"));
+        }
+        line.push('\n');
+        out.push_str(&line);
     }
     out.push_str("steps\n");
     for step in &view.steps {

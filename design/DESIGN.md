@@ -1834,15 +1834,21 @@ run the configured gate (`selfdev.publish.gate`, default `./scripts/selfcheck.sh
 `CARGO_TARGET_DIR` honoured — the gate is configuration, so a proposal cannot choose the evidence
 that judges it); append the receipt pair `{branch, worktree, commit, gate}`. An interruption
 between the two pairs leaves an intent with no receipt, which settles the attempt `needs_operator`
-and leaves the worktree for the operator, and a retry never force-pushes or adopts a branch. S2b
-extends the same receipt with one `git push <remote> HEAD:refs/heads/<branch>` (never forced) and
-one `gh pr create --base <base> --head <branch>`, with the token read from the environment named
-by `selfdev.publish.token_env` and never written to an event. S2a lands the local half: the
-repository work sits behind a `PublishPort` the bundle never implements (`kian-cli` does, in
+and leaves the worktree for the operator, and a retry never force-pushes or adopts a branch. The
+same receipt carries the remote half: `push {remote, ref}` after one
+`git push <remote> HEAD:refs/heads/<branch>` (never forced, so an existing branch refuses) and
+`pull_request {base, head, url?}` after one `gh pr create --base <base> --head <branch>`, whose
+body on stdin carries the audit chain. The token is read from the environment named by
+`selfdev.publish.token_env` at publish time, exported only into those two child processes — every
+other child runs with the variable removed — and never written to an argument or an event; a
+missing variable fails the step with `credential <name> is not set` before the worktree exists. A
+push that landed while its pull request failed is `Partial`: the attempt settles `needs_operator`,
+the branch stays on the remote, and no receipt is written. The repository work sits behind a
+`PublishPort` the bundle never implements (`kian-cli` does, in
 `crates/kian-cli/src/selfdev_publish.rs`), so every spawn goes through
 `cron_worktree::git_command()` and the inherited `GIT_*` environment cannot redirect a write into
 the caller's checkout; a gate that outlives its bound settles `needs_operator` with the commit in
-the detail rather than failing as if nothing was written. S2b is not implemented.
+the detail rather than failing as if nothing was written.
 
  Refinement (operational commands, as implemented by `kian-cli`): the SPEC §3.2 set lands as six
 commands with two access modes. Read-only commands (`kian session inspect <id>`, `kian session

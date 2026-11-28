@@ -31,7 +31,7 @@ use kian_superagent::job::alert::AlertSpec;
 use kian_superagent::job::conduct::{
     AlertPort, Clock, DeliverPort, GateReceipt, JOB_FAILED_REASON, JOB_FINISHED_STOP_REASON,
     JobDeps, JobLoopDriver, PublishError, PublishPort, PublishReceipt, PublishRequest,
-    PublishTargets, RunPort, check_publish_ok,
+    PublishTargets, PullRequestReceipt, PushReceipt, RunPort, check_publish_ok,
 };
 use kian_superagent::job::outcome::AttemptOutcome;
 use kian_superagent::job::plan::{self, JobPlan};
@@ -568,17 +568,30 @@ impl PublishPort for FakePublish {
                 requests.push(request.clone());
             }
             match behavior {
-                PublishBehavior::Commit => Ok(PublishReceipt {
-                    commit: PUBLISH_COMMIT.to_string(),
-                    branch: request.branch,
-                    worktree: request.worktree,
-                    gate: request.gates.then(|| GateReceipt {
-                        command: "./scripts/selfcheck.sh".to_string(),
-                        exit_code: 0,
-                        digest: "sha256:00".to_string(),
-                        output_tail: String::new(),
-                    }),
-                }),
+                PublishBehavior::Commit => {
+                    let push = request.push.then(|| PushReceipt {
+                        remote: "origin".to_string(),
+                        reference: format!("refs/heads/{}", request.branch),
+                    });
+                    let pull_request = request.pull_request.then(|| PullRequestReceipt {
+                        base: request.base.clone(),
+                        head: request.branch.clone(),
+                        url: Some("https://example.test/pr/1".to_string()),
+                    });
+                    Ok(PublishReceipt {
+                        commit: PUBLISH_COMMIT.to_string(),
+                        branch: request.branch,
+                        worktree: request.worktree,
+                        gate: request.gates.then(|| GateReceipt {
+                            command: "./scripts/selfcheck.sh".to_string(),
+                            exit_code: 0,
+                            digest: "sha256:00".to_string(),
+                            output_tail: String::new(),
+                        }),
+                        push,
+                        pull_request,
+                    })
+                }
                 PublishBehavior::Occupied => Err(PublishError::Occupied(format!(
                     "the worktree {} already exists",
                     request.worktree
@@ -610,7 +623,7 @@ fn publish_plan() -> JobPlan {
             "action": "publish",
             "depends_on": ["patch"],
             "inputs": [{"step": "patch", "name": "patch"}],
-            "publish": {"base": "main", "gates": true},
+            "publish": {"base": "main", "gates": true, "push": true, "pull_request": true},
             "effect": "write",
             "verify": [{"check": "publish_ok"}]
         }]
@@ -1486,6 +1499,18 @@ async fn a_publish_step_commits_the_artifact_and_settles_from_its_receipt() {
     assert_eq!(receipt.bytes["ok"], json!(true));
     assert_eq!(receipt.bytes["result"]["commit"], json!(PUBLISH_COMMIT));
     assert_eq!(receipt.bytes["result"]["gate"]["exit_code"], json!(0));
+    assert_eq!(
+        receipt.bytes["result"]["push"]["ref"],
+        json!(format!("refs/heads/{branch}"))
+    );
+    assert_eq!(
+        receipt.bytes["result"]["pull_request"]["head"],
+        json!(branch)
+    );
+    assert_eq!(
+        receipt.bytes["result"]["pull_request"]["url"],
+        json!("https://example.test/pr/1")
+    );
 
     let requests = harness
         .world
@@ -1495,6 +1520,11 @@ async fn a_publish_step_commits_the_artifact_and_settles_from_its_receipt() {
         .clone();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].patch, PATCH);
+    assert!(requests[0].push, "the plan asked for the push");
+    assert!(
+        requests[0].pull_request,
+        "the plan asked for the pull request"
+    );
     assert_eq!(
         requests[0]
             .trailers
@@ -1516,6 +1546,13 @@ async fn a_publish_step_commits_the_artifact_and_settles_from_its_receipt() {
     assert!(verdict.passed);
     assert_eq!(verdict.outcome, Some(AttemptOutcome::Succeeded));
     assert_eq!(status::publish_receipts(&events).len(), 1);
+    let view = status::view(&events).expect("the run's view");
+    let rendered = status::render(&view);
+    assert!(rendered.contains("pushed"), "{rendered}");
+    assert!(
+        rendered.contains("pr https://example.test/pr/1"),
+        "{rendered}"
+    );
 }
 
 #[tokio::test]
@@ -1628,35 +1665,83 @@ fn publish_ok_judges_the_receipt_not_the_intent() {
             "gate": {"command": "g", "exit_code": 0, "digest": "sha256:00", "output_tail": ""}
         }
     });
-    assert!(check_publish_ok(&good, branch, true).passed);
+    assert!(check_publish_ok(&good, branch, true, false, false).passed);
 
     let short = json!({
         "ok": true,
         "result": {"branch": branch, "worktree": "/tmp/w", "commit": "0123",
                    "gate": {"exit_code": 0}}
     });
-    assert!(!check_publish_ok(&short, branch, true).passed);
+    assert!(!check_publish_ok(&short, branch, true, false, false).passed);
 
     let foreign = json!({
         "ok": true,
         "result": {"branch": "main", "worktree": "/tmp/w", "commit": PUBLISH_COMMIT,
                    "gate": {"exit_code": 0}}
     });
-    assert!(!check_publish_ok(&foreign, branch, true).passed);
+    assert!(!check_publish_ok(&foreign, branch, true, false, false).passed);
 
     let failed_gate = json!({
         "ok": true,
         "result": {"branch": branch, "worktree": "/tmp/w", "commit": PUBLISH_COMMIT,
                    "gate": {"exit_code": 1}}
     });
-    assert!(!check_publish_ok(&failed_gate, branch, true).passed);
+    assert!(!check_publish_ok(&failed_gate, branch, true, false, false).passed);
     assert!(
-        check_publish_ok(&failed_gate, branch, false).passed,
+        check_publish_ok(&failed_gate, branch, false, false, false).passed,
         "a plan that runs no gate is judged without one"
     );
 
+    let unpushed = check_publish_ok(&good, branch, true, true, false);
+    assert!(!unpushed.passed);
+    assert!(
+        unpushed
+            .detail
+            .unwrap_or_default()
+            .contains("carries no push"),
+        "a plan that asks for a push is judged by its push"
+    );
+    let unopened = check_publish_ok(&good, branch, true, false, true);
+    assert!(!unopened.passed);
+
+    let pushed = json!({
+        "ok": true,
+        "result": {
+            "branch": branch,
+            "worktree": "/tmp/w",
+            "commit": PUBLISH_COMMIT,
+            "gate": {"exit_code": 0},
+            "push": {"remote": "origin", "ref": format!("refs/heads/{branch}")},
+            "pull_request": {"base": "main", "head": branch, "url": "https://example.test/pr/1"}
+        }
+    });
+    assert!(check_publish_ok(&pushed, branch, true, true, true).passed);
+    let foreign_ref = json!({
+        "ok": true,
+        "result": {
+            "branch": branch,
+            "worktree": "/tmp/w",
+            "commit": PUBLISH_COMMIT,
+            "gate": {"exit_code": 0},
+            "push": {"remote": "origin", "ref": "refs/heads/main"}
+        }
+    });
+    assert!(!check_publish_ok(&foreign_ref, branch, true, true, false).passed);
+    let foreign_head = json!({
+        "ok": true,
+        "result": {
+            "branch": branch,
+            "worktree": "/tmp/w",
+            "commit": PUBLISH_COMMIT,
+            "gate": {"exit_code": 0},
+            "push": {"remote": "origin", "ref": format!("refs/heads/{branch}")},
+            "pull_request": {"base": "main", "head": "main"}
+        }
+    });
+    assert!(!check_publish_ok(&foreign_head, branch, true, true, true).passed);
+
     let refused = json!({"ok": false, "error": "the patch does not apply: nope"});
-    let outcome = check_publish_ok(&refused, branch, true);
+    let outcome = check_publish_ok(&refused, branch, true, false, false);
     assert!(!outcome.passed);
     assert!(
         outcome

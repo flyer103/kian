@@ -796,7 +796,7 @@ and `kian job status` all read the same fact.
 Semantics: [design/JOB-MODEL.md](../design/JOB-MODEL.md); decision:
 [ADR-052](../design/decisions/ADR-052-job-model.md).
 
-## Self-dev proposals (propose, then publish locally)
+## Self-dev proposals (propose, publish, review)
 
 A self-dev run turns one verified evidence pack into a reviewable patch proposal. It is an
 ordinary job run: the pack is frozen into the run's `job.selfdev` key at admit, the patch is a
@@ -842,7 +842,7 @@ jobs:
             action: publish
             depends_on: [patch]
             inputs: [{ step: patch, name: patch }]
-            publish: { base: main, gates: true }
+            publish: { base: main, gates: true, push: true, pull_request: true }
             effect: write
             verify:
               - check: publish_ok
@@ -859,30 +859,42 @@ The breaker refuses a run when the last `consecutive_failures` run verdicts of t
 `failed`: nothing is written and the command exits 2 with `selfdev_circuit_open`. `--force` admits
 once and records `circuit_overridden: true` inside `job.selfdev`.
 
-The `publish` step turns the artifact into a local branch, and the operator's configuration decides
-where. It holds no credential and pushes nothing:
+The `publish` step turns the artifact into a branch on the code host, and the operator's
+configuration decides where:
 
 ```yaml
 selfdev:
   publish:
     repo: /Users/you/src/kian        # the checkout the worktree is derived from
+    remote: origin                   # the remote the branch is pushed to once
+    base: main                       # the branch the pull request targets
     gate: ./scripts/selfcheck.sh     # the one command that judges the proposal
+    token_env: KIAN_PUBLISH_TOKEN    # read at publish time, never written down
     author: { name: kian-bot, email: kian-bot@example.com }
     target_dir: /Users/you/.cache/kian-publish-target   # optional: CARGO_TARGET_DIR for the gate
 ```
+
+`gh` must be on `PATH` and authenticated. The token named by `token_env` is exported only into the
+`git push` and `gh pr create` child processes — every other child runs with the variable removed —
+and never reaches an event, a log or a plan.
 
 The conductor derives `branch = selfdev/<run_session>` and
 `worktree = <repo>/.agents/worktrees/selfdev-<run_session>`, re-reads the patch artifact from the
 producer's stream and re-verifies its digest, creates the worktree at the frozen base commit, applies
 the patch, commits it with `Kian-Run` / `Kian-Plan-Digest` / `Kian-Patch-Sha256` / `Kian-Pack`
-trailers, and runs the gate inside the worktree before recording the receipt. A publish is never
-retried (`retries: 0`): a worktree that already exists, or an attempt whose receipt was never
+trailers, and runs the gate inside the worktree. A `push: true` publish then pushes the branch once,
+never forced, and a `pull_request: true` publish opens one pull request whose body carries the audit
+chain; the receipt records `push {remote, ref}` and `pull_request {base, head, url}`. A publish is
+never retried (`retries: 0`): a worktree that already exists, or an attempt whose receipt was never
 written, settles `needs_operator` and leaves the worktree for a human; a patch that does not apply
 fails the step with git's own stderr; a gate that exits non-zero fails the step with its exit code
-in the receipt. `kian job status <run>` prints the branch, the commit and the gate's exit code.
+in the receipt and nothing is pushed. `kian job status <run>` prints the branch, the commit, the
+gate's exit code, `pushed` and the pull request URL.
 The gate inherits `CARGO_TARGET_DIR` from `target_dir`; point it at a directory no other working tree
-builds into, or each tree's build replaces the other's artifacts. Nothing is pushed: the commit is
-local until S2b.
+builds into, or each tree's build replaces the other's artifacts. A branch already on the remote
+refuses the push instead of being overwritten, and a push that landed while the pull request failed
+settles `needs_operator` with the branch on the remote: open the pull request by hand or delete the
+branch.
 
 `succeeded` means a proposal exists. It does not mean the bug is fixed, that the patch applies to
 a newer `main`, or that anyone reviewed it — landing stays with the owner.
