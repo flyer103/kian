@@ -107,7 +107,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # The two profile knobs above change every artifact fingerprint, so
+      # they must be in the cache key: otherwise the action restores a cache
+      # whose artifacts no longer match and cargo rebuilds the workspace on
+      # every run.
       - uses: Swatinem/rust-cache@v2
+        with:
+          env-vars: |
+            CARGO_PROFILE_DEV_DEBUG
+            CARGO_PROFILE_TEST_DEBUG
       # A docs-only diff changes no crate: the link and crate-map gate
       # (`cargo test -p kian-cli --test docs_map`) is the whole risk there.
       - name: Docs map (docs-only change)
@@ -172,6 +180,10 @@ jobs:
           df -h /
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          env-vars: |
+            CARGO_PROFILE_DEV_DEBUG
+            CARGO_PROFILE_TEST_DEBUG
       - name: postgres-gated suites (must run, not skip)
         run: |
           set -euo pipefail
