@@ -321,6 +321,10 @@ Rules:
   insert the archived marker under CAS → delete online rows in one transaction. A failure at any
   point leaves the online rows intact; retries are idempotent. Delete is never attempted before a
   verified package exists.
+- **Deleted rows.** The commit clears every online row the session owns: events, inputs, the
+  projection snapshot, its view rows, and the `claims` row. The claim is the session's last lease
+  and outlives the end event by design; leaving it behind would fail the recovery sweep, which
+  projects every claimed session and has no stream left to project once the commit lands.
 - **Read behavior.** Reads whose range touches the online rows of an archived session return the
   explicit `archived` error (`API-CONTRACT` code). `session inspect` reports archived plus the
   package path; `session export` reads the package and MUST be byte-identical; `session replay`

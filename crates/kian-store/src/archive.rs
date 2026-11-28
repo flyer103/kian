@@ -25,6 +25,13 @@
 //!    takes the package's hashes as part of the marker, and the delete
 //!    statements below exist only inside this guarded transaction.
 //!
+//! The transaction clears every online trace of the session, not just
+//! its events and inputs: the projection snapshot, its view rows, and
+//! the claims row. The claim is the session's last lease and outlives
+//! its end event by design; leaving it behind would fail the recovery
+//! sweep, which projects every claimed session and has no stream left
+//! to project once this commit lands.
+//!
 //! The marker row is infrastructure, not truth (R1): it names the
 //! package; the package carries the data. Reads of an archived session
 //! answer the typed `archived` error (`-32007`) instead of scanning
@@ -693,6 +700,16 @@ async fn delete_online_rows_sqlite(
         .bind(key)
         .execute(&mut **tx)
         .await?;
+    // A claim row is the last lease the session held; it outlives the
+    // end event by design. It is not session state, but the recovery
+    // sweep projects every claimed session to filter expired leases,
+    // and an archived session has no stream left to project — a
+    // leftover row would poison the whole sweep, not just this
+    // session.
+    sqlx::query("DELETE FROM claims WHERE session = ?1")
+        .bind(key)
+        .execute(&mut **tx)
+        .await?;
     Ok(())
 }
 
@@ -713,6 +730,12 @@ async fn delete_online_rows_pg(
         .execute(&mut **tx)
         .await?;
     sqlx::query("DELETE FROM view_rows WHERE session = $1")
+        .bind(key)
+        .execute(&mut **tx)
+        .await?;
+    // See the sqlite twin: a claim row for a session with no online
+    // stream fails the recovery sweep's lease projection.
+    sqlx::query("DELETE FROM claims WHERE session = $1")
         .bind(key)
         .execute(&mut **tx)
         .await?;
@@ -948,6 +971,55 @@ mod tests {
         assert_eq!(
             store.archive_commit(&m, 3).await.unwrap(),
             ArchiveCommitOutcome::AlreadyArchived
+        );
+        store.close().await;
+        cleanup(&path);
+    }
+
+    /// A claim row outlives its session's end event; the commit must
+    /// remove it too, because the recovery sweep projects every claimed
+    /// session and an archived session has no stream left to project.
+    #[tokio::test]
+    async fn commit_removes_the_claims_row_of_the_archived_session_only() {
+        let (store, path) = test_store().await;
+        let sid = SessionId::new();
+        seed_terminal(&store, sid).await;
+        let other = SessionId::new();
+        seed_terminal(&store, other).await;
+        for s in [sid, other] {
+            sqlx::query(
+                "INSERT INTO claims (session, epoch, holder, ttl_ms, last_heartbeat) \
+                 VALUES (?1, 7, 'test', 30000, 0)",
+            )
+            .bind(s.0.to_string())
+            .execute(store.pool())
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            store.archive_commit(&marker(sid, "aa"), 3).await.unwrap(),
+            ArchiveCommitOutcome::Committed
+        );
+        assert_eq!(
+            row_count(
+                &store,
+                "SELECT COUNT(*) FROM claims WHERE session = ?1",
+                &sid.0.to_string()
+            )
+            .await,
+            0,
+            "the archived session's claim row is gone"
+        );
+        assert_eq!(
+            row_count(
+                &store,
+                "SELECT COUNT(*) FROM claims WHERE session = ?1",
+                &other.0.to_string()
+            )
+            .await,
+            1,
+            "another session's claim row is untouched"
         );
         store.close().await;
         cleanup(&path);
