@@ -11,9 +11,12 @@ Product semantics live in [WORKER-MODEL](../design/WORKER-MODEL.md); this file i
 | `/opt/kian/bin/kiand` | worker binary used by the vultr worker |
 | `/srv/kian/kian.yaml` | config — **must be `kian:kian 0640`** |
 | `/srv/kian/kian.db` | sqlite store (events + queue + registry) |
+| `/srv/kian/backups` | nightly snapshots (`kian-<UTC>.db`, five retained) |
+| `/etc/systemd/system/kian-backup.{service,timer}` | nightly backup at 03:20 UTC |
+| `/usr/local/bin/kian-backup.sh` | the snapshot script |
 | `/etc/systemd/system/kian.service` | unit: `User=kian`, `Restart=always`, `OnFailure=kian-alert@%n` |
 | `/etc/systemd/system/kian-watch.{service,timer}` | watchdog: probes every 30 s |
-| `/usr/local/bin/kian-watch.sh` | the probe (unit state, restart churn, config readability, `kian workers`) |
+| `/usr/local/bin/kian-watch.sh` | the probe (unit state, restart churn, config readability, `healthz`) |
 | `/usr/local/bin/kian-config-guard` | config ownership guard, also `ExecStartPre=+` of the unit |
 | `/usr/local/bin/kian-alert.sh` | `OnFailure` handler |
 | `/var/log/kian-watch.log`, `/var/log/kian-alert.log` | alert records |
@@ -37,13 +40,49 @@ unreadable config within one probe.
 ## Watchdog
 
 `kian-watch.timer` runs `kian-watch.service` every 30 s. The probe fails when the unit is not
-active, `NRestarts` rose since the previous probe, `/srv/kian/kian.yaml` is not readable by `kian`,
-or `kian workers --config … --json` does not answer. Three consecutive failures (≈90 s) write an
-`ALERT` to the journal and `/var/log/kian-watch.log`; a single restart is absorbed by the streak.
+active, `NRestarts` rose since the previous probe, or `/srv/kian/kian.yaml` is not readable by
+`kian`. Once the unit is at least 15 min old it also requires `healthz` on `127.0.0.1:7433` to
+answer within 10 s: a restart replays the stream before the listener binds, and probing that
+window would make the watchdog restart a healthy-but-not-yet-serving process. The probe never
+folds the store — it holds no admin command — so a slow box cannot turn the watchdog into the
+load that trips it. Three consecutive failures (≈90 s) write an `ALERT` to the journal and
+`/var/log/kian-watch.log`; a single restart is absorbed by the streak.
 
 The watchdog exists because `Restart=always` keeps a crash-looping unit out of `failed`, so
 `OnFailure` alone never fires: on 2026-11-19 the service restarted 9,982 times over ~9 h with no
 alert.
+
+## Backups
+
+`kian-backup.timer` fires `kian-backup.service` every night at 03:20 UTC (up to 5 min of jitter),
+which runs `/usr/local/bin/kian-backup.sh`: one `VACUUM INTO` snapshot of `/srv/kian/kian.db` into
+`/srv/kian/backups/kian-<UTC>.db`, a row-count probe of the copy, then pruning down to the five
+most recent files — about 3.4 GB each, about 35 s of wall clock.
+
+`VACUUM INTO`, not `.backup`: the backup API writes its destination page by page through a rollback
+journal, and against a store the server never stops writing that amplified to hundreds of GB of
+IO without finishing (measured: 16 minutes in, still copying, the writer in `D`). `VACUUM INTO`
+takes one read snapshot and streams the file once; the source is in WAL mode, so the snapshot does
+not block writers. The unit is `Nice=19`, `IOSchedulingClass=idle`, `TimeoutStartSec=900`, so a
+regression cannot pin the box either.
+
+```bash
+systemctl list-timers kian-backup.timer            # next fire, last run
+sudo journalctl -u kian-backup.service -n 5        # backup ok: <path> (<bytes>, <events>, <s>)
+ls -l /srv/kian/backups
+```
+
+Restore — the snapshot is the whole store (events, queue, registry, projections), so replay
+rebuilds every in-memory projection from it and nothing else on the box needs restoring:
+
+```bash
+systemctl stop kian
+install -o kian -g kian -m 0644 /srv/kian/backups/kian-<UTC>.db /srv/kian/kian.db.restore
+mv /srv/kian/kian.db /srv/kian/kian.db.before-restore
+mv /srv/kian/kian.db.restore /srv/kian/kian.db
+rm -f /srv/kian/kian.db-wal /srv/kian/kian.db-shm   # the snapshot is self-contained
+systemctl start kian
+```
 
 ## Health and recovery
 
