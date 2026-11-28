@@ -518,7 +518,7 @@ bridge message plus the channel config (normalized allowlist), so it is unit-tes
 | `topic` | `topics[normalize(sender)]` | the same table is the receive allowlist |
 | `sender` | `{"handle": "<raw handle>"}` | minimal stable provenance object; admission-class entries compare it by exact JSON equality |
 | `group` | `None` | direct chats only in phase 1 |
-| `payload` | `{"text", "created_at_ms", "sender_handle", "chat_guid", "chat_identifier", "service", "is_group": false}`, plus `attachments` when the row carried any, plus `media` when `attachments: bytes` and a `media:` section are configured | text-bearing; `attachments` is the projected metadata (§3.2 items); `media` is the ephemeral ADR-062 envelope the edge consumes before admission; `sender_handle` is the reply target the model echoes |
+| `payload` | `{"text", "created_at_ms", "sender_handle", "chat_guid", "chat_identifier", "service", "is_group": false}`, plus `attachments` when the row carried any, plus `media` when `attachments: bytes` and a `media:` section are configured, plus `media_unavailable` for the items that fetch did not deliver | text-bearing; `attachments` is the projected metadata (§3.2 items); `media` is the ephemeral ADR-062 envelope the edge consumes before admission; `media_unavailable` names the items that stayed missing (`attachment_id`, `kind`, `error`) so the hole is model-visible; `sender_handle` is the reply target the model echoes |
 | `ts_ms` | `created_at_ms` | falls back to the adapter's receive time when absent |
 
 The `attachments` items carry `filename`, `mime_type`, `total_bytes` and `is_sticker` — the fields a
@@ -537,9 +537,13 @@ the edge the ADR-062 envelope `{"media": [{"kind", "media_type", "base64"}]}`; t
 item as an artifact, transcribes it, rewrites the item to an artifact reference plus transcript and
 appends the `[image transcript]`/`[voice message transcript]` line to the admitted text (ADR-062,
 ADR-064). A voice note is an ordinary audio item on this path: the bridge types it from the filename
-because the row records none (ADR-078). The base64 is consumed before admission, so the durable payload never contains bytes; a
-fetch that fails without bytes leaves the metadata-only payload above and still admits the row. In
-`metadata` mode (default) the route is never called. With `superagent.shaping.vision: true`
+because the row records none (ADR-078). The fetch is idempotent, so a transient failure — a reset
+or closed connection, a body that died mid-read, a timeout — is retried three times with
+200/400/800 ms backoff, while a refusal (`401`/`404`/`409`/`413`/`503`) is a verdict and is never
+repeated. The base64 is consumed before admission, so the durable payload never contains bytes; an
+item that still has no bytes after its retries leaves the metadata-only payload above, adds one
+`media_unavailable` entry, and the row is still admitted. In `metadata` mode (default) the route is
+never called. With `superagent.shaping.vision: true`
 (ADR-065) the admitted content also carries a sibling `images` array of these artifact references,
 so a vision target reads the picture itself while the wrapper and this transcript line stay
 unchanged.
@@ -795,6 +799,7 @@ failures, warnings}`, no token). Verified L1 against a scripted bridge mock and 
 | `chat.db` replaced/restored | generation change | reset cursors, audit, replay bounded; no merge claimed | this channel only |
 | Row still settling after `ROW_SETTLE_WINDOW` (an attachment join never arrives) | more markers than delivered attachments for five seconds of polls | admit the row with what arrived, one audit line naming the placeholder and attachment counts (ADR-070) | that row |
 | Row carries more media items than the eight-item cap | attachment count over `MAX_MEDIA_ITEMS_PER_ROW` | admit the row with the first eight, one audit line naming the count and the cap; the rest stay on the Mac (ADR-070) | that row |
+| Attachment fetch fails after its retries | `/v1/attachment` answered a transient failure (reset, closed body, timeout) three times, or one non-transient refusal | the row is admitted with its metadata; every item that stayed missing is named in payload `media_unavailable` (`attachment_id`, `kind`, `error`) plus one audit line per item, and a refusal (`401`/`404`/`409`/`413`/`503`) is never retried | that row's media only |
 | Mac asleep / logged out | bridge unreachable (the whole Mac is down) | inbound delayed until wake; messages cached by iCloud are read then (UNVERIFIED, §13.3); sends return `Unavailable` → retried by the outbox | this channel only |
 | Send outcome uncertain (`may_have_completed` / `still_in_flight`) | disposition | `DeliveryFailed` with the disposition in the text; the outbox's retry is deduped by `client_id` when the bridge is alive; a bridge restart inside the window can duplicate (§13.6) | that delivery |
 | Send queue full (8) | bridge answers `bridge_busy` | `DeliveryFailed` (retry-safe, no wire traffic); the outbox retries with backoff | that delivery |
@@ -842,7 +847,8 @@ scripted in-process bridge mock (axum, the `wechat_channel.rs` shape).
   `Timeout` on a held request; `instance_id`/`generation` reset; `gap: true` audit;
   `database.ready:false` → receive paused + send still attempted; 401/503/`-1743` surfaces;
   `attachments: bytes` emits the `media` envelope through a mock `/v1/attachment`, `metadata` never
-  calls that route, and a failed fetch keeps the metadata and admits the row.
+  calls that route, a transient failure is retried three times before it is reported, and a failed
+  fetch keeps the metadata, names the item in `media_unavailable`, and admits the row.
 - Handle normalization: email case, formatted phone vs E.164, config duplicate keys refused.
 - Config: section presence both ways, empty/blank `bridge_url`, non-http URL, `wait_ms` bounds,
   `poll_timeout_ms` relation, `max_send_chars` guard, `attachments: bytes` without `media:` refused
@@ -854,7 +860,8 @@ scripted in-process bridge mock (axum, the `wechat_channel.rs` shape).
   cached); body cap; auth required on every route; loopback-only bind refusal; `/v1/attachment`
   (bearer, raw bytes plus headers, HEIC-to-JPEG conversion and cache reuse, `409` stale generation
   on the legacy form, `410` missing file, `413` oversize, `415` non-image, `404` unknown id/
-  filename and a row outside the participant filter, and redacted `503` failures).
+  filename and a row outside the participant filter, and redacted `503` failures); the client's
+  retry policy (a transient failure three times with doubling backoff, a refusal never repeated).
 
 **L2 — real `Server` + sqlite + mock bridge over loopback** (landed:
 `crates/kian-cli/tests/imessage_cli.rs`): one inbound message → exactly one

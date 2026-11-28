@@ -347,6 +347,26 @@ pub enum BridgeError {
     Malformed(String),
 }
 
+impl BridgeError {
+    /// True for a failure the same request may legitimately survive: a
+    /// reset or closed connection, a body that died mid-read, a timeout.
+    /// A bridge refusal (401/404/409/413/503) is a verdict, not a hiccup,
+    /// so it is never repeated. Used only by the idempotent attachment GET.
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            BridgeError::Unreachable(_) | BridgeError::Timeout | BridgeError::Malformed(_)
+        )
+    }
+}
+
+/// Bounded repeats of one attachment GET (the reset-tunnel body is the
+/// documented failure mode, ADR-064 §3.2).
+const ATTACHMENT_FETCH_RETRIES: u32 = 3;
+
+/// First backoff step; each further retry doubles it (200 → 400 → 800 ms).
+const ATTACHMENT_RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
+
 /// The bridge ABI client. Cheap to clone (a `reqwest::Client` inside);
 /// the token is never rendered by `Debug` because the struct has no
 /// `Debug` derive (a leak would need an explicit field read).
@@ -429,6 +449,67 @@ impl BridgeClient {
     /// variant arrives unreadable. `media_type` still follows the
     /// response header, never the request.
     pub async fn attachment(
+        &self,
+        attachment_id: &str,
+        generation: &str,
+        as_jpeg: bool,
+        timeout: Duration,
+    ) -> Result<AttachmentBytes, BridgeError> {
+        // A fetch is idempotent, so a transient failure is worth repeating:
+        // over an SSH tunnel the connection is reset mid-body often enough
+        // that a single attempt turns a healthy attachment into a dropped
+        // one. Bounded, with doubling backoff, and never for a refusal the
+        // bridge made on purpose (401/404/409/413/503).
+        let mut attempt: u32 = 0;
+        loop {
+            match self
+                .attachment_once(attachment_id, generation, as_jpeg, timeout)
+                .await
+            {
+                Ok(bytes) => {
+                    if attempt > 0 {
+                        tracing::info!(
+                            target: "kian::imessage_channel",
+                            attachment_id = %attachment_id,
+                            attempts = attempt + 1,
+                            "imessage audit: attachment fetch succeeded after a retry"
+                        );
+                    }
+                    return Ok(bytes);
+                }
+                Err(error) if error.is_transient() && attempt < ATTACHMENT_FETCH_RETRIES => {
+                    attempt += 1;
+                    let delay = ATTACHMENT_RETRY_BASE_DELAY * 2u32.pow(attempt - 1);
+                    tracing::warn!(
+                        target: "kian::imessage_channel",
+                        attachment_id = %attachment_id,
+                        attempt = attempt,
+                        max_attempts = ATTACHMENT_FETCH_RETRIES + 1,
+                        retry_in_ms = delay.as_millis() as u64,
+                        error = %error,
+                        "imessage audit: attachment fetch failed, retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(error) => {
+                    if attempt > 0 {
+                        tracing::warn!(
+                            target: "kian::imessage_channel",
+                            attachment_id = %attachment_id,
+                            attempts = attempt + 1,
+                            error = %error,
+                            "imessage audit: attachment fetch gave up after retries; the row keeps its metadata"
+                        );
+                    }
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    /// One `GET /v1/attachment` attempt — the body of [`Self::attachment`]
+    /// with no retry of its own, so the backoff loop owns the policy.
+    async fn attachment_once(
         &self,
         attachment_id: &str,
         generation: &str,
@@ -739,5 +820,30 @@ mod tests {
         assert!(health.database.ready);
         assert_eq!(health.watch.participants, vec!["+1".to_string()]);
         assert!(!health.imsg.rpc);
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_broken_connection_is_worth_repeating() {
+        assert!(BridgeError::Malformed("error decoding response body".into()).is_transient());
+        assert!(BridgeError::Timeout.is_transient());
+        assert!(BridgeError::Unreachable("connection reset".into()).is_transient());
+        assert!(!BridgeError::Unauthorized.is_transient());
+        assert!(!BridgeError::AttachmentUnavailable("unknown attachment id".into()).is_transient());
+        assert!(!BridgeError::DatabaseUnreadable("locked".into()).is_transient());
+    }
+
+    #[test]
+    fn the_backoff_doubles_and_stays_bounded() {
+        assert_eq!(ATTACHMENT_FETCH_RETRIES, 3);
+        assert_eq!(ATTACHMENT_RETRY_BASE_DELAY, Duration::from_millis(200));
+        let steps: Vec<u64> = (1..=ATTACHMENT_FETCH_RETRIES)
+            .map(|attempt| (ATTACHMENT_RETRY_BASE_DELAY * 2u32.pow(attempt - 1)).as_millis() as u64)
+            .collect();
+        assert_eq!(steps, vec![200, 400, 800]);
     }
 }

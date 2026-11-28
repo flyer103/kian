@@ -1255,6 +1255,7 @@ async fn attach_media(
     event: &mut ChannelEvent,
 ) {
     let mut items = Vec::new();
+    let mut unavailable = Vec::new();
     let media: Vec<&BridgeAttachment> = message
         .attachments
         .iter()
@@ -1296,20 +1297,35 @@ async fn attach_media(
                 "media_type": bytes.media_type,
                 "base64": base64_encode(&bytes.bytes),
             })),
-            Err(error) => warn!(
-                target: "kian::imessage_channel",
-                channel = %inner.name,
-                attachment_id = %id,
-                kind = kind,
-                error = %error,
-                "imessage audit: attachment fetch failed; the row keeps its metadata"
-            ),
+            // Never silent: the row is still admitted on its metadata, but
+            // the event names the item that did not arrive, so both the
+            // model and a transcript reader see the hole.
+            Err(error) => {
+                unavailable.push(json!({
+                    "attachment_id": id,
+                    "kind": kind,
+                    "error": error.to_string(),
+                }));
+                warn!(
+                    target: "kian::imessage_channel",
+                    channel = %inner.name,
+                    attachment_id = %id,
+                    kind = kind,
+                    error = %error,
+                    "imessage audit: attachment fetch failed after retries; the row keeps its metadata"
+                );
+            }
         }
     }
     if !items.is_empty()
         && let Some(payload) = event.payload.as_object_mut()
     {
         payload.insert("media".into(), Value::Array(items));
+    }
+    if !unavailable.is_empty()
+        && let Some(payload) = event.payload.as_object_mut()
+    {
+        payload.insert("media_unavailable".into(), Value::Array(unavailable));
     }
 }
 
