@@ -386,14 +386,14 @@ instead of disappearing from a model's view.
 - Without `as`, `200` returns the original bytes with the attachment's `mime_type` as
   `content-type`; an item whose row records no type is typed from its filename extension
   (`Audio Message.caf` → `audio/x-caf`), because a voice note carries an empty `mime_type`
-  (ADR-075). `?as=jpeg` returns an `image/jpeg` variant for `image/heic`: the bridge runs
+  (ADR-078). `?as=jpeg` returns an `image/jpeg` variant for `image/heic`: the bridge runs
   `/usr/bin/sips -s format jpeg -Z 2048` against a temporary file, atomically renames the result
   into its disposable cache, and never modifies the original. JPEG generation is serialized in the
   bridge process; a failed conversion answers `503 attachment_unavailable` and never falls back to
   HEIC bytes.
 - The route serves `image/*` and `audio/*` items. Anything else — a video, a PDF, a contact card —
   answers `415 unsupported_type`, because the media edge has an OCR tool and a transcription tool
-  and no consumer for other bytes (ADR-075).
+  and no consumer for other bytes (ADR-078).
 - `200` includes `content-length`, `x-kian-total-bytes` from the attachment row and
   `x-kian-variant: original|jpeg`.
 - `400 bad_request` covers a non-integer or negative position, or an unsupported `as` value.
@@ -527,7 +527,7 @@ encodes a per-generation ROWID that must not become durable data. A row without 
 payload bytes exactly as before, so a text-only conversation is unaffected by the field's existence.
 A row that records no MIME type is typed from its filename extension, so a voice note is
 `{"filename": "Audio Message.caf", "mime_type": "audio/x-caf", …}` instead of an untyped item
-(ADR-075).
+(ADR-078).
 
 With `attachments: bytes` and a `media:` section, the adapter additionally fetches the row's
 `image/*` and `audio/*` items — at most eight, never a sticker — through `/v1/attachment` (carrying
@@ -537,7 +537,7 @@ the edge the ADR-062 envelope `{"media": [{"kind", "media_type", "base64"}]}`; t
 item as an artifact, transcribes it, rewrites the item to an artifact reference plus transcript and
 appends the `[image transcript]`/`[voice message transcript]` line to the admitted text (ADR-062,
 ADR-064). A voice note is an ordinary audio item on this path: the bridge types it from the filename
-because the row records none (ADR-075). The base64 is consumed before admission, so the durable payload never contains bytes; a
+because the row records none (ADR-078). The base64 is consumed before admission, so the durable payload never contains bytes; a
 fetch that fails without bytes leaves the metadata-only payload above and still admits the row. In
 `metadata` mode (default) the route is never called. With `superagent.shaping.vision: true`
 (ADR-065) the admitted content also carries a sibling `images` array of these artifact references,
@@ -963,7 +963,7 @@ question — they stay in §13.
    audio arm of `/v1/attachment` and the `[voice message transcript]` line — is covered against
    fakes. A real voice note was admitted with its metadata and no `media` array before this change
    and has not been replayed since; the first owner voice note after the bridge rebuild is the
-   acceptance (§12, ADR-075).
+   acceptance (§12, ADR-078).
 
 ## 14. Delivery slices
 
@@ -1000,9 +1000,9 @@ entry. No new event kind, no store schema, no core seam change. Estimated write 
 lines, adapter 120 lines, edge + router 350 lines, config/CLI 120 lines, tests ~600 lines, docs
 ~500 lines.
 
-**2c (inbound voice, ADR-075).** The bridge's filename-extension fallback in the attachment
+**2c (inbound voice, ADR-078).** The bridge's filename-extension fallback in the attachment
 projection and its audio arm on `GET /v1/attachment`; the adapter's extension fallback in
-`media_kind`; §3.2/§4 increments, ADR-075 and L1/L2 tests. No new route, no
+`media_kind`; §3.2/§4 increments, ADR-078 and L1/L2 tests. No new route, no
 event kind, no store schema, no core seam change.
 
 **Rollback.** Purely config: remove the `type: imessage` channel (or stop the bridge); no event

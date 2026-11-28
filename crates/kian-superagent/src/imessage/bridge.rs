@@ -296,7 +296,7 @@ impl BridgeAttachment {
 
 /// The filename fallback for an item that records no MIME type: a voice note
 /// arrives as `Audio Message.caf` with an empty `mime_type`, and a bridge
-/// built before ADR-075 still projects it that way.
+/// built before ADR-078 still projects it that way.
 fn media_kind_from_filename(filename: Option<&str>) -> Option<&'static str> {
     let extension = filename?.rsplit_once('.')?.1.to_ascii_lowercase();
     match extension.as_str() {
@@ -700,7 +700,7 @@ mod tests {
         assert_eq!(
             item(Some(""), Some("Audio Message.caf"), false).media_kind(),
             Some("audio"),
-            "a voice note records no MIME type; its filename is the second signal (ADR-075)"
+            "a voice note records no MIME type; its filename is the second signal (ADR-078)"
         );
         assert_eq!(
             item(Some(""), Some("clip.HEIC"), false).media_kind(),

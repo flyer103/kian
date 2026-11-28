@@ -1,4 +1,4 @@
-# ADR-075 — An inbound iMessage voice note is fetched and transcribed
+# ADR-078 — An inbound iMessage voice note is fetched and transcribed
 
 - Status: accepted (2026-11-27, iMessage inbound voice)
 - Related: ADR-062 (channel edge media), ADR-064 (iMessage attachment bytes), ADR-067 (iMessage

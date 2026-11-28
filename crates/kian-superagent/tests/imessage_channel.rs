@@ -567,7 +567,7 @@ async fn an_untyped_voice_note_page_still_reaches_the_media_edge() {
             "media_type": "audio/x-caf",
             "base64": "Y2FmLWJ5dGVz",
         }]),
-        "a bridge built before ADR-075 projects an empty type; the filename still classifies it"
+        "a bridge built before ADR-078 projects an empty type; the filename still classifies it"
     );
     let queries = mock.attachment_queries();
     assert_eq!(queries.len(), 1, "{queries:?}");

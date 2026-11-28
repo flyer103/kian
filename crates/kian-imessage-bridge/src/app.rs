@@ -513,7 +513,7 @@ fn project_attachments(rowid: u64, raw: Option<&Value>) -> Vec<Value> {
         .collect()
 }
 
-/// The row's `mime_type`, else the type its filename implies (ADR-075).
+/// The row's `mime_type`, else the type its filename implies (ADR-078).
 fn projected_media_type(item: &Value) -> Value {
     let recorded = item.get("mime_type").and_then(Value::as_str);
     let filename = item
@@ -1477,7 +1477,7 @@ mod tests {
         assert_eq!(
             reduced["attachments"][0]["mime_type"],
             json!("audio/x-caf"),
-            "the Mac records no type for a voice note (ADR-075)"
+            "the Mac records no type for a voice note (ADR-078)"
         );
         assert_eq!(
             reduced["attachments"][0]["filename"],

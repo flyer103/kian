@@ -27,7 +27,7 @@ pub const LOCATE_RETRY_DELAY: Duration = Duration::from_millis(250);
 /// A voice note lands in `chat.db` with an empty `mime_type` and an
 /// `Audio Message.caf` filename; without the filename fallback the row is
 /// neither an image nor an audio item and its bytes can never be read
-/// (ADR-075). The table is deliberately small: a format this channel has no
+/// (ADR-078). The table is deliberately small: a format this channel has no
 /// tool for (video, PDF, a contact card) keeps no type and is refused by
 /// `read` instead of being guessed at.
 #[must_use]
@@ -549,7 +549,7 @@ mod tests {
         assert_eq!(
             media_type_of(voice, Some("  ")).as_deref(),
             Some("audio/x-caf"),
-            "an empty recorded type is the voice-note case (ADR-075)"
+            "an empty recorded type is the voice-note case (ADR-078)"
         );
         assert_eq!(media_type_of(voice, None).as_deref(), Some("audio/x-caf"));
         assert_eq!(
