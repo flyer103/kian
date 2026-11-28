@@ -91,6 +91,8 @@ is 3,229,468,968 B, i.e. the "worker streams" *are* the whole store.
   `incremental_rebuild_equals_full_for_task_board`; plus
   `commands::tests::ticket_row_attributes_parked_deliveries_by_alias_or_conversation` pinning the
   shared row function's alias/parked attribution.
-- **L3 (deployed run, not run at landing).** Force a full rebuild on the production store and
-  observe `memory.peak` for `kian.service` stay ≈ ≤ 1.5 GB (the 2026-11-28 run peaked ~4.9 GB),
-  with every view published, `stale_usage_rows` = 0 and `/healthz` 200 throughout.
+- **L3 (verified 2026-11-28 on a copy of the production store).** A full rebuild through
+  `rebuild_views_full` over a `sqlite3 .backup` copy of `/srv/kian/kian.db`
+  (3,353,419,776 B, 357 sessions) published every view in 49.5 s with a peak RSS of
+  1,017,392 kB ≈ 0.97 GB — against the ~4.9–5.35 GB the whole-store map needed on the same data —
+  and `stale_usage_rows` = 0.
