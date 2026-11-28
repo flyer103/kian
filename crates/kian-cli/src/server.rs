@@ -632,10 +632,7 @@ impl Server {
             let router_pinned = router_session;
             let mut router_re_arm = kian_superagent::rearm::resolve_re_arm(router_pinned, {
                 let store = store.clone();
-                move |session| {
-                    let store = store.clone();
-                    Box::pin(async move { store.rebuild(session).await })
-                }
+                move |session| Box::pin(crate::rotation::resident_stream(store.clone(), session))
             })
             .await
             .map_err(|e| {
@@ -663,8 +660,7 @@ impl Server {
                     router_re_arm = kian_superagent::rearm::resolve_re_arm(router_pinned, {
                         let store = store.clone();
                         move |session| {
-                            let store = store.clone();
-                            Box::pin(async move { store.rebuild(session).await })
+                            Box::pin(crate::rotation::resident_stream(store.clone(), session))
                         }
                     })
                     .await
@@ -746,8 +742,7 @@ impl Server {
                     let re_arm = kian_superagent::rearm::resolve_re_arm(pinned, {
                         let store = store.clone();
                         move |session| {
-                            let store = store.clone();
-                            Box::pin(async move { store.rebuild(session).await })
+                            Box::pin(crate::rotation::resident_stream(store.clone(), session))
                         }
                     })
                     .await

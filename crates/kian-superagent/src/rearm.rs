@@ -17,8 +17,11 @@
 //! successor of a given ended session. The first chain link whose
 //! stream is empty (never created) or non-terminal is the **live**
 //! resident session; every terminal link before it is recorded with its
-//! end reason. Assembly then binds the live session everywhere the
-//! pinned id used to go, and bootstraps it:
+//! end reason. Retention removes a terminal link's online rows, so the
+//! walk is told when a candidate is archived — the marker, not the empty
+//! stream, is the truth: an archived link counts as terminal and its id
+//! is never re-created. Assembly then binds the live session everywhere
+//! the pinned id used to go, and bootstraps it:
 //!
 //! - generation 0 (no ended predecessors): the legacy bootstrap key and
 //!   prompt, byte-identical to the legacy behavior;
@@ -60,22 +63,36 @@ pub fn successor_session(session: SessionId) -> SessionId {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EndedResident {
     pub session: SessionId,
-    pub reason: EndReason,
+    pub cause: EndedCause,
+}
+
+/// Why a predecessor link is no longer the live resident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndedCause {
+    /// The stream's own terminal `session/ended{reason}` tail.
+    Ended(EndReason),
+    /// Retention archived the session (READ-MODEL §7): its online rows are
+    /// gone, and the archived marker is the durable evidence that the id
+    /// must never be re-created.
+    Archived,
 }
 
 impl EndedResident {
     /// The reason as the stable word used in re-arm prompts (serde's
-    /// lowercase spelling of [`EndReason`]).
+    /// lowercase spelling of [`EndReason`], or `archived`).
     #[must_use]
     pub fn reason_name(&self) -> &'static str {
-        match self.reason {
-            EndReason::Completed => "completed",
-            EndReason::Cancelled => "cancelled",
-            EndReason::Interrupted => "interrupted",
-            EndReason::Failed => "failed",
-            EndReason::AwaitingInput => "awaiting_input",
-            EndReason::AwaitingBudget => "awaiting_budget",
-            EndReason::Rotated => "rotated",
+        match self.cause {
+            EndedCause::Ended(reason) => match reason {
+                EndReason::Completed => "completed",
+                EndReason::Cancelled => "cancelled",
+                EndReason::Interrupted => "interrupted",
+                EndReason::Failed => "failed",
+                EndReason::AwaitingInput => "awaiting_input",
+                EndReason::AwaitingBudget => "awaiting_budget",
+                EndReason::Rotated => "rotated",
+            },
+            EndedCause::Archived => "archived",
         }
     }
 }
@@ -155,7 +172,10 @@ pub fn terminal_resident(
         return Ok(None);
     }
     match events.last().map(|e| e.kind) {
-        Some(EventKind::SessionEnded { reason }) => Ok(Some(EndedResident { session, reason })),
+        Some(EventKind::SessionEnded { reason }) => Ok(Some(EndedResident {
+            session,
+            cause: EndedCause::Ended(reason),
+        })),
         _ => Err(ReArmError::Project(format!(
             "session {} projects terminal ({state:?}) without a session/ended tail — unsupported stream shape",
             session.0
@@ -163,21 +183,34 @@ pub fn terminal_resident(
     }
 }
 
-/// The chain walk: `stream_of` yields a candidate session's committed
-/// stream (empty = never created). See the module docs for the
-/// semantics; the walk is deterministic because [`successor_session`]
-/// is.
+/// One walk step's evidence about a candidate session.
+///
+/// The walk cannot read the store (§7 iron rule): assembly reports
+/// whether the candidate's stream is committed — empty means never
+/// created — or archived, in which case the empty online stream means
+/// "retired", not "never created".
+#[derive(Debug, Clone, PartialEq)]
+pub enum ResidentStream {
+    /// The candidate's committed stream (empty = never created).
+    Committed(Vec<Event>),
+    /// Retention archived the candidate: its id is retired.
+    Archived,
+}
+
+/// The chain walk: `stream_of` reports a candidate session's stream (or
+/// its archived marker). See the module docs for the semantics; the walk
+/// is deterministic because [`successor_session`] is.
 ///
 /// `stream_of` is a port-shaped callback (the bundle crate reaches no
 /// store — the §7 iron rule): each call returns a future producing the
-/// candidate's stream, and assembly passes a closure reading the real
+/// candidate's evidence, and assembly passes a closure reading the real
 /// event store.
 pub fn resolve_re_arm<S, E>(
     pinned: SessionId,
     mut stream_of: S,
 ) -> futures::future::BoxFuture<'static, Result<ReArm, ReArmError<E>>>
 where
-    S: FnMut(SessionId) -> futures::future::BoxFuture<'static, Result<Vec<Event>, E>>
+    S: FnMut(SessionId) -> futures::future::BoxFuture<'static, Result<ResidentStream, E>>
         + Send
         + 'static,
     E: Send + 'static,
@@ -192,8 +225,15 @@ where
                     bound: RE_ARM_CHAIN_BOUND,
                 });
             }
-            let events = stream_of(current).await.map_err(ReArmError::Stream)?;
-            let Some(link) = terminal_resident(&events).narrow()? else {
+            let step = stream_of(current).await.map_err(ReArmError::Stream)?;
+            let link = match step {
+                ResidentStream::Archived => Some(EndedResident {
+                    session: current,
+                    cause: EndedCause::Archived,
+                }),
+                ResidentStream::Committed(events) => terminal_resident(&events).narrow()?,
+            };
+            let Some(link) = link else {
                 return Ok(ReArm {
                     live: current,
                     ended,
@@ -291,10 +331,15 @@ mod tests {
         events
     }
 
-    fn ok(
+    fn committed(
         events: Vec<Event>,
-    ) -> futures::future::BoxFuture<'static, Result<Vec<Event>, std::convert::Infallible>> {
-        Box::pin(async { Ok(events) })
+    ) -> futures::future::BoxFuture<'static, Result<ResidentStream, std::convert::Infallible>> {
+        Box::pin(async { Ok(ResidentStream::Committed(events)) })
+    }
+
+    fn archived()
+    -> futures::future::BoxFuture<'static, Result<ResidentStream, std::convert::Infallible>> {
+        Box::pin(async { Ok(ResidentStream::Archived) })
     }
 
     #[test]
@@ -336,14 +381,14 @@ mod tests {
             terminal_resident(&ended(s, EndReason::Completed)).unwrap(),
             Some(EndedResident {
                 session: s,
-                reason: EndReason::Completed
+                cause: EndedCause::Ended(EndReason::Completed)
             })
         );
         assert_eq!(
             terminal_resident(&ended(s, EndReason::Cancelled)).unwrap(),
             Some(EndedResident {
                 session: s,
-                reason: EndReason::Cancelled
+                cause: EndedCause::Ended(EndReason::Cancelled)
             })
         );
     }
@@ -351,7 +396,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_fresh_store_arms_the_pinned_session() {
         let pinned = session(1);
-        let rearm = resolve_re_arm(pinned, |_| ok(vec![])).await.unwrap();
+        let rearm = resolve_re_arm(pinned, |_| committed(vec![])).await.unwrap();
         assert_eq!(rearm, ReArm::pinned(pinned));
         assert!(!rearm.is_succession());
         assert_eq!(rearm.scan_chain(), vec![pinned]);
@@ -361,7 +406,7 @@ mod tests {
     async fn resolve_live_pinned_session_stays_generation_zero() {
         let pinned = session(1);
         let rearm = resolve_re_arm(pinned, move |s| {
-            ok(if s == pinned { running(pinned) } else { vec![] })
+            committed(if s == pinned { running(pinned) } else { vec![] })
         })
         .await
         .unwrap();
@@ -375,7 +420,7 @@ mod tests {
         // no successor.
         let pinned = session(1);
         let rearm = resolve_re_arm(pinned, move |s| {
-            ok(if s == pinned {
+            committed(if s == pinned {
                 ended(pinned, EndReason::Failed)
             } else {
                 vec![]
@@ -391,7 +436,7 @@ mod tests {
         let pinned = session(1);
         let successor = successor_session(pinned);
         let rearm = resolve_re_arm(pinned, move |s| {
-            ok(if s == pinned {
+            committed(if s == pinned {
                 ended(pinned, EndReason::Completed)
             } else {
                 vec![]
@@ -404,11 +449,42 @@ mod tests {
             rearm.ended,
             vec![EndedResident {
                 session: pinned,
-                reason: EndReason::Completed
+                cause: EndedCause::Ended(EndReason::Completed)
             }]
         );
         assert!(rearm.is_succession());
         assert_eq!(rearm.scan_chain(), vec![pinned, successor]);
+    }
+
+    #[tokio::test]
+    async fn resolve_rotates_past_an_archived_predecessor() {
+        // Retention removed the pinned session's online rows, so its
+        // stream is empty exactly like a never-created session; the
+        // archived marker must decide that the id is retired and the walk
+        // advances to the successor instead of re-creating it.
+        let pinned = session(1);
+        let successor = successor_session(pinned);
+        let rearm = resolve_re_arm(pinned, move |s| {
+            if s == pinned {
+                archived()
+            } else {
+                committed(vec![])
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(rearm.live, successor);
+        assert_eq!(
+            rearm.ended,
+            vec![EndedResident {
+                session: pinned,
+                cause: EndedCause::Archived
+            }]
+        );
+        assert_eq!(rearm.ended[0].reason_name(), "archived");
+        let cause = re_arm_cause(&rearm.ended);
+        assert!(cause.contains(&pinned.0.to_string()));
+        assert!(cause.contains("(archived)"));
     }
 
     #[tokio::test]
@@ -417,7 +493,7 @@ mod tests {
         let s1 = successor_session(pinned);
         let s2 = successor_session(s1);
         let rearm = resolve_re_arm(pinned, move |s| {
-            ok(if s == pinned {
+            committed(if s == pinned {
                 ended(pinned, EndReason::Completed)
             } else if s == s1 {
                 ended(s1, EndReason::Cancelled)
@@ -430,9 +506,15 @@ mod tests {
         assert_eq!(rearm.live, s2);
         assert_eq!(rearm.ended.len(), 2);
         assert_eq!(rearm.ended[0].session, pinned);
-        assert_eq!(rearm.ended[0].reason, EndReason::Completed);
+        assert_eq!(
+            rearm.ended[0].cause,
+            EndedCause::Ended(EndReason::Completed)
+        );
         assert_eq!(rearm.ended[1].session, s1);
-        assert_eq!(rearm.ended[1].reason, EndReason::Cancelled);
+        assert_eq!(
+            rearm.ended[1].cause,
+            EndedCause::Ended(EndReason::Cancelled)
+        );
         assert_eq!(rearm.scan_chain(), vec![pinned, s1, s2]);
     }
 
@@ -441,7 +523,7 @@ mod tests {
         let pinned = session(1);
         // Every candidate (including every derived successor) is a
         // terminal stream — the walk must refuse, not loop.
-        let err = resolve_re_arm(pinned, |s| ok(ended(s, EndReason::Completed)))
+        let err = resolve_re_arm(pinned, |s| committed(ended(s, EndReason::Completed)))
             .await
             .unwrap_err();
         assert!(matches!(
@@ -473,11 +555,11 @@ mod tests {
         let cause = re_arm_cause(&[
             EndedResident {
                 session: pinned,
-                reason: EndReason::Completed,
+                cause: EndedCause::Ended(EndReason::Completed),
             },
             EndedResident {
                 session: s1,
-                reason: EndReason::Cancelled,
+                cause: EndedCause::Ended(EndReason::Cancelled),
             },
         ]);
         assert!(cause.contains(&pinned.0.to_string()));

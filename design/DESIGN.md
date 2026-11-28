@@ -1289,7 +1289,11 @@ Re-arm semantics (zero new event kinds; the chain is derivable from persisted st
 - **Successor chain.** `successor(s) = uuid5(s, "kian:resident:re-arm")` — the name string is
  frozen contract (constraint-3 spirit: changing it orphans every existing chain). At boot,
  assembly walks from the config-pinned session down the chain: every link whose stream projects
- terminal is recorded (session + end reason) and skipped; the first empty-or-live link is the
+ terminal is recorded (session + end reason) and skipped, and a link with an `archived_sessions`
+ marker is recorded `archived` and skipped the same way — retention deletes a terminal stream, so
+ the marker, not an empty stream, decides that the id is retired and must never be bootstrapped
+ again ([ADR-082](decisions/ADR-082-retention-preserves-replay-evidence.md)); the first
+ empty-or-live link is the
  **live** session and is bound everywhere the pinned id used to go (bootstrap target, inbox
  residency counter, worker completion reports, subscription fallback, driver routing, and the
  timer rule's `Route::Session` target for the watchdog). The walk refuses to boot (fail-closed)

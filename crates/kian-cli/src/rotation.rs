@@ -41,6 +41,22 @@ use kian_orchestrator::{DrainCtx, Engine, RotateOutcome};
 use kian_store::{AppendGuard, EventStore};
 use serde_json::{Value, json};
 
+/// The resident walk's per-candidate evidence (re-arm): an archived
+/// marker wins over the online stream, so retention never lets the boot
+/// path re-create a retired id that merely looks "never created".
+pub(crate) async fn resident_stream(
+    store: EventStore,
+    session: SessionId,
+) -> Result<kian_superagent::rearm::ResidentStream, kian_store::InboxError> {
+    if store.archived_session(session).await?.is_some() {
+        return Ok(kian_superagent::rearm::ResidentStream::Archived);
+    }
+    store
+        .rebuild(session)
+        .await
+        .map(kian_superagent::rearm::ResidentStream::Committed)
+}
+
 /// What one boot-time rotation captured for the successor's bootstrap.
 #[derive(Debug)]
 pub struct BootRotation {
@@ -319,10 +335,7 @@ impl RuntimeRotation {
         if !events.is_empty() && project(&events).map_err(|e| e.to_string())?.is_terminal() {
             let resolution = kian_superagent::rearm::resolve_re_arm(self.pinned, {
                 let store = store.clone();
-                move |session| {
-                    let store = store.clone();
-                    Box::pin(async move { store.rebuild(session).await })
-                }
+                move |session| Box::pin(resident_stream(store.clone(), session))
             })
             .await
             .map_err(|e| {
@@ -391,7 +404,7 @@ impl RuntimeRotation {
         }
         let predecessor = kian_superagent::rearm::EndedResident {
             session: live,
-            reason: EndReason::Rotated,
+            cause: kian_superagent::rearm::EndedCause::Ended(EndReason::Rotated),
         };
         self.ended
             .lock()

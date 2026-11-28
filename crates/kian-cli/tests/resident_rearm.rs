@@ -588,3 +588,118 @@ async fn soft_failed_router_re_opens_on_the_same_session() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// 4. An archived pinned session is never re-created: the marker decides
+// ---------------------------------------------------------------------------
+
+/// The retention path a production boot can meet: the pinned Router was
+/// archived (its online stream deleted, the package and marker left
+/// behind). Boot must read the marker, find the chain terminal and arm
+/// the deterministic successor — never bootstrap the retired id again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_archived_pinned_router_arms_the_successor_instead_of_reviving_it() {
+    force_no_proxy();
+    let dir = temp_dir("c82-rearm-archived");
+    let (router_base, _router_mock) = spawn_scripted_provider(
+        vec![ScriptedResponse::Text("re-arm acknowledged".into())],
+        0,
+    )
+    .await;
+    let (worker_base, _worker_mock) =
+        spawn_scripted_provider(vec![ScriptedResponse::Text("unused".into())], 0).await;
+    let config = write_config(
+        &dir,
+        &router_base,
+        &worker_base,
+        "127.0.0.1:7342",
+        30_000,
+        10_000,
+    );
+    let sqlite = dir.join("kian.sqlite");
+    let mut yaml = std::fs::read_to_string(&config).expect("read config");
+    yaml.push_str(&format!(
+        "retention:\n  enabled: true\n  archive_dir: \"{}\"\n  min_bytes: 0\n",
+        dir.join("archive").display()
+    ));
+    std::fs::write(&config, yaml).expect("write retention config");
+
+    seed_terminal(&sqlite, router_session(), EndReason::Completed).await;
+    let archived = Command::new(env!("CARGO_BIN_EXE_kian"))
+        .args(["archive", "run", "--config", config.to_str().unwrap()])
+        .output()
+        .expect("run kian archive run");
+    assert!(
+        archived.status.success(),
+        "archive run failed: {}{}",
+        String::from_utf8_lossy(&archived.stdout),
+        String::from_utf8_lossy(&archived.stderr)
+    );
+
+    let before_boot = EventStore::open_read_only(&sqlite)
+        .await
+        .expect("read-only store");
+    assert!(
+        before_boot
+            .archived_session(router_session())
+            .await
+            .expect("marker")
+            .is_some(),
+        "the archive pass left the marker behind"
+    );
+    assert!(
+        before_boot
+            .rebuild(router_session())
+            .await
+            .expect("pinned")
+            .is_empty(),
+        "commit deleted the online stream"
+    );
+    before_boot.close().await;
+
+    let (_base, _server) = spawn_server(&config).await;
+    let read_only = EventStore::open_read_only(&sqlite)
+        .await
+        .expect("read-only store");
+
+    let successor = successor_session();
+    let events = wait_for_session(
+        &read_only,
+        successor,
+        "successor bootstrap judge turn",
+        |ev| count_kind(ev, EventKind::TurnStart) >= 1 && count_kind(ev, EventKind::TurnEnd) >= 1,
+    )
+    .await;
+    let prompt = events
+        .iter()
+        .find(|e| e.kind == EventKind::InputAdmitted)
+        .expect("re-arm prompt admitted")
+        .bytes["content"]
+        .as_str()
+        .expect("prompt text")
+        .to_owned();
+    assert!(prompt.starts_with("[re-arm]"), "prompt: {prompt}");
+    assert!(prompt.contains(&router_session().0.to_string()));
+    assert!(
+        prompt.contains("(archived)"),
+        "the cause names the archive, not an end: {prompt}"
+    );
+
+    // The retired id stays retired: no bootstrap, no new event, and the
+    // marker is still there for the next boot.
+    let pinned = read_only.rebuild(router_session()).await.expect("pinned");
+    assert!(
+        pinned.is_empty(),
+        "an archived resident must never be re-created: {pinned:?}"
+    );
+    assert!(
+        read_only
+            .archived_session(router_session())
+            .await
+            .expect("marker")
+            .is_some(),
+        "boot does not consume the archive marker"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

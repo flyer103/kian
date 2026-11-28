@@ -3766,7 +3766,7 @@ mod tests {
 
     #[tokio::test]
     async fn bootstrap_of_a_re_armed_successor_carries_cause_and_stable_key() {
-        use crate::rearm::{EndedResident, re_arm_bootstrap_key, successor_session};
+        use crate::rearm::{EndedCause, EndedResident, re_arm_bootstrap_key, successor_session};
         use kian_core::events::EndReason;
 
         let inbox = Arc::new(ScriptedInbox {
@@ -3778,7 +3778,7 @@ mod tests {
         let mut profile = RouterProfile::new(live, router_template("mock", "mock-router"));
         profile.re_arm = vec![EndedResident {
             session: pinned,
-            reason: EndReason::Completed,
+            cause: EndedCause::Ended(EndReason::Completed),
         }];
         profile
             .bootstrap(&*inbox as &dyn InboxWriter)
@@ -3864,7 +3864,7 @@ mod tests {
 
     #[tokio::test]
     async fn bootstrap_header_composes_with_a_re_arm_prefix() {
-        use crate::rearm::{EndedResident, successor_session};
+        use crate::rearm::{EndedCause, EndedResident, successor_session};
         use kian_core::events::EndReason;
 
         let inbox = Arc::new(ScriptedInbox {
@@ -3876,7 +3876,7 @@ mod tests {
         let mut profile = RouterProfile::new(live, router_template("mock", "mock-router"));
         profile.re_arm = vec![EndedResident {
             session: pinned,
-            reason: EndReason::Completed,
+            cause: EndedCause::Ended(EndReason::Completed),
         }];
         profile.policy_version = Some(crate::policy_version::PolicyVersion::new("v1"));
         profile

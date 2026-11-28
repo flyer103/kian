@@ -876,7 +876,7 @@ mod tests {
 
     #[tokio::test]
     async fn bootstrap_of_a_re_armed_successor_carries_cause_and_stable_key() {
-        use crate::rearm::{EndedResident, re_arm_bootstrap_key, successor_session};
+        use crate::rearm::{EndedCause, EndedResident, re_arm_bootstrap_key, successor_session};
         use kian_core::events::EndReason;
 
         let inbox = LoggingInbox::shared();
@@ -885,7 +885,7 @@ mod tests {
         let mut profile = WatchdogProfile::new(live, watchdog_template("mock", "m", 1));
         profile.re_arm = vec![EndedResident {
             session: pinned,
-            reason: EndReason::Cancelled,
+            cause: EndedCause::Ended(EndReason::Cancelled),
         }];
         profile
             .bootstrap(&*inbox as &dyn InboxWriter)
