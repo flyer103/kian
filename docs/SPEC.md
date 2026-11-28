@@ -192,6 +192,9 @@ is recorded in [CHANGELOG.md](../CHANGELOG.md) and [overview.md](overview.md) §
 ## 3. Operations Interface
 
 ### 3.1 Observability
+- Liveness: `GET /healthz` answers `200` from process state alone (no store read, no projection,
+  no token) — the probe a supervisor points at, distinct from the derived `/metrics` route
+  (ADR-076).
 - Metrics: session state-machine transition counts, drain depth/duration, pendingWake depth,
   cache hit rate / invalidation causes (A3), recovery action counts and budget consumption (A5),
   evidence-gate verdicts (A6).

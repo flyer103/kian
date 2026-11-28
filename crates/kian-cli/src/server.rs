@@ -1461,6 +1461,7 @@ impl Server {
             self.event_stream_enabled,
         )
         .merge(metrics_router(self.clone()))
+        .merge(health_router())
         .merge(crate::ops::router(ops));
         // the fourth surface — the inbound webhook receiver,
         // mounted **only** when the route is configured (a `type:
@@ -2991,6 +2992,29 @@ impl WebhookPlane for Server {
             Ok(channel.ingest_delivery(&event_type, &delivery_id, &body))
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// GET /healthz — liveness (API-CONTRACT §1.1, ADR-076)
+// ---------------------------------------------------------------------------
+
+fn health_router() -> axum::Router {
+    axum::Router::new().route("/healthz", axum::routing::get(health_handler))
+}
+
+/// Liveness, not readiness: the answer comes from the process alone —
+/// no store read, no projection, no token — so a supervisor can tell a
+/// serving listener from a wedged one without paying the derived
+/// surfaces' cost. `/metrics` stays the observability surface and is
+/// never a liveness signal (ADR-076).
+async fn health_handler() -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    (
+        axum::http::StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "ok": true,
+            "version": env!("CARGO_PKG_VERSION"),
+        })),
+    )
 }
 
 // ---------------------------------------------------------------------------

@@ -1729,7 +1729,10 @@ provider-independent prefix-cache hit-rate proxy); the only counted invalidation
 constraint-3 violation. The same report is exposed by `kian cache-stats [--config <path>]
 [--session <uuid>] [--json]`; the live-provider run is env-gated (`KIAN_API_KEY`), excluded
 from CI, so it is recorded in the run log of whichever run performed it, never in the
-changelog.
+changelog. Liveness is a separate route from the derived report: `GET /healthz` answers `200`
+from process state alone — no store read, no projection, no token — and is what a supervisor
+probes; `/metrics` is never a liveness signal (API-CONTRACT §1.1,
+[ADR-076](decisions/ADR-076-liveness-is-a-probe.md)).
 
  Refinement (self-inspection, as implemented by `kian-cli`): `kian self inspect [--window <dur>]
 [--session <uuid>] [--json]` is the windowed diagnostic over the same stream.

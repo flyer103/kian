@@ -8,6 +8,11 @@ pull request and the run logs, not here (see [AGENTS.md](AGENTS.md) § CHANGELOG
 
 ## Unreleased
 
+- **Liveness is a probe, not the metrics surface (ADR-076).** `kian serve` mounts
+  `GET /healthz`, which answers `200` with `{"ok":true,"version":…}` from process state alone —
+  no store read, no projection, no token — so a supervisor never pays the `/metrics` derivation
+  (whose cost grows with the store) to learn that the listener is serving. `/metrics` keeps its
+  meaning and is never a liveness signal.
 - **An inbound iMessage voice note is transcribed (ADR-075).** The Mac records a voice note as
   `Audio Message.caf` with an empty `mime_type`, so the bridge now types an attachment from its
   filename when the row records none and `GET /v1/attachment` serves `audio/*` as the original bytes;

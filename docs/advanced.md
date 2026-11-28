@@ -1371,6 +1371,7 @@ Semantics: [ADR-053](../design/decisions/ADR-053-economics-cost-projection.md).
 | `kian self evidence --session <uuid> --seq <n> --out <dir> [--context <k>]` | Handoff package for one anchor row: the raw ±k envelope slice, session state and end writes, repo commit/branch/dirty and crate map, the `self inspect` projection, and a manifest with every file's sha256 (payload text stays inside the package — never on stdout) |
 | `kian wake-now`, `kian lease inspect`, `kian recovery budget reset` | Operational actions |
 | `GET /metrics` | Engine, cache, usage and super-agent counters |
+| `GET /healthz` | Liveness: `200` from process state alone — no projection, no token — the probe a supervisor points at ([ADR-076](../design/decisions/ADR-076-liveness-is-a-probe.md)) |
 
 Interrupt is durable: it admits a control-envelope inbox row (idempotent per epoch), so the intent
 survives a drain crash and the takeover settles `interrupted`
